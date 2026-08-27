@@ -1,0 +1,2 @@
+device_path,sysfs_path,width,height,frame_bytes,packing,bit_order,black_bit,orientation,refresh_command,refresh_max,fast_refresh_only,verified_run
+/dev/epaper_lcd,/sys/devices/platform/e0266a128/epaper,296,152,5624,vertical_8_pixel_strips,msb_top,1,upright,refresh=1,30,0,20260814-224906

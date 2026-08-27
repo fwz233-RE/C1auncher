@@ -1,0 +1,7 @@
+build
+*.log
+*.memlog
+*.swp
+*.tar.xz
+*~
+.idea
