@@ -1,0 +1,690 @@
+/*
+ * TSM - VTE State Machine Tests
+ *
+ * Copyright (c) 2018 Aetf <aetf@unlimitedcodeworks.xyz>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining
+ * a copy of this software and associated documentation files
+ * (the "Software"), to deal in the Software without restriction, including
+ * without limitation the rights to use, copy, modify, merge, publish,
+ * distribute, sublicense, and/or sell copies of the Software, and to
+ * permit persons to whom the Software is furnished to do so, subject to
+ * the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included
+ * in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+ * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ * IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+#include "libtsm-int.h"
+#include "libtsm.h"
+#include "test_common.h"
+
+#include <xkbcommon/xkbcommon-keysyms.h>
+#include <stdio.h>
+
+static void log_cb(void *data, const char *file, int line, const char *func, const char *subs,
+				   unsigned int sev, const char *format, va_list args)
+{
+	UNUSED(data);
+	UNUSED(file);
+	UNUSED(line);
+	UNUSED(func);
+	UNUSED(subs);
+	UNUSED(sev);
+	UNUSED(format);
+	UNUSED(args);
+}
+
+static void write_cb(struct tsm_vte *vte, const char *u8, size_t len, void *data)
+{
+	UNUSED(len);
+	UNUSED(data);
+
+	ck_assert_ptr_ne(vte, NULL);
+	ck_assert_ptr_ne(u8, NULL);
+}
+
+START_TEST(test_vte_init)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	int r;
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, write_cb, NULL, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	tsm_vte_unref(vte);
+	vte = NULL;
+
+	tsm_screen_unref(screen);
+	screen = NULL;
+}
+END_TEST
+
+START_TEST(test_vte_null)
+{
+	int r;
+	bool rb;
+
+	r = tsm_vte_new(NULL, NULL, NULL, NULL, log_cb, NULL);
+	ck_assert_int_eq(r, -EINVAL);
+
+	tsm_vte_ref(NULL);
+	tsm_vte_unref(NULL);
+
+	tsm_vte_set_osc_cb(NULL, NULL, NULL);
+
+	r = tsm_vte_set_palette(NULL, "");
+	ck_assert_int_eq(r, -EINVAL);
+
+	r = tsm_vte_set_custom_palette(NULL, NULL);
+	ck_assert_int_eq(r, -EINVAL);
+
+	tsm_vte_get_def_attr(NULL, NULL);
+	tsm_vte_get_flags(NULL);
+
+	tsm_vte_get_mouse_mode(NULL);
+	tsm_vte_get_mouse_event(NULL);
+
+	tsm_vte_reset(NULL);
+	tsm_vte_hard_reset(NULL);
+	tsm_vte_input(NULL, "", 0);
+
+	rb = tsm_vte_handle_keyboard(NULL, 0, 0, 0, 0);
+	ck_assert(!rb);
+}
+END_TEST
+
+static uint8_t test_palette[TSM_COLOR_NUM][3] = {
+	[TSM_COLOR_BLACK]         = {   0,  18,  36 },
+	[TSM_COLOR_RED]           = {   1,  19,  37 },
+	[TSM_COLOR_GREEN]         = {   2,  20,  38 },
+	[TSM_COLOR_YELLOW]        = {   3,  21,  39 },
+	[TSM_COLOR_BLUE]          = {   4,  22,  40 },
+	[TSM_COLOR_MAGENTA]       = {   5,  23,  41 },
+	[TSM_COLOR_CYAN]          = {   6,  24,  42 },
+	[TSM_COLOR_LIGHT_GREY]    = {   7,  25,  43 },
+	[TSM_COLOR_DARK_GREY]     = {   8,  26,  44 },
+	[TSM_COLOR_LIGHT_RED]     = {   9,  27,  45 },
+	[TSM_COLOR_LIGHT_GREEN]   = {  10,  28,  46 },
+	[TSM_COLOR_LIGHT_YELLOW]  = {  11,  29,  47 },
+	[TSM_COLOR_LIGHT_BLUE]    = {  12,  30,  48 },
+	[TSM_COLOR_LIGHT_MAGENTA] = {  13,  31,  49 },
+	[TSM_COLOR_LIGHT_CYAN]    = {  14,  32,  50 },
+	[TSM_COLOR_WHITE]         = {  15,  33,  51 },
+
+	[TSM_COLOR_FOREGROUND]    = {  16,  34,  52 },
+	[TSM_COLOR_BACKGROUND]    = {  17,  35,  53 },
+};
+
+START_TEST(test_vte_custom_palette)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	int r;
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, write_cb, NULL, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_set_custom_palette(vte, test_palette);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_set_palette(vte, "custom");
+	ck_assert_int_eq(r, 0);
+
+	struct tsm_screen_attr attr;
+	tsm_vte_get_def_attr(vte, &attr);
+	ck_assert_uint_eq(attr.fr, test_palette[TSM_COLOR_FOREGROUND][0]);
+	ck_assert_uint_eq(attr.fg, test_palette[TSM_COLOR_FOREGROUND][1]);
+	ck_assert_uint_eq(attr.fb, test_palette[TSM_COLOR_FOREGROUND][2]);
+
+	ck_assert_uint_eq(attr.br, test_palette[TSM_COLOR_BACKGROUND][0]);
+	ck_assert_uint_eq(attr.bg, test_palette[TSM_COLOR_BACKGROUND][1]);
+	ck_assert_uint_eq(attr.bb, test_palette[TSM_COLOR_BACKGROUND][2]);
+
+	tsm_vte_unref(vte);
+	vte = NULL;
+
+	tsm_screen_unref(screen);
+	screen = NULL;
+}
+END_TEST
+
+static bool write_cb_called = false;
+
+static void checking_write_cb(struct tsm_vte *vte, const char *u8, size_t len, void *data)
+{
+	write_cb_called = true;
+
+	ck_assert_ptr_ne(vte, NULL);
+	ck_assert_ptr_ne(u8, NULL);
+	ck_assert_uint_gt(len, 0);
+
+	ck_assert_mem_eq(u8, data, len);
+}
+
+static void checked_vte_input(struct tsm_vte *vte, const char *u8, size_t len)
+{
+	write_cb_called = false;
+	tsm_vte_input(vte, u8, len);
+	ck_assert(write_cb_called);
+}
+
+START_TEST(test_vte_osc_query)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	int r;
+	char expected_output[32];
+	const char *input;
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, checking_write_cb, expected_output, NULL, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_set_custom_palette(vte, test_palette);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_set_palette(vte, "custom");
+	ck_assert_int_eq(r, 0);
+
+	// query foreground, end_seq = BEL
+	input = "\e]10;?\x07";
+	strcpy(expected_output, "\e]10;rgb:1010/2222/3434\x07");
+	checked_vte_input(vte, input, strlen(input));
+
+	// query foreground, end_seq = ST
+	input = "\e]10;?\e\\";
+	strcpy(expected_output, "\e]10;rgb:1010/2222/3434\e\\");
+	checked_vte_input(vte, input, strlen(input));
+
+	// ignore additional parameters after foreground query
+	input = "\e]10;?;11;?\x07";
+	strcpy(expected_output, "\e]10;rgb:1010/2222/3434\x07");
+	checked_vte_input(vte, input, strlen(input));
+
+	// query background
+	input = "\e]11;?\x07";
+	strcpy(expected_output, "\e]11;rgb:1111/2323/3535\x07");
+	checked_vte_input(vte, input, strlen(input));
+
+	// ignore additional parameters after background query
+	input = "\e]11;?;12;?\x07";
+	strcpy(expected_output, "\e]11;rgb:1111/2323/3535\x07");
+	checked_vte_input(vte, input, strlen(input));
+
+	tsm_vte_unref(vte);
+	vte = NULL;
+
+	tsm_screen_unref(screen);
+	screen = NULL;
+}
+END_TEST
+
+unsigned char write_buffer[512];
+unsigned char *write_buffer_p = write_buffer;
+
+static void storing_write_cb(struct tsm_vte *vte, const char *u8, size_t len, void *data)
+{
+	ck_assert_ptr_ne(vte, NULL);
+	ck_assert_ptr_ne(u8, NULL);
+
+	memcpy(write_buffer_p, u8, len);
+	write_buffer_p[len] = '\0';
+	write_buffer_p += len;
+}
+
+static void storing_write_cb_reset(void)
+{
+	memset(write_buffer, 0, sizeof(write_buffer));
+	write_buffer_p = write_buffer;
+}
+
+START_TEST(test_vte_osc4)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	int r;
+	const char *input;
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, storing_write_cb, NULL, NULL, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_set_custom_palette(vte, test_palette);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_set_palette(vte, "custom");
+	ck_assert_int_eq(r, 0);
+
+	// query palette entries
+	storing_write_cb_reset();
+	input = "\e]4;1;?;13;?;3;?\x07";
+	const char *expected =
+		"\e]4;1;rgb:0101/1313/2525\x07"
+		"\e]4;13;rgb:0d0d/1f1f/3131\x07"
+		"\e]4;3;rgb:0303/1515/2727\x07";
+	tsm_vte_input(vte, input, strlen(input));
+	ck_assert_mem_eq(write_buffer, expected, strlen(expected));
+	ck_assert_int_eq(write_buffer_p - write_buffer, strlen(expected));
+
+	// query cube & grayscale entries
+	storing_write_cb_reset();
+	input = "\e]4;110;?;254;?;\x07";
+	expected =
+		"\e]4;110;rgb:8787/afaf/d7d7\x07"
+		"\e]4;254;rgb:e4e4/e4e4/e4e4\x07";
+	tsm_vte_input(vte, input, strlen(input));
+	ck_assert_mem_eq(write_buffer, expected, strlen(expected));
+
+	// ignore color change requests, incomplete messages
+	storing_write_cb_reset();
+	input = "\e]4;1;rgb:1111/2222/3333;2\x07";
+	tsm_vte_input(vte, input, strlen(input));
+	ck_assert_ptr_eq(write_buffer, write_buffer_p);
+	storing_write_cb_reset();
+
+	tsm_vte_unref(vte);
+	vte = NULL;
+
+	tsm_screen_unref(screen);
+	screen = NULL;
+}
+END_TEST
+
+START_TEST(test_vte_backspace_key)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	char expected_output;
+	int r;
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, checking_write_cb, &expected_output, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	expected_output = '\010';
+	r = tsm_vte_handle_keyboard(vte, XKB_KEY_BackSpace, 010, 0, 010);
+	ck_assert(r);
+	r = tsm_vte_handle_keyboard(vte, XKB_KEY_BackSpace, 0177, 0, 0177);
+	ck_assert(r);
+
+	tsm_vte_set_backspace_sends_delete(vte, true);
+
+	expected_output = '\177';
+	r = tsm_vte_handle_keyboard(vte, XKB_KEY_BackSpace, 010, 0, 010);
+	ck_assert(r);
+	r = tsm_vte_handle_keyboard(vte, XKB_KEY_BackSpace, 0177, 0, 0177);
+	ck_assert(r);
+
+	tsm_vte_set_backspace_sends_delete(vte, false);
+
+	expected_output = '\010';
+	r = tsm_vte_handle_keyboard(vte, XKB_KEY_BackSpace, 010, 0, 010);
+	ck_assert(r);
+	r = tsm_vte_handle_keyboard(vte, XKB_KEY_BackSpace, 0177, 0, 0177);
+	ck_assert(r);
+
+	tsm_vte_unref(vte);
+	vte = NULL;
+
+	tsm_screen_unref(screen);
+	screen = NULL;
+}
+END_TEST
+
+START_TEST(test_vte_get_flags)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	char expected_output;
+	int r, flags;
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, checking_write_cb, &expected_output, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	flags = tsm_vte_get_flags(vte);
+	ck_assert(!(flags & TSM_VTE_FLAG_CURSOR_KEY_MODE));
+
+	// enable cursor key mode
+	tsm_vte_input(vte, "\033[?1h", 5);
+
+	flags = tsm_vte_get_flags(vte);
+	ck_assert(flags & TSM_VTE_FLAG_CURSOR_KEY_MODE);
+
+	tsm_vte_unref(vte);
+	vte = NULL;
+
+	tsm_screen_unref(screen);
+	screen = NULL;
+}
+END_TEST
+
+/* Regression test for https://github.com/Aetf/libtsm/issues/26 */
+START_TEST(test_vte_decrqm_no_reset)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	int r;
+	unsigned int flags;
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, write_cb, NULL, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	/* switch terminal to alternate screen mode */
+	tsm_vte_input(vte, "\033[?1049h", 8);
+
+	flags = tsm_screen_get_flags(screen);
+	ck_assert(flags & TSM_SCREEN_ALTERNATE);
+
+	/* send DECRQM SRM (12) request */
+	tsm_vte_input(vte, "\033[?12$p", 7);
+
+	/* terminal should still be in alternate screen mode */
+	flags = tsm_screen_get_flags(screen);
+	ck_assert(flags & TSM_SCREEN_ALTERNATE);
+
+	tsm_vte_unref(vte);
+	vte = NULL;
+
+	tsm_screen_unref(screen);
+	screen = NULL;
+}
+END_TEST
+
+#define assert_tsm_screen_cursor_pos(screen, x1, y1)                 \
+	do {                                                             \
+		ck_assert_int_eq(x1, tsm_screen_get_cursor_x(screen));       \
+		ck_assert_int_eq(y1, tsm_screen_get_cursor_y(screen));       \
+	} while(0)
+
+/* test for https://github.com/Aetf/kmscon/issues/78 */
+START_TEST(test_vte_csi_cursor_up_down)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	int r;
+	int h;
+	char csi_cmd[64];
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, write_cb, NULL, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	tsm_vte_input(vte, "\n123", 4);
+	assert_tsm_screen_cursor_pos(screen, 3, 1);
+
+	// cursor move up, first col
+	tsm_vte_input(vte, "\033[1F", 4);
+	assert_tsm_screen_cursor_pos(screen, 0, 0);
+
+	// cursor move down, first col
+	tsm_vte_input(vte, "\033[1E", 4);
+	assert_tsm_screen_cursor_pos(screen, 0, 1);
+
+	h = tsm_screen_get_height(screen);
+
+	// move cursor up out of screen, should at first line
+	sprintf(csi_cmd, "\033[%dF", h + 10);
+	tsm_vte_input(vte, csi_cmd, strlen(csi_cmd));
+	assert_tsm_screen_cursor_pos(screen, 0, 0);
+
+	// move cursor down out of screen, should at last line
+	sprintf(csi_cmd, "\033[%dE", h + 10);
+	tsm_vte_input(vte, csi_cmd, strlen(csi_cmd));
+	assert_tsm_screen_cursor_pos(screen, 0, h - 1);
+
+	tsm_vte_unref(vte);
+	vte = NULL;
+
+	tsm_screen_unref(screen);
+	screen = NULL;
+}
+END_TEST
+
+static bool bell_cb_called = false;
+
+static void bell_cb(struct tsm_vte *vte, void *data)
+{
+	bool *flag = data;
+	ck_assert_ptr_ne(vte, NULL);
+	if (flag)
+		*flag = true;
+	bell_cb_called = true;
+}
+
+START_TEST(test_vte_bell)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	int r;
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, write_cb, NULL, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	tsm_vte_set_bell_cb(vte, bell_cb, NULL);
+
+	bell_cb_called = false;
+	tsm_vte_input(vte, "\x07", 1);
+	ck_assert(bell_cb_called);
+
+	/* BEL inside an OSC sequence acts as the ST terminator, not as a bell */
+	bell_cb_called = false;
+	tsm_vte_input(vte, "\033]0;title\x07", 10);
+	ck_assert(!bell_cb_called);
+
+	tsm_vte_unref(vte);
+	vte = NULL;
+
+	tsm_screen_unref(screen);
+	screen = NULL;
+}
+END_TEST
+
+START_TEST(test_vte_bell_no_cb)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	int r;
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, write_cb, NULL, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	/* BEL without a registered callback must not crash */
+	tsm_vte_input(vte, "\x07", 1);
+
+	tsm_vte_unref(vte);
+	vte = NULL;
+
+	tsm_screen_unref(screen);
+	screen = NULL;
+}
+END_TEST
+
+START_TEST(test_vte_bell_data)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	bool flag = false;
+	int r;
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, write_cb, NULL, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	tsm_vte_set_bell_cb(vte, bell_cb, &flag);
+
+	tsm_vte_input(vte, "\x07", 1);
+	ck_assert(flag);
+
+	tsm_vte_unref(vte);
+	vte = NULL;
+
+	tsm_screen_unref(screen);
+	screen = NULL;
+}
+END_TEST
+
+TEST_DEFINE_CASE(misc)
+	TEST(test_vte_init)
+	TEST(test_vte_null)
+	TEST(test_vte_custom_palette)
+	TEST(test_vte_osc_query)
+	TEST(test_vte_osc4)
+	TEST(test_vte_backspace_key)
+	TEST(test_vte_get_flags)
+	TEST(test_vte_decrqm_no_reset)
+	TEST(test_vte_csi_cursor_up_down)
+TEST_END_CASE
+
+TEST_DEFINE_CASE(bell)
+	TEST(test_vte_bell)
+	TEST(test_vte_bell_no_cb)
+	TEST(test_vte_bell_data)
+TEST_END_CASE
+
+static unsigned int led_cb_leds = 0;
+static bool led_cb_called = false;
+
+static void led_cb(struct tsm_vte *vte, unsigned int leds, void *data)
+{
+	unsigned int *out = data;
+	ck_assert_ptr_ne(vte, NULL);
+	if (out)
+		*out = leds;
+	led_cb_leds = leds;
+	led_cb_called = true;
+}
+
+START_TEST(test_vte_led_decll)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	int r;
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, write_cb, NULL, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	tsm_vte_set_led_cb(vte, led_cb, NULL);
+
+	/* CSI 1 q  — turn on Scroll Lock LED */
+	led_cb_called = false;
+	tsm_vte_input(vte, "\033[1q", 4);
+	ck_assert(led_cb_called);
+	ck_assert_uint_eq(led_cb_leds, TSM_VTE_LED_SCROLL_LOCK);
+
+	/* CSI 3 q  — turn on Caps Lock LED (cumulative) */
+	led_cb_called = false;
+	tsm_vte_input(vte, "\033[3q", 4);
+	ck_assert(led_cb_called);
+	ck_assert_uint_eq(led_cb_leds, TSM_VTE_LED_SCROLL_LOCK | TSM_VTE_LED_CAPS_LOCK);
+
+	/* CSI 0 q  — clear all LEDs */
+	led_cb_called = false;
+	tsm_vte_input(vte, "\033[0q", 4);
+	ck_assert(led_cb_called);
+	ck_assert_uint_eq(led_cb_leds, 0);
+
+	tsm_vte_unref(vte);
+	tsm_screen_unref(screen);
+}
+END_TEST
+
+START_TEST(test_vte_led_no_cb)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	int r;
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, write_cb, NULL, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	/* DECLL without a registered callback must not crash */
+	tsm_vte_input(vte, "\033[1q", 4);
+
+	tsm_vte_unref(vte);
+	tsm_screen_unref(screen);
+}
+END_TEST
+
+START_TEST(test_vte_led_data)
+{
+	struct tsm_screen *screen;
+	struct tsm_vte *vte;
+	unsigned int out = 0;
+	int r;
+
+	r = tsm_screen_new(&screen, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	r = tsm_vte_new(&vte, screen, write_cb, NULL, log_cb, NULL);
+	ck_assert_int_eq(r, 0);
+
+	tsm_vte_set_led_cb(vte, led_cb, &out);
+
+	tsm_vte_input(vte, "\033[2q", 4);
+	ck_assert_uint_eq(out, TSM_VTE_LED_NUM_LOCK);
+
+	tsm_vte_unref(vte);
+	tsm_screen_unref(screen);
+}
+END_TEST
+
+TEST_DEFINE_CASE(led)
+	TEST(test_vte_led_decll)
+	TEST(test_vte_led_no_cb)
+	TEST(test_vte_led_data)
+TEST_END_CASE
+
+// clang-format off
+TEST_DEFINE(
+	TEST_SUITE(vte,
+		TEST_CASE(misc),
+		TEST_CASE(bell),
+		TEST_CASE(led),
+		TEST_END
+	)
+)
+// clang-format on

@@ -1,0 +1,32 @@
+#!/bin/bash
+# C1-Slim launcher for the vendored Neofetch 7.1.0 script.
+set -u
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [[ -f "$script_dir/neofetch.upstream" ]]; then
+    package_dir=$script_dir
+else
+    package_dir=/usr/data/c1/neofetch
+fi
+
+upstream=$package_dir/neofetch.upstream
+config=$package_dir/c1-config.conf
+custom_logo=$package_dir/c1-logo.txt
+
+if [[ ! -r $upstream || ! -r $config || ! -r $custom_logo ]]; then
+    printf 'C1 Neofetch installation is incomplete.\n' >&2
+    exit 1
+fi
+
+export TERM=${TERM:-xterm-256color}
+export COLUMNS=${COLUMNS:-49}
+export LINES=${LINES:-19}
+
+exec /bin/bash "$upstream" \
+    --config "$config" \
+    --backend ascii \
+    --source "$custom_logo" \
+    --ascii_colors 7 \
+    --colors 7 7 7 7 7 7 \
+    --color_blocks off \
+    "$@"
