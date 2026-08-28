@@ -113,6 +113,32 @@ function Assert-SystemState {
     return [pscustomobject]@{ Identity = $identity.Output; RootMount = $rootMount; StorageMount = $storageMount }
 }
 
+function Sync-DeviceClock {
+    $hostEpochBefore = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    Invoke-CheckedRemote "date -u -s '@$hostEpochBefore' >/dev/null; hwclock -w -u" | Out-Null
+    $deviceEpochText = Invoke-CheckedRemote 'date +%s'
+    [long]$deviceEpoch = 0
+    if (-not [long]::TryParse($deviceEpochText.Trim(), [ref]$deviceEpoch)) {
+        throw "Device clock returned an invalid epoch: $deviceEpochText"
+    }
+    $hostEpochAfter = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $skewSeconds = [Math]::Min(
+        [Math]::Abs($deviceEpoch - $hostEpochBefore),
+        [Math]::Abs($deviceEpoch - $hostEpochAfter)
+    )
+    if ($skewSeconds -gt 5) {
+        throw "Device clock synchronization failed; skew is $skewSeconds seconds."
+    }
+    $rtc = (Invoke-Remote 'hwclock -r -u').Output.Trim()
+    return @(
+        "host_epoch_before=$hostEpochBefore"
+        "device_epoch=$deviceEpoch"
+        "host_epoch_after=$hostEpochAfter"
+        "skew_seconds=$skewSeconds"
+        "rtc=$rtc"
+    ) -join [Environment]::NewLine
+}
+
 function Assert-SuspendCapability {
     $proof = Invoke-CheckedRemote "if [ -f /usr/data/c1/suspend-probe-passed ]; then cat /usr/data/c1/suspend-probe-passed; else echo missing; exit 1; fi"
     if ($proof -notmatch '(?m)^result=passed$') {
@@ -221,6 +247,8 @@ $script:Adb = Resolve-Adb
 try {
     $script:Serial = Get-OnlyDevice
     $baseline = Assert-SystemState
+    $clockSync = if ($Action -eq 'Install') { Sync-DeviceClock } else { 'clock_sync=not_requested' }
+    Write-Evidence 'clock-sync.txt' ($clockSync + [Environment]::NewLine)
     $suspendCapability = if ($EnableAutoSuspend) { Assert-SuspendCapability } else { 'automatic_suspend=disabled_by_default' }
     Write-Evidence 'suspend-capability.txt' ($suspendCapability + [Environment]::NewLine)
     $hostKeyProbe = Invoke-Remote "if [ -f /usr/data/c1/ssh/ssh_host_ed25519_key ]; then sha256sum /usr/data/c1/ssh/ssh_host_ed25519_key; fi"

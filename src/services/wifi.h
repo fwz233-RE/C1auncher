@@ -36,6 +36,8 @@ typedef struct {
 } c1_wifi_snapshot;
 
 bool c1_wifi_read_snapshot(c1_wifi_snapshot *snapshot);
+bool c1_wifi_decode_scan_ssid(const char *encoded, char *decoded, size_t capacity);
+bool c1_wifi_encode_control_ssid(const char *ssid, char *encoded, size_t capacity);
 c1_status c1_wifi_scan(c1_wifi_snapshot *snapshot);
 c1_status c1_wifi_connect(const char *ssid, const char *password, c1_wifi_snapshot *snapshot);
 c1_status c1_wifi_disable(c1_wifi_snapshot *snapshot);

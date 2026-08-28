@@ -251,7 +251,11 @@ c1_ui_transition c1_ui_step(c1_ui_state state, c1_ui_event event, const c1_ui_st
                 c1_ui_clear_secret(&transition.state);
                 transition.state.symbol_selection = 0U;
                 transition.state.keyboard_layer = C1_UI_KEYBOARD_LOWER;
-                transition.state.page = C1_UI_PAGE_WIFI_PASSWORD;
+                if (status->networks[network_index].secured) {
+                    transition.state.page = C1_UI_PAGE_WIFI_PASSWORD;
+                } else {
+                    transition.action = C1_UI_ACTION_WIFI_CONNECT;
+                }
             }
         }
         return transition;
