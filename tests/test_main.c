@@ -1,6 +1,8 @@
+#include "core/power_policy.h"
 #include "core/record.h"
 #include "core/status.h"
 #include "display/frame.h"
+#include "platform/stop.h"
 #include "services/terminal.h"
 #include "ui/canvas.h"
 #include "ui/model.h"
@@ -9,6 +11,7 @@
 
 #include <errno.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,12 +141,12 @@ static void test_ui(void)
 
     expect(state.page == C1_UI_PAGE_DESKTOP && state.selection == 4U,
            "UI starts locked on the center desktop cell");
-    expect(c1_ui_toggle_lock(&state) && state.page == C1_UI_PAGE_LOCK,
+    expect(c1_ui_enter_lock(&state) && state.page == C1_UI_PAGE_LOCK,
            "desktop OK enters the wallpaper lock screen");
     c1_ui_render(page, &state, &status, NULL);
     expect(memcmp(page, c1_wallpaper_frame, sizeof(page)) == 0,
            "lock screen renders the embedded 296 by 152 wallpaper exactly");
-    expect(c1_ui_toggle_lock(&state) && state.page == C1_UI_PAGE_DESKTOP,
+    expect(c1_ui_unlock(&state) && state.page == C1_UI_PAGE_DESKTOP,
            "lock-screen OK returns to the desktop");
     {
         static const c1_ui_page confirm_pages[] = {
@@ -160,8 +163,8 @@ static void test_ui(void)
             c1_ui_state confirm_state = c1_ui_initial_state();
 
             confirm_state.page = confirm_pages[page_index];
-            expect(!c1_ui_toggle_lock(&confirm_state) &&
-                       confirm_state.page == confirm_pages[page_index],
+            transition = c1_ui_step(confirm_state, C1_UI_EVENT_ENTER, &status);
+            expect(transition.state.page != C1_UI_PAGE_LOCK,
                    "OK keeps its existing confirm function outside the desktop");
         }
     }
@@ -461,6 +464,98 @@ static void test_terminal_pty(void)
     c1_terminal_stop(&session);
 }
 
+static void test_power_policy(void)
+{
+    c1_power_policy policy;
+    c1_ui_state state = c1_ui_initial_state();
+    int64_t now = 1000;
+
+    c1_power_policy_init(&policy, now);
+    expect(policy.state == C1_POWER_ACTIVE,
+           "power policy starts active");
+    expect(c1_power_policy_tick(&policy,
+                                now + C1_POWER_IDLE_TIMEOUT_MS + 1,
+                                true) == C1_POWER_ACTION_NONE,
+           "idle desktop remains active");
+
+    state.page = C1_UI_PAGE_WIFI_PASSWORD;
+    snprintf(state.secret, sizeof(state.secret), "%s", "temporary-password");
+    state.secret_length = strlen(state.secret);
+    state.terminal_symbol_picker = true;
+    expect(c1_power_policy_tick(&policy,
+                                now + C1_POWER_IDLE_TIMEOUT_MS,
+                                false) == C1_POWER_ACTION_ENTER_LOCK,
+           "idle non-desktop page requests lock");
+    expect(c1_ui_enter_lock(&state) && state.page == C1_UI_PAGE_LOCK &&
+               state.secret_length == 0U && state.secret[0] == '\0' &&
+               !state.terminal_symbol_picker,
+           "automatic lock clears transient input state");
+    expect(c1_power_policy_tick(&policy,
+                                now + C1_POWER_IDLE_TIMEOUT_MS +
+                                    C1_POWER_LOCK_TIMEOUT_MS - 1,
+                                false) == C1_POWER_ACTION_NONE,
+           "lock grace period delays suspend");
+    expect(c1_power_policy_tick(&policy,
+                                now + C1_POWER_IDLE_TIMEOUT_MS +
+                                    C1_POWER_LOCK_TIMEOUT_MS,
+                                false) == C1_POWER_ACTION_SUSPEND,
+           "locked policy requests suspend after grace period");
+
+    c1_power_policy_suspend_failed(&policy, now + C1_POWER_IDLE_TIMEOUT_MS +
+                                                C1_POWER_LOCK_TIMEOUT_MS);
+    expect(policy.state == C1_POWER_LOCKED,
+           "failed suspend returns to locked state");
+    expect(c1_power_policy_tick(&policy,
+                                now + C1_POWER_IDLE_TIMEOUT_MS +
+                                    C1_POWER_LOCK_TIMEOUT_MS +
+                                    C1_POWER_RETRY_DELAY_MS - 1,
+                                false) == C1_POWER_ACTION_NONE,
+           "failed suspend uses bounded retry delay");
+
+    expect(c1_power_policy_tick(&policy,
+                                now + C1_POWER_IDLE_TIMEOUT_MS +
+                                    C1_POWER_LOCK_TIMEOUT_MS +
+                                    C1_POWER_RETRY_DELAY_MS,
+                                false) == C1_POWER_ACTION_SUSPEND,
+           "failed suspend retries after the bounded delay");
+    c1_power_policy_suspend_failed(&policy, now + 1000000);
+
+    c1_power_policy_resumed(&policy, now + 1000000);
+    expect(c1_power_policy_filter_wakeup(&policy, true),
+           "resume suppresses the wake key press");
+    expect(c1_power_policy_filter_wakeup(&policy, false),
+           "resume consumes the wake key release");
+    expect(!c1_power_policy_filter_wakeup(&policy, true),
+           "a later wake key press is delivered");
+    expect(c1_power_policy_unlock(&policy, now + 1000001) &&
+               policy.state == C1_POWER_ACTIVE,
+           "explicit unlock returns to active state");
+    expect(c1_ui_unlock(&state) && state.page == C1_UI_PAGE_DESKTOP,
+           "explicit UI unlock returns to desktop");
+
+    c1_power_policy_init(&policy, now);
+    expect(c1_power_policy_lock(&policy, now),
+           "desktop can enter lock explicitly");
+    c1_power_policy_suspend_unavailable(&policy);
+    expect(c1_power_policy_tick(&policy,
+                                now + C1_POWER_LOCK_TIMEOUT_MS +
+                                    C1_POWER_RETRY_DELAY_MS,
+                                true) == C1_POWER_ACTION_NONE &&
+               c1_power_policy_timeout(&policy, now, true) == -1,
+           "unsupported suspend leaves locked policy indefinitely blocked");
+}
+
+static void test_stop_signal(void)
+{
+    c1_stop_reset();
+    c1_stop_install();
+    expect(!c1_stop_requested(), "stop state begins clear");
+    expect(raise(SIGTERM) == 0 && c1_stop_requested(),
+           "termination signal interrupts the event loop policy");
+    c1_stop_reset();
+    expect(!c1_stop_requested(), "stop state resets for a restart");
+}
+
 static void test_ndjson(void)
 {
     static const char expected[] =
@@ -492,6 +587,8 @@ int main(void)
     test_ui();
     test_terminal_screen();
     test_terminal_pty();
+    test_power_policy();
+    test_stop_signal();
     test_ndjson();
 
     if (failures != 0) {

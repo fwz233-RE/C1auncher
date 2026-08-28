@@ -275,7 +275,9 @@ static void cleanup_runtime(void)
     } else {
         shadow_mounted = false;
     }
-    unlink(C1_SSH_SHADOW);
+    if (!shadow_mounted) {
+        unlink(C1_SSH_SHADOW);
+    }
     unlink(C1_SSH_CONFIG);
     unlink(C1_SSH_PID_FILE);
 }
@@ -286,10 +288,17 @@ bool c1_ssh_read_snapshot(c1_ssh_snapshot *snapshot)
         return false;
     }
     memset(snapshot, 0, sizeof(*snapshot));
-    snapshot->enabled = service_running() && port_is_open();
+    snapshot->enabled = service_running();
     interface_ipv4(snapshot->ipv4, sizeof(snapshot->ipv4));
     snprintf(snapshot->error, sizeof(snapshot->error), "%s", last_error);
     return true;
+}
+
+void c1_ssh_adopt_snapshot(const c1_ssh_snapshot *snapshot)
+{
+    if (snapshot != NULL) {
+        snprintf(last_error, sizeof(last_error), "%s", snapshot->error);
+    }
 }
 
 c1_status c1_ssh_enable(c1_ssh_snapshot *snapshot)
@@ -300,6 +309,12 @@ c1_status c1_ssh_enable(c1_ssh_snapshot *snapshot)
         last_error[0] = '\0';
         c1_ssh_read_snapshot(snapshot);
         return C1_STATUS_OK;
+    }
+    cleanup_runtime();
+    if (shadow_mounted) {
+        set_error("SHADOW RESTORE FAILED");
+        c1_ssh_read_snapshot(snapshot);
+        return C1_STATUS_IO_ERROR;
     }
     if (access(C1_SSH_HOST_KEY, R_OK) != 0) {
         set_error("SSH HOST KEY IS MISSING");
@@ -337,6 +352,20 @@ finished:
     }
     c1_ssh_read_snapshot(snapshot);
     return result;
+}
+
+c1_status c1_ssh_pause(bool *was_enabled)
+{
+    if (was_enabled == NULL) {
+        return C1_STATUS_INVALID_ARGUMENT;
+    }
+    *was_enabled = service_running();
+    return *was_enabled ? c1_ssh_disable(NULL) : C1_STATUS_OK;
+}
+
+c1_status c1_ssh_resume(bool was_enabled)
+{
+    return was_enabled ? c1_ssh_enable(NULL) : C1_STATUS_OK;
 }
 
 c1_status c1_ssh_disable(c1_ssh_snapshot *snapshot)

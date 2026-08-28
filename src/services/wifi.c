@@ -24,6 +24,7 @@
 
 #define C1_WIFI_RUN_DIR "/run/c1"
 #define C1_WIFI_CTRL_DIR "/run/c1/wpa_ctrl"
+#define C1_WIFI_FACTORY_CTRL_DIR "/var/run/wpa_supplicant"
 #define C1_WIFI_DATA_DIR "/usr/data/c1/wifi"
 #define C1_WIFI_CONFIG "/usr/data/c1/wifi/wpa_supplicant.conf"
 #define C1_WIFI_PID "/run/c1/wpa_supplicant.pid"
@@ -33,6 +34,7 @@
 static c1_wifi_state current_state = C1_WIFI_DISABLED;
 static c1_wifi_network cached_networks[C1_WIFI_MAX_NETWORKS];
 static size_t cached_network_count;
+static char cached_connected_ssid[C1_WIFI_SSID_CAPACITY];
 static char last_error[C1_WIFI_ERROR_CAPACITY];
 
 static void secure_clear(void *memory, size_t size)
@@ -106,7 +108,11 @@ static bool run_program(const char *path, char *const argv[], unsigned int timeo
     return wait_child(child, timeout_seconds);
 }
 
-static bool run_wpa_command(const char *command, char *output, size_t capacity)
+static bool run_wpa_command_timeout(const char *control_dir,
+                                    const char *command,
+                                    char *output,
+                                    size_t capacity,
+                                    int timeout_ms)
 {
     static unsigned int sequence;
     struct sockaddr_un local;
@@ -116,7 +122,9 @@ static bool run_wpa_command(const char *command, char *output, size_t capacity)
     ssize_t count;
     bool success = false;
 
-    if (command == NULL || strchr(command, '\n') != NULL || capacity < 2U) {
+    if (control_dir == NULL || command == NULL || strchr(command, '\n') != NULL ||
+        strlen(control_dir) + sizeof("/wlan0") > sizeof(remote.sun_path) ||
+        capacity < 2U || timeout_ms < 0) {
         return false;
     }
     descriptor = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -139,7 +147,7 @@ static bool run_wpa_command(const char *command, char *output, size_t capacity)
     chmod(local.sun_path, 0600);
     memset(&remote, 0, sizeof(remote));
     remote.sun_family = AF_UNIX;
-    snprintf(remote.sun_path, sizeof(remote.sun_path), C1_WIFI_CTRL_DIR "/wlan0");
+    snprintf(remote.sun_path, sizeof(remote.sun_path), "%s/wlan0", control_dir);
     if (connect(descriptor, (struct sockaddr *)&remote, sizeof(remote)) != 0 ||
         send(descriptor, command, strlen(command), 0) != (ssize_t)strlen(command)) {
         goto finished;
@@ -147,7 +155,7 @@ static bool run_wpa_command(const char *command, char *output, size_t capacity)
     readable.fd = descriptor;
     readable.events = POLLIN;
     readable.revents = 0;
-    if (poll(&readable, 1U, 5000) <= 0 || (readable.revents & POLLIN) == 0) {
+    if (poll(&readable, 1U, timeout_ms) <= 0 || (readable.revents & POLLIN) == 0) {
         goto finished;
     }
     count = recv(descriptor, output, capacity - 1U, 0);
@@ -161,6 +169,11 @@ finished:
     close(descriptor);
     unlink(local.sun_path);
     return success;
+}
+
+static bool run_wpa_command(const char *command, char *output, size_t capacity)
+{
+    return run_wpa_command_timeout(C1_WIFI_CTRL_DIR, command, output, capacity, 5000);
 }
 
 static bool interface_ipv4(char *value, size_t capacity)
@@ -221,7 +234,24 @@ static bool control_ready(void)
 {
     char output[256];
 
-    return run_wpa_command("PING", output, sizeof(output)) && strstr(output, "PONG") != NULL;
+    return run_wpa_command_timeout(C1_WIFI_CTRL_DIR,
+                                   "PING",
+                                   output,
+                                   sizeof(output),
+                                   500) &&
+           strstr(output, "PONG") != NULL;
+}
+
+static bool factory_control_ready(void)
+{
+    char output[256];
+
+    return run_wpa_command_timeout(C1_WIFI_FACTORY_CTRL_DIR,
+                                   "PING",
+                                   output,
+                                   sizeof(output),
+                                   500) &&
+           strstr(output, "PONG") != NULL;
 }
 
 static void terminate_processes_named(const char *name)
@@ -392,9 +422,6 @@ static bool quote_wpa_value(const char *value, char *quoted, size_t capacity)
 
 bool c1_wifi_read_snapshot(c1_wifi_snapshot *snapshot)
 {
-    char output[C1_WIFI_OUTPUT_CAPACITY];
-    char *ssid_line;
-
     if (snapshot == NULL) {
         return false;
     }
@@ -402,28 +429,32 @@ bool c1_wifi_read_snapshot(c1_wifi_snapshot *snapshot)
     snapshot->state = current_state;
     snapshot->network_count = cached_network_count;
     memcpy(snapshot->networks, cached_networks, sizeof(cached_networks));
+    snprintf(snapshot->connected_ssid,
+             sizeof(snapshot->connected_ssid),
+             "%s",
+             cached_connected_ssid);
     snprintf(snapshot->error, sizeof(snapshot->error), "%s", last_error);
-    if (run_wpa_command("STATUS", output, sizeof(output))) {
-        ssid_line = strstr(output, "ssid=");
-        while (ssid_line != NULL && ssid_line != output && ssid_line[-1] != '\n') {
-            ssid_line = strstr(ssid_line + 5U, "ssid=");
-        }
-        if (ssid_line != NULL) {
-            size_t length;
-
-            ssid_line += 5U;
-            length = strcspn(ssid_line, "\r\n");
-            if (length >= sizeof(snapshot->connected_ssid)) {
-                length = sizeof(snapshot->connected_ssid) - 1U;
-            }
-            memcpy(snapshot->connected_ssid, ssid_line, length);
-            snapshot->connected_ssid[length] = '\0';
-        }
-    }
     if (interface_ipv4(snapshot->ipv4, sizeof(snapshot->ipv4))) {
         snapshot->state = C1_WIFI_CONNECTED;
     }
     return true;
+}
+
+void c1_wifi_adopt_snapshot(const c1_wifi_snapshot *snapshot)
+{
+    if (snapshot == NULL) {
+        return;
+    }
+    current_state = snapshot->state;
+    cached_network_count = snapshot->network_count <= C1_WIFI_MAX_NETWORKS
+                               ? snapshot->network_count
+                               : C1_WIFI_MAX_NETWORKS;
+    memcpy(cached_networks, snapshot->networks, sizeof(cached_networks));
+    snprintf(cached_connected_ssid,
+             sizeof(cached_connected_ssid),
+             "%s",
+             snapshot->connected_ssid);
+    snprintf(last_error, sizeof(last_error), "%s", snapshot->error);
 }
 
 c1_status c1_wifi_scan(c1_wifi_snapshot *snapshot)
@@ -543,6 +574,7 @@ c1_status c1_wifi_connect(const char *ssid, const char *password, c1_wifi_snapsh
 
         if (interface_ipv4(ip, sizeof(ip))) {
             current_state = C1_WIFI_CONNECTED;
+            snprintf(cached_connected_ssid, sizeof(cached_connected_ssid), "%s", ssid);
             snprintf(last_error, sizeof(last_error), "CONNECTED TO %.32s", ssid);
             result = C1_STATUS_OK;
             goto finished;
@@ -559,6 +591,141 @@ finished:
     return result;
 }
 
+c1_status c1_wifi_pause(bool *was_enabled, bool *was_connected, bool *was_managed)
+{
+    char saved_ssid[C1_WIFI_SSID_CAPACITY];
+    char output[C1_WIFI_OUTPUT_CAPACITY];
+    char ip[C1_WIFI_IP_CAPACITY];
+    bool managed_control;
+    bool factory_control;
+    c1_status status;
+
+    if (was_enabled == NULL || was_connected == NULL || was_managed == NULL) {
+        return C1_STATUS_INVALID_ARGUMENT;
+    }
+    managed_control = control_ready();
+    factory_control = !managed_control && factory_control_ready();
+    *was_managed = managed_control || access(C1_WIFI_PID, F_OK) == 0;
+    *was_enabled = current_state != C1_WIFI_DISABLED || managed_control || factory_control ||
+                   access("/sys/class/net/wlan0", F_OK) == 0;
+    *was_connected = current_state == C1_WIFI_CONNECTED ||
+                     cached_connected_ssid[0] != '\0' ||
+                     interface_ipv4(ip, sizeof(ip));
+    if ((managed_control || factory_control) &&
+        run_wpa_command_timeout(managed_control ? C1_WIFI_CTRL_DIR : C1_WIFI_FACTORY_CTRL_DIR,
+                                "STATUS",
+                                output,
+                                sizeof(output),
+                                1000) &&
+        strstr(output, "wpa_state=COMPLETED") != NULL) {
+        char *ssid = strstr(output, "ssid=");
+
+        while (ssid != NULL && ssid != output && ssid[-1] != '\n') {
+            ssid = strstr(ssid + 5U, "ssid=");
+        }
+        *was_connected = true;
+        if (ssid != NULL) {
+            size_t length;
+
+            ssid += 5U;
+            length = strcspn(ssid, "\r\n");
+            if (length >= sizeof(cached_connected_ssid)) {
+                length = sizeof(cached_connected_ssid) - 1U;
+            }
+            memcpy(cached_connected_ssid, ssid, length);
+            cached_connected_ssid[length] = '\0';
+        }
+    }
+    if (!*was_enabled) {
+        return C1_STATUS_OK;
+    }
+    snprintf(saved_ssid, sizeof(saved_ssid), "%s", cached_connected_ssid);
+    status = c1_wifi_disable(NULL);
+    if (status == C1_STATUS_OK) {
+        snprintf(cached_connected_ssid, sizeof(cached_connected_ssid), "%s", saved_ssid);
+    }
+    return status;
+}
+
+c1_status c1_wifi_resume(bool was_enabled, bool was_connected, bool was_managed)
+{
+    char output[C1_WIFI_OUTPUT_CAPACITY];
+    unsigned int tick;
+
+    if (!was_enabled) {
+        return C1_STATUS_OK;
+    }
+    if (!was_managed) {
+        char *const argv[] = {"wifi_up.sh", NULL};
+
+        if (!run_program("/bin/wifi_up.sh", argv, 20U)) {
+            set_error("FACTORY WI-FI RESUME FAILED");
+            return C1_STATUS_UNAVAILABLE;
+        }
+        for (tick = 0U; tick < 20U && !factory_control_ready(); ++tick) {
+            sleep_milliseconds(100L);
+        }
+        if (!factory_control_ready()) {
+            set_error("FACTORY WI-FI CONTROL TIMEOUT");
+            return C1_STATUS_UNAVAILABLE;
+        }
+        if (!was_connected) {
+            (void)run_wpa_command_timeout(C1_WIFI_FACTORY_CTRL_DIR,
+                                          "DISCONNECT",
+                                          output,
+                                          sizeof(output),
+                                          1000);
+            terminate_processes_named("udhcpc");
+            current_state = C1_WIFI_READY;
+            last_error[0] = '\0';
+            return C1_STATUS_OK;
+        }
+        for (tick = 0U; tick < 100U; ++tick) {
+            char ip[C1_WIFI_IP_CAPACITY];
+
+            if (interface_ipv4(ip, sizeof(ip))) {
+                current_state = C1_WIFI_CONNECTED;
+                last_error[0] = '\0';
+                return C1_STATUS_OK;
+            }
+            sleep_milliseconds(200L);
+        }
+        set_error("FACTORY WI-FI RESUME TIMED OUT");
+        return C1_STATUS_UNAVAILABLE;
+    }
+    if (!ensure_wifi_ready()) {
+        return C1_STATUS_UNAVAILABLE;
+    }
+    if (!was_connected) {
+        current_state = C1_WIFI_READY;
+        return C1_STATUS_OK;
+    }
+    for (tick = 0U; tick < 30U; ++tick) {
+        if (run_wpa_command_timeout(C1_WIFI_CTRL_DIR,
+                                    "STATUS",
+                                    output,
+                                    sizeof(output),
+                                    500) &&
+            strstr(output, "wpa_state=COMPLETED") != NULL) {
+            char *const argv[] = {
+                "udhcpc", "-R", "-S", "-b", "-t", "10", "-T", "2", "-i", "wlan0",
+                "-p", C1_WIFI_DHCP_PID, "-x", "hostname:C1-Slim", NULL
+            };
+
+            terminate_processes_named("udhcpc");
+            if (!run_program("/sbin/udhcpc", argv, 5U)) {
+                (void)run_program("/bin/udhcpc", argv, 5U);
+            }
+            current_state = C1_WIFI_CONNECTED;
+            last_error[0] = '\0';
+            return C1_STATUS_OK;
+        }
+        sleep_milliseconds(100L);
+    }
+    set_error("WI-FI RESUME TIMED OUT");
+    return C1_STATUS_UNAVAILABLE;
+}
+
 c1_status c1_wifi_disable(c1_wifi_snapshot *snapshot)
 {
     char output[256];
@@ -573,6 +740,7 @@ c1_status c1_wifi_disable(c1_wifi_snapshot *snapshot)
     current_state = C1_WIFI_DISABLED;
     cached_network_count = 0U;
     memset(cached_networks, 0, sizeof(cached_networks));
+    cached_connected_ssid[0] = '\0';
     last_error[0] = '\0';
     unlink(C1_WIFI_PID);
     unlink(C1_WIFI_DHCP_PID);

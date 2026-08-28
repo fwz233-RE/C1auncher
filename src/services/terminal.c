@@ -209,6 +209,7 @@ c1_status c1_terminal_start(c1_terminal_session *session,
     session->exit_code = 0;
     session->pending_offset = 0U;
     session->pending_length = 0U;
+    session->suspended = false;
     return C1_STATUS_OK;
 }
 
@@ -330,6 +331,44 @@ ssize_t c1_terminal_read(c1_terminal_session *session, void *buffer, size_t capa
     return -1;
 }
 
+c1_status c1_terminal_suspend(c1_terminal_session *session, bool *was_running)
+{
+    pid_t foreground;
+
+    if (session == NULL || was_running == NULL) {
+        return C1_STATUS_INVALID_ARGUMENT;
+    }
+    *was_running = c1_terminal_is_running(session);
+    if (!*was_running) {
+        return C1_STATUS_OK;
+    }
+    foreground = tcgetpgrp(session->master_fd);
+    if (foreground <= 0 || kill(-foreground, SIGSTOP) != 0) {
+        return C1_STATUS_IO_ERROR;
+    }
+    session->suspended = true;
+    return C1_STATUS_OK;
+}
+
+c1_status c1_terminal_resume(c1_terminal_session *session, bool was_running)
+{
+    pid_t foreground;
+
+    if (session == NULL) {
+        return C1_STATUS_INVALID_ARGUMENT;
+    }
+    if (!was_running || !session->suspended) {
+        return C1_STATUS_OK;
+    }
+    foreground = session->master_fd >= 0 ? tcgetpgrp(session->master_fd) : -1;
+    if (foreground <= 0 || kill(-foreground, SIGCONT) != 0) {
+        c1_terminal_stop(session);
+        return C1_STATUS_IO_ERROR;
+    }
+    session->suspended = false;
+    return C1_STATUS_OK;
+}
+
 void c1_terminal_stop(c1_terminal_session *session)
 {
     int64_t deadline;
@@ -349,6 +388,7 @@ void c1_terminal_stop(c1_terminal_session *session)
     foreground = session->master_fd >= 0 ? tcgetpgrp(session->master_fd) : -1;
     if (foreground > 0) {
         (void)kill(-foreground, SIGHUP);
+        (void)kill(-foreground, SIGCONT);
     }
     (void)kill(session->child_pid, SIGHUP);
     close_master(session);
@@ -362,9 +402,13 @@ void c1_terminal_stop(c1_terminal_session *session)
         }
     }
     if (session->child_pid > 0) {
+        if (foreground > 0) {
+            (void)kill(-foreground, SIGKILL);
+        }
         (void)kill(session->child_pid, SIGKILL);
         reap_child(session, true);
     }
     session->state = C1_TERMINAL_STOPPED;
     session->exit_code = 0;
+    session->suspended = false;
 }

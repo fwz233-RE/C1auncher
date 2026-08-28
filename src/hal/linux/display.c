@@ -6,10 +6,15 @@
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 #include <unistd.h>
 
 #define C1_EPAPER_DEVICE "/dev/epaper_lcd"
 #define C1_EPAPER_REFRESH "/sys/devices/platform/e0266a128/epaper/refresh"
+
+static uint8_t cached_frame[C1_DISPLAY_FRAME_BYTES];
+static bool cached_frame_valid;
+static c1_linux_display_stats display_stats;
 
 static bool write_refresh(int *error_number)
 {
@@ -37,6 +42,7 @@ static bool write_refresh(int *error_number)
 static c1_status emit_result(c1_record_sink sink,
                              bool frame_written,
                              bool refresh_requested,
+                             bool unchanged_skipped,
                              int write_error,
                              int refresh_error)
 {
@@ -48,6 +54,7 @@ static c1_status emit_result(c1_record_sink sink,
         c1_record_add_integer(&record, "bytes", C1_DISPLAY_FRAME_BYTES) != C1_STATUS_OK ||
         c1_record_add_boolean(&record, "frame_written", frame_written) != C1_STATUS_OK ||
         c1_record_add_boolean(&record, "refresh_requested", refresh_requested) != C1_STATUS_OK ||
+        c1_record_add_boolean(&record, "unchanged_skipped", unchanged_skipped) != C1_STATUS_OK ||
         c1_record_add_integer(&record, "write_errno", write_error) != C1_STATUS_OK ||
         c1_record_add_integer(&record, "refresh_errno", refresh_error) != C1_STATUS_OK) {
         return C1_STATUS_INVALID_ARGUMENT;
@@ -71,6 +78,11 @@ static c1_status write_frame(const uint8_t *frame,
     if (frame == NULL || size != C1_DISPLAY_FRAME_BYTES || sink.emit == NULL) {
         return C1_STATUS_INVALID_ARGUMENT;
     }
+    if (!request_refresh && cached_frame_valid &&
+        memcmp(cached_frame, frame, C1_DISPLAY_FRAME_BYTES) == 0) {
+        ++display_stats.unchanged_skips;
+        return emit_result(sink, false, false, true, 0, 0);
+    }
 
     descriptor = open(C1_EPAPER_DEVICE, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
     if (descriptor < 0) {
@@ -92,9 +104,18 @@ static c1_status write_frame(const uint8_t *frame,
         refresh_requested = write_refresh(&refresh_error);
     }
 
+    if (frame_written) {
+        memcpy(cached_frame, frame, C1_DISPLAY_FRAME_BYTES);
+        cached_frame_valid = true;
+        ++display_stats.writes;
+        if (request_refresh && refresh_requested) {
+            ++display_stats.full_refreshes;
+        }
+    }
     emit_status = emit_result(sink,
                               frame_written,
                               refresh_requested,
+                              false,
                               write_error,
                               refresh_error);
     if (emit_status != C1_STATUS_OK) {
@@ -119,4 +140,16 @@ c1_status c1_linux_display_write_frame_fast(void *context,
 {
     (void)context;
     return write_frame(frame, size, false, sink);
+}
+
+void c1_linux_display_get_stats(c1_linux_display_stats *stats)
+{
+    if (stats != NULL) {
+        *stats = display_stats;
+    }
+}
+
+void c1_linux_display_reset_cache(void)
+{
+    cached_frame_valid = false;
 }

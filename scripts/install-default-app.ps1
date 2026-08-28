@@ -3,6 +3,7 @@ param(
     [ValidateSet('Install', 'Verify', 'RemoveOriginal')]
     [string]$Action = 'Install',
     [switch]$Reboot,
+    [switch]$EnableAutoSuspend,
     [ValidateRange(30, 600)]
     [int]$ReconnectTimeoutSeconds = 300,
     [string]$AdbPath = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
@@ -112,6 +113,23 @@ function Assert-SystemState {
     return [pscustomobject]@{ Identity = $identity.Output; RootMount = $rootMount; StorageMount = $storageMount }
 }
 
+function Assert-SuspendCapability {
+    $proof = Invoke-CheckedRemote "if [ -f /usr/data/c1/suspend-probe-passed ]; then cat /usr/data/c1/suspend-probe-passed; else echo missing; exit 1; fi"
+    if ($proof -notmatch '(?m)^result=passed$') {
+        throw "A successful suspend and ADB reconnect probe is required before automatic suspend can be enabled.`n$proof"
+    }
+    $probe = Invoke-CheckedRemote "state=unavailable; [ -r /sys/power/state ] && state=`$(cat /sys/power/state); writable=no; [ -w /sys/power/state ] && writable=yes; wake_sources=0; for node in /sys/devices/*/power/wakeup /sys/devices/*/*/power/wakeup /sys/devices/*/*/*/power/wakeup /sys/devices/*/*/*/*/power/wakeup; do [ -r `$node ] || continue; [ \"`$(cat `$node 2>/dev/null)\" = enabled ] && wake_sources=`$((wake_sources + 1)); done; input_wake_sources=0; for node in /sys/class/input/event*/device/power/wakeup; do [ -r `$node ] || continue; [ \"`$(cat `$node 2>/dev/null)\" = enabled ] && input_wake_sources=`$((input_wake_sources + 1)); done; echo power_state=`$state; echo state_writable=`$writable; echo enabled_wake_sources=`$wake_sources; echo enabled_input_wake_sources=`$input_wake_sources"
+    if ($probe -notmatch '(?m)^power_state=.*\bmem\b' -or
+        $probe -notmatch '(?m)^state_writable=yes$') {
+        throw "Automatic suspend capability probe failed.`n$probe"
+    }
+    $inputWakeMatch = [regex]::Match($probe, '(?m)^enabled_input_wake_sources=(\d+)$')
+    if (-not $inputWakeMatch.Success -or [int]$inputWakeMatch.Groups[1].Value -lt 1) {
+        throw "No enabled input-device wake source was found; automatic suspend remains disabled.`n$probe"
+    }
+    return ($proof + [Environment]::NewLine + $probe)
+}
+
 function Assert-ApplicationState([ValidateSet('Original', 'C1', 'C1OrLegacy')] [string]$Expected) {
     $deadline = [DateTimeOffset]::UtcNow.AddSeconds(20)
     do {
@@ -203,6 +221,8 @@ $script:Adb = Resolve-Adb
 try {
     $script:Serial = Get-OnlyDevice
     $baseline = Assert-SystemState
+    $suspendCapability = if ($EnableAutoSuspend) { Assert-SuspendCapability } else { 'automatic_suspend=disabled_by_default' }
+    Write-Evidence 'suspend-capability.txt' ($suspendCapability + [Environment]::NewLine)
     $hostKeyProbe = Invoke-Remote "if [ -f /usr/data/c1/ssh/ssh_host_ed25519_key ]; then sha256sum /usr/data/c1/ssh/ssh_host_ed25519_key; fi"
     if ($hostKeyProbe.Output -match '^([0-9a-fA-F]{64})\s+') {
         $hostKeyHash = $matches[1].ToLowerInvariant()
@@ -261,7 +281,8 @@ try {
     Invoke-CheckedRemote "sh -n $remoteScript" | Out-Null
     Invoke-CheckedRemote "sh -n $remoteShim" | Out-Null
     $actionName = if ($Action -eq 'RemoveOriginal') { 'remove-original' } else { $Action.ToLowerInvariant() }
-    $deviceHashArguments = "$expectedOriginalHash $shimHash $appHash $launcherHash $hostKeyHash $neofetchCommandHash $neofetchUpstreamHash $neofetchConfigHash $neofetchLicenseHash $neofetchLogoHash $expectedPreviousShimHash"
+    $autoSuspendMode = if ($EnableAutoSuspend) { 'enabled' } else { 'disabled' }
+    $deviceHashArguments = "$expectedOriginalHash $shimHash $appHash $launcherHash $hostKeyHash $neofetchCommandHash $neofetchUpstreamHash $neofetchConfigHash $neofetchLicenseHash $neofetchLogoHash $expectedPreviousShimHash $autoSuspendMode"
     $operation = Invoke-CheckedRemote "$remoteScript $actionName $deviceHashArguments"
     Write-Evidence 'operation.log' $operation
     Assert-SystemState | Out-Null
