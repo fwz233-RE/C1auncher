@@ -1,0 +1,11 @@
+{
+  "packages": [
+    {
+      "id": "c1ancher",
+      "version": "1.2.0",
+      "displayName": "C1ancher",
+      "entry": "C1ancher",
+      "payloadDirectory": "../../build/catalog-payload/c1ancher"
+    }
+  ]
+}

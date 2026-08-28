@@ -161,7 +161,8 @@ static uint32_t key_symbol(c1_terminal_key key)
     case C1_TERMINAL_KEY_DELETE: return XKB_KEY_Delete;
     case C1_TERMINAL_KEY_BACKSPACE: return XKB_KEY_BackSpace;
     case C1_TERMINAL_KEY_ENTER: return XKB_KEY_Return;
-    case C1_TERMINAL_KEY_TAB: return XKB_KEY_Tab;
+    case C1_TERMINAL_KEY_PAGE_UP: return XKB_KEY_Page_Up;
+    case C1_TERMINAL_KEY_PAGE_DOWN: return XKB_KEY_Page_Down;
     case C1_TERMINAL_KEY_ESCAPE: return XKB_KEY_Escape;
     }
     return XKB_KEY_VoidSymbol;

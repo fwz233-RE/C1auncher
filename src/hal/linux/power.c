@@ -2,7 +2,6 @@
 
 #include "hal/linux/power.h"
 
-#include "services/ssh.h"
 #include "services/wifi.h"
 
 #include <errno.h>
@@ -143,13 +142,6 @@ static c1_status resume_services(c1_linux_power_context *context,
             context->wifi_paused = false;
         }
     }
-    if (context->ssh_paused) {
-        if (c1_ssh_resume(context->ssh_enabled) != C1_STATUS_OK) {
-            result = C1_STATUS_IO_ERROR;
-        } else {
-            context->ssh_paused = false;
-        }
-    }
     if (context->terminal_paused) {
         if (c1_terminal_resume(terminal, context->terminal_running) != C1_STATUS_OK) {
             result = C1_STATUS_IO_ERROR;
@@ -176,13 +168,6 @@ c1_status c1_linux_power_prepare(c1_linux_power_context *context,
         return status;
     }
     context->terminal_paused = context->terminal_running;
-
-    status = c1_ssh_pause(&context->ssh_enabled);
-    context->ssh_paused = context->ssh_enabled;
-    if (status != C1_STATUS_OK) {
-        c1_linux_power_rollback(context, terminal);
-        return status;
-    }
 
     status = c1_wifi_pause(&context->wifi_enabled,
                            &context->wifi_connected,

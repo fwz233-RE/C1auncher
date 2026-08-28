@@ -54,6 +54,11 @@ $targets = @(
         Name = 'C1ancher-launcher'
         AbiPath = Join-Path $projectRoot 'build\launcher-abi.txt'
         BinaryPath = Join-Path $projectRoot 'build\C1ancher-launcher'
+    },
+    [pscustomobject]@{
+        Name = 'c1pkg'
+        AbiPath = Join-Path $projectRoot 'build\c1pkg-abi.txt'
+        BinaryPath = Join-Path $projectRoot 'build\c1pkg'
     }
 )
 $requiredPatterns = @(

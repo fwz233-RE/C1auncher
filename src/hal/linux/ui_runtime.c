@@ -7,7 +7,6 @@
 #include "hal/linux/display.h"
 #include "hal/linux/power.h"
 #include "hal/linux/system_state.h"
-#include "services/ssh.h"
 #include "services/terminal.h"
 #include "services/wifi.h"
 #include "platform/stop.h"
@@ -36,13 +35,12 @@
 #define C1_TERMINAL_REPEAT_DELAY_MS 450
 #define C1_TERMINAL_REPEAT_INTERVAL_MS 90
 #define C1_TERMINAL_NEOFETCH_COMMAND "clear; neofetch\r"
-#define C1_TERMINAL_NEOFETCH_CLEAR "\033[2J\033[H"
+#define C1_TERMINAL_APP_COMMAND "clear; /usr/data/c1/bin/c1pkg tui\r"
 
 typedef struct {
     c1_status status;
     c1_ui_action action;
     c1_wifi_snapshot wifi;
-    c1_ssh_snapshot ssh;
 } c1_service_result;
 
 typedef struct {
@@ -238,7 +236,6 @@ static c1_status emit_runtime_stats(c1_record_sink sink,
 static void merge_service_status(c1_ui_status *status)
 {
     c1_wifi_snapshot wifi;
-    c1_ssh_snapshot ssh;
     size_t index;
 
     if (c1_wifi_read_snapshot(&wifi)) {
@@ -259,11 +256,6 @@ static void merge_service_status(c1_ui_status *status)
                  wifi.connected_ssid);
         snprintf(status->wifi_ipv4, sizeof(status->wifi_ipv4), "%s", wifi.ipv4);
         snprintf(status->wifi_message, sizeof(status->wifi_message), "%s", wifi.error);
-    }
-    if (c1_ssh_read_snapshot(&ssh)) {
-        status->ssh_enabled = ssh.enabled;
-        snprintf(status->ssh_ipv4, sizeof(status->ssh_ipv4), "%s", ssh.ipv4);
-        snprintf(status->ssh_message, sizeof(status->ssh_message), "%s", ssh.error);
     }
 }
 
@@ -315,6 +307,18 @@ static c1_status render_wifi_scanning(c1_ui_state state, c1_record_sink sink)
     return render_state(state, &system_status, NULL, false, sink);
 }
 
+static const char *terminal_action_command(c1_ui_action action)
+{
+    switch (action) {
+    case C1_UI_ACTION_TERMINAL_NEOFETCH:
+        return C1_TERMINAL_NEOFETCH_COMMAND;
+    case C1_UI_ACTION_TERMINAL_APP:
+        return C1_TERMINAL_APP_COMMAND;
+    default:
+        return NULL;
+    }
+}
+
 static void run_service_action(c1_ui_action action,
                                const c1_ui_state *state,
                                c1_service_result *result)
@@ -333,13 +337,8 @@ static void run_service_action(c1_ui_action action,
     case C1_UI_ACTION_WIFI_DISABLE:
         result->status = c1_wifi_disable(&result->wifi);
         break;
-    case C1_UI_ACTION_SSH_ENABLE:
-        result->status = c1_ssh_enable(&result->ssh);
-        break;
-    case C1_UI_ACTION_SSH_DISABLE:
-        result->status = c1_ssh_disable(&result->ssh);
-        break;
     case C1_UI_ACTION_TERMINAL_NEOFETCH:
+    case C1_UI_ACTION_TERMINAL_APP:
     case C1_UI_ACTION_NONE:
         result->status = C1_STATUS_OK;
         break;
@@ -354,7 +353,7 @@ static c1_status service_worker_start(c1_service_worker *worker,
     pid_t child;
 
     if (worker == NULL || state == NULL || worker->pid > 0 ||
-        action == C1_UI_ACTION_NONE || action == C1_UI_ACTION_TERMINAL_NEOFETCH) {
+        action == C1_UI_ACTION_NONE || terminal_action_command(action) != NULL) {
         return C1_STATUS_INVALID_ARGUMENT;
     }
     if (pipe(descriptors) != 0) {
@@ -476,11 +475,8 @@ static void adopt_service_result(const c1_service_result *result)
     case C1_UI_ACTION_WIFI_DISABLE:
         c1_wifi_adopt_snapshot(&result->wifi);
         break;
-    case C1_UI_ACTION_SSH_ENABLE:
-    case C1_UI_ACTION_SSH_DISABLE:
-        c1_ssh_adopt_snapshot(&result->ssh);
-        break;
     case C1_UI_ACTION_TERMINAL_NEOFETCH:
+    case C1_UI_ACTION_TERMINAL_APP:
     case C1_UI_ACTION_NONE:
         break;
     }
@@ -554,6 +550,28 @@ static c1_status drain_terminal(c1_terminal_session *session,
         *changed = true;
     }
     return flush_terminal_replies(session, screen);
+}
+
+static c1_status send_pending_terminal_action(c1_terminal_session *session,
+                                              c1_ui_action *pending_action)
+{
+    const char *command;
+    c1_status status;
+
+    if (pending_action == NULL || *pending_action == C1_UI_ACTION_NONE ||
+        !c1_terminal_shell_is_foreground(session)) {
+        return C1_STATUS_OK;
+    }
+    command = terminal_action_command(*pending_action);
+    if (command == NULL) {
+        *pending_action = C1_UI_ACTION_NONE;
+        return C1_STATUS_INVALID_ARGUMENT;
+    }
+    status = c1_terminal_write(session, command, strlen(command));
+    if (status == C1_STATUS_OK) {
+        *pending_action = C1_UI_ACTION_NONE;
+    }
+    return status;
 }
 
 static void move_terminal_symbol(c1_ui_state *state, uint16_t code)
@@ -641,13 +659,13 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
     int64_t next_status_at;
     int64_t terminal_render_at = -1;
     bool terminal_dirty = false;
-    bool terminal_neofetch_pending = false;
+    c1_ui_action pending_terminal_action = C1_UI_ACTION_NONE;
     bool terminal_started_once = false;
     bool terminal_ended_announced = false;
+    bool terminal_app_mode = false;
     bool shift_pressed = false;
     bool shift_chord_used = false;
     bool control_pressed = false;
-    bool control_chord_used = false;
     uint16_t repeat_code = 0U;
     int64_t repeat_at = -1;
     uint64_t poll_calls = 0U;
@@ -730,7 +748,6 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                     shift_pressed = false;
                     shift_chord_used = false;
                     control_pressed = false;
-                    control_chord_used = false;
                     repeat_code = 0U;
                     repeat_at = -1;
                     terminal_render_at = -1;
@@ -861,10 +878,21 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                        (ssize_t)sizeof(input)) {
                     bool terminal_page = state.page == C1_UI_PAGE_TERMINAL;
                     bool password_page = c1_ui_is_password_page(state.page);
+                    bool app_volume_key;
+                    bool app_confirm_key;
 
                     if (input.type != EV_KEY) {
                         continue;
                     }
+                    app_volume_key =
+                        terminal_page && terminal_app_mode &&
+                        (input.code == KEY_VOLUMEUP || input.code == KEY_VOLUMEDOWN) &&
+                        c1_terminal_is_running(&terminal_session) &&
+                        !c1_terminal_shell_is_foreground(&terminal_session);
+                    app_confirm_key =
+                        terminal_page && terminal_app_mode && input.code == KEY_OK &&
+                        c1_terminal_is_running(&terminal_session) &&
+                        !c1_terminal_shell_is_foreground(&terminal_session);
                     if (input.code == KEY_WAKEUP &&
                         c1_power_policy_filter_wakeup(&power_policy, input.value != 0)) {
                         continue;
@@ -924,19 +952,11 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                         continue;
                     }
                     if (input.code == KEY_OK && terminal_page) {
-                        if (input.value == 1) {
-                            control_pressed = true;
-                            control_chord_used = false;
-                        } else if (input.value == 0) {
-                            bool send_tab = control_pressed && !control_chord_used &&
-                                            c1_terminal_is_running(&terminal_session);
-
-                            control_pressed = false;
-                            control_chord_used = false;
-                            if (send_tab) {
+                        if (app_confirm_key) {
+                            if (input.value == 1) {
                                 c1_terminal_screen_scroll_reset(&terminal_screen);
                                 (void)c1_terminal_screen_special(&terminal_screen,
-                                                                 C1_TERMINAL_KEY_TAB,
+                                                                 C1_TERMINAL_KEY_ENTER,
                                                                  0U);
                                 status = flush_terminal_replies(&terminal_session,
                                                                 &terminal_screen);
@@ -944,12 +964,14 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                                     goto done;
                                 }
                                 terminal_dirty = true;
-                                terminal_render_at = now + C1_TERMINAL_RENDER_DELAY_MS;
+                                terminal_render_at = now;
                             }
+                        } else {
+                            control_pressed = input.value != 0;
                         }
                         continue;
                     }
-                    if (terminal_page && terminal_repeatable(input.code)) {
+                    if (terminal_page && terminal_repeatable(input.code) && !app_volume_key) {
                         if (input.value == 1) {
                             repeat_code = input.code;
                             repeat_at = now + C1_TERMINAL_REPEAT_DELAY_MS;
@@ -971,6 +993,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                             state.terminal_symbol_picker = false;
                             state.page = C1_UI_PAGE_DESKTOP;
                             state.selection = 4U;
+                            terminal_app_mode = false;
                             status = render_current(state, &terminal_screen, true, sink);
                             if (status != C1_STATUS_OK) {
                                 goto done;
@@ -1014,14 +1037,24 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                             terminal_render_at = now;
                             continue;
                         }
-                        if (input.code == KEY_VOLUMEUP) {
-                            c1_terminal_screen_scroll_page_up(&terminal_screen);
-                            terminal_dirty = true;
-                            terminal_render_at = now;
-                            continue;
-                        }
-                        if (input.code == KEY_VOLUMEDOWN) {
-                            c1_terminal_screen_scroll_page_down(&terminal_screen);
+                        if (input.code == KEY_VOLUMEUP || input.code == KEY_VOLUMEDOWN) {
+                            if (app_volume_key) {
+                                c1_terminal_key key = input.code == KEY_VOLUMEUP
+                                                          ? C1_TERMINAL_KEY_PAGE_DOWN
+                                                          : C1_TERMINAL_KEY_PAGE_UP;
+
+                                c1_terminal_screen_scroll_reset(&terminal_screen);
+                                (void)c1_terminal_screen_special(&terminal_screen, key, 0U);
+                                status = flush_terminal_replies(&terminal_session,
+                                                                &terminal_screen);
+                                if (status != C1_STATUS_OK) {
+                                    goto done;
+                                }
+                            } else if (input.code == KEY_VOLUMEUP) {
+                                c1_terminal_screen_scroll_page_up(&terminal_screen);
+                            } else {
+                                c1_terminal_screen_scroll_page_down(&terminal_screen);
+                            }
                             terminal_dirty = true;
                             terminal_render_at = now;
                             continue;
@@ -1044,9 +1077,6 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                                 terminal_render_at = now;
                             }
                             continue;
-                        }
-                        if (control_pressed && input.code != KEY_OK) {
-                            control_chord_used = true;
                         }
                         status = send_terminal_key(&terminal_session,
                                                    &terminal_screen,
@@ -1082,15 +1112,14 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                             c1_ui_status current_status;
                             c1_ui_transition transition;
                             c1_ui_page previous_page = state.page;
-                            bool launch_neofetch;
+                            const char *terminal_command;
 
                             if (!read_ui_status(&current_status)) {
                                 status = C1_STATUS_UNAVAILABLE;
                                 goto done;
                             }
                             transition = c1_ui_step(state, event, &current_status);
-                            launch_neofetch =
-                                transition.action == C1_UI_ACTION_TERMINAL_NEOFETCH;
+                            terminal_command = terminal_action_command(transition.action);
                             if (!password_page &&
                                 emit_navigation(sink, input.code, event, transition.state) != C1_STATUS_OK) {
                                 status = C1_STATUS_IO_ERROR;
@@ -1104,6 +1133,8 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                                 bool terminal_was_running =
                                     c1_terminal_is_running(&terminal_session);
 
+                                terminal_app_mode =
+                                    transition.action == C1_UI_ACTION_TERMINAL_APP;
                                 state.keyboard_layer = C1_UI_KEYBOARD_LOWER;
                                 if (!terminal_was_running) {
                                     c1_terminal_screen_reset(&terminal_screen);
@@ -1119,31 +1150,26 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                                         terminal_ended_announced = false;
                                     }
                                 }
-                                if (launch_neofetch &&
+                                if (terminal_command != NULL &&
                                     c1_terminal_is_running(&terminal_session)) {
-                                    c1_terminal_screen_scroll_reset(&terminal_screen);
-                                    c1_terminal_screen_feed(
-                                        &terminal_screen,
-                                        C1_TERMINAL_NEOFETCH_CLEAR,
-                                        sizeof(C1_TERMINAL_NEOFETCH_CLEAR) - 1U);
-                                    terminal_dirty = true;
-                                    terminal_render_at = now;
                                     if (terminal_was_running) {
-                                        status = c1_terminal_write(
-                                            &terminal_session,
-                                            C1_TERMINAL_NEOFETCH_COMMAND,
-                                            sizeof(C1_TERMINAL_NEOFETCH_COMMAND) - 1U);
-                                        if (status != C1_STATUS_OK) {
-                                            goto done;
+                                        if (c1_terminal_shell_is_foreground(&terminal_session)) {
+                                            status = c1_terminal_write(&terminal_session,
+                                                                       terminal_command,
+                                                                       strlen(terminal_command));
+                                            if (status != C1_STATUS_OK) {
+                                                goto done;
+                                            }
+                                            c1_terminal_screen_scroll_reset(&terminal_screen);
+                                            terminal_dirty = true;
+                                            terminal_render_at =
+                                                now + C1_TERMINAL_RENDER_DELAY_MS;
                                         }
-                                        terminal_dirty = true;
-                                        terminal_render_at =
-                                            now + C1_TERMINAL_RENDER_DELAY_MS;
                                     } else {
-                                        terminal_neofetch_pending = true;
+                                        pending_terminal_action = transition.action;
                                     }
                                 }
-                                if (launch_neofetch) {
+                                if (terminal_command != NULL) {
                                     transition.action = C1_UI_ACTION_NONE;
                                 }
                                 status = render_current(state, &terminal_screen, true, sink);
@@ -1211,17 +1237,16 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                 if (status != C1_STATUS_OK && c1_terminal_is_running(&terminal_session)) {
                     break;
                 }
-                if (changed && terminal_neofetch_pending &&
+                if (changed && pending_terminal_action != C1_UI_ACTION_NONE &&
                     c1_terminal_is_running(&terminal_session)) {
-                    c1_terminal_screen_scroll_reset(&terminal_screen);
-                    status = c1_terminal_write(
-                        &terminal_session,
-                        C1_TERMINAL_NEOFETCH_COMMAND,
-                        sizeof(C1_TERMINAL_NEOFETCH_COMMAND) - 1U);
+                    status = send_pending_terminal_action(&terminal_session,
+                                                          &pending_terminal_action);
                     if (status != C1_STATUS_OK) {
                         break;
                     }
-                    terminal_neofetch_pending = false;
+                    if (pending_terminal_action == C1_UI_ACTION_NONE) {
+                        c1_terminal_screen_scroll_reset(&terminal_screen);
+                    }
                 }
                 if (changed) {
                     terminal_dirty = true;
@@ -1267,7 +1292,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                 c1_terminal_screen_feed(&terminal_screen, ended, (size_t)length);
             }
             terminal_ended_announced = true;
-            terminal_neofetch_pending = false;
+            pending_terminal_action = C1_UI_ACTION_NONE;
             repeat_code = 0U;
             repeat_at = -1;
             terminal_dirty = true;

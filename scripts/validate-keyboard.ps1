@@ -1,9 +1,12 @@
 [CmdletBinding()]
 param(
-    [string]$Path = (Join-Path (Split-Path -Parent $PSScriptRoot) 'config\c1-slim\keyboard.csv')
+    [string]$Path
 )
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($Path)) {
+    $Path = Join-Path (Split-Path -Parent $PSScriptRoot) 'config\c1-slim\keyboard.csv'
+}
 $rows = @(Import-Csv -LiteralPath $Path)
 
 if ($rows.Count -ne 40) {
