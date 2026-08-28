@@ -17,5 +17,8 @@ typedef struct {
 bool c1_ssh_read_snapshot(c1_ssh_snapshot *snapshot);
 c1_status c1_ssh_enable(c1_ssh_snapshot *snapshot);
 c1_status c1_ssh_disable(c1_ssh_snapshot *snapshot);
+c1_status c1_ssh_pause(bool *was_enabled);
+c1_status c1_ssh_resume(bool was_enabled);
+void c1_ssh_adopt_snapshot(const c1_ssh_snapshot *snapshot);
 
 #endif

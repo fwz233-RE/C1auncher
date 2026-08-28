@@ -38,22 +38,29 @@ bool c1_ui_is_password_page(c1_ui_page page)
     return page == C1_UI_PAGE_WIFI_PASSWORD;
 }
 
-bool c1_ui_toggle_lock(c1_ui_state *state)
+bool c1_ui_enter_lock(c1_ui_state *state)
 {
-    if (state == NULL) {
+    if (state == NULL || state->page == C1_UI_PAGE_LOCK) {
         return false;
     }
-    if (state->page == C1_UI_PAGE_DESKTOP) {
-        state->page = C1_UI_PAGE_LOCK;
-        state->selection = 4U;
-        return true;
+    c1_ui_clear_secret(state);
+    state->page = C1_UI_PAGE_LOCK;
+    state->selection = 4U;
+    state->symbol_selection = 0U;
+    state->keyboard_layer = C1_UI_KEYBOARD_LOWER;
+    state->terminal_symbol_picker = false;
+    state->selected_ssid[0] = '\0';
+    return true;
+}
+
+bool c1_ui_unlock(c1_ui_state *state)
+{
+    if (state == NULL || state->page != C1_UI_PAGE_LOCK) {
+        return false;
     }
-    if (state->page == C1_UI_PAGE_LOCK) {
-        state->page = C1_UI_PAGE_DESKTOP;
-        state->selection = 4U;
-        return true;
-    }
-    return false;
+    state->page = C1_UI_PAGE_DESKTOP;
+    state->selection = 4U;
+    return true;
 }
 
 bool c1_ui_secret_append(c1_ui_state *state, char character)

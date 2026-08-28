@@ -16,6 +16,7 @@ SOURCES := \
 	src/main.c \
 	src/core/status.c \
 	src/core/record.c \
+	src/core/power_policy.c \
 	src/display/frame.c \
 	src/ui/model.c \
 	src/ui/canvas.c \
@@ -25,6 +26,7 @@ SOURCES := \
 	src/services/wifi.c \
 	src/services/ssh.c \
 	src/services/terminal.c \
+	src/hal/linux/power.c \
 	src/hal/linux/system_state.c \
 	src/hal/linux/display.c \
 	src/hal/linux/ui_runtime.c \
@@ -44,13 +46,15 @@ HOST_TEST_SOURCES := \
 	tests/test_main.c \
 	src/core/status.c \
 	src/core/record.c \
+	src/core/power_policy.c \
 	src/display/frame.c \
 	src/ui/model.c \
 	src/ui/canvas.c \
 	src/ui/render.c \
 	src/ui/wallpaper.c \
 	src/ui/terminal_screen.c \
-	src/services/terminal.c
+	src/services/terminal.c \
+	src/platform/stop.c
 
 LAUNCHER_SOURCES := \
 	src/launcher/main.c \

@@ -13,6 +13,8 @@ legacy_app=$bin_dir/c1-app
 launcher=$bin_dir/app_daemon
 enabled=/usr/data/c1/enabled
 original_removed=/usr/data/c1/original-software-removed
+auto_suspend_disabled=/usr/data/c1/disable-auto-suspend
+suspend_probe_passed=/usr/data/c1/suspend-probe-passed
 factory_app_dir=/usr/bin/d261
 factory_init_script=/etc/init.d/S80app
 staged_shim=/dev/shm/C1ancher-daemon.shim
@@ -257,6 +259,39 @@ write_manifest() {
     sync
 }
 
+configure_auto_suspend() {
+    mode=$1
+    case "$mode" in
+        enabled)
+            [ -f "$suspend_probe_passed" ] && grep -qx 'result=passed' "$suspend_probe_passed" || {
+                echo "automatic suspend requires a successful suspend/reconnect probe: $suspend_probe_passed" >&2
+                return 1
+            }
+            rm -f "$auto_suspend_disabled"
+            ;;
+        disabled)
+            temporary=$auto_suspend_disabled.new.$$
+            : > "$temporary"
+            chmod 600 "$temporary"
+            mv "$temporary" "$auto_suspend_disabled"
+            ;;
+        *)
+            echo "invalid automatic suspend mode: $mode" >&2
+            return 1
+            ;;
+    esac
+    sync
+}
+
+verify_auto_suspend() {
+    mode=$1
+    case "$mode" in
+        enabled) [ ! -e "$auto_suspend_disabled" ] && [ -f "$suspend_probe_passed" ] && grep -qx 'result=passed' "$suspend_probe_passed" ;;
+        disabled) [ -f "$auto_suspend_disabled" ] ;;
+        *) return 1 ;;
+    esac
+}
+
 install_default_app() {
     original_hash=$1
     shim_hash=$2
@@ -270,6 +305,7 @@ install_default_app() {
     shift 9
     neofetch_logo_hash=$1
     previous_shim_hash=$2
+    auto_suspend_mode=$3
     current_hash=$(hash_file "$target")
 
     require_hash "$staged_shim" "$shim_hash"
@@ -323,6 +359,7 @@ install_default_app() {
     chmod 700 "$data_dir/device-default-app.sh" "$storage_dir/device-default-app.sh"
     write_manifest "$data_dir" "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$host_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash"
     write_manifest "$storage_dir" "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$host_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash"
+    configure_auto_suspend "$auto_suspend_mode"
     temporary=$enabled.new.$$
     echo 'enabled' > "$temporary"
     chmod 600 "$temporary"
@@ -346,6 +383,7 @@ verify_default_app() {
     neofetch_license_hash=$9
     shift 9
     neofetch_logo_hash=$1
+    auto_suspend_mode=$2
 
     require_hash "$target" "$shim_hash"
     require_hash "$root_backup" "$original_hash"
@@ -356,6 +394,7 @@ verify_default_app() {
     require_hash "$launcher" "$launcher_hash"
     require_hash "$ssh_host_key" "$host_key_hash"
     verify_neofetch "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash"
+    verify_auto_suspend "$auto_suspend_mode"
     [ -f "$enabled" ]
     if [ -f "$original_removed" ]; then
         [ ! -e "$factory_app_dir" ]
@@ -415,17 +454,19 @@ neofetch_config_hash=${9:-}
 neofetch_license_hash=${10:-}
 neofetch_logo_hash=${11:-}
 previous_shim_hash=${12:-}
-[ -n "$original_hash" ] && [ -n "$shim_hash" ] && [ -n "$app_hash" ] && [ -n "$launcher_hash" ] && [ -n "$host_key_hash" ] && [ -n "$neofetch_command_hash" ] && [ -n "$neofetch_upstream_hash" ] && [ -n "$neofetch_config_hash" ] && [ -n "$neofetch_license_hash" ] && [ -n "$neofetch_logo_hash" ] && [ -n "$previous_shim_hash" ] || {
-    echo "usage: $0 {install|verify|remove-original} ORIGINAL_HASH SHIM_HASH APP_HASH LAUNCHER_HASH HOST_KEY_HASH NEOFETCH_COMMAND_HASH NEOFETCH_UPSTREAM_HASH NEOFETCH_CONFIG_HASH NEOFETCH_LICENSE_HASH NEOFETCH_LOGO_HASH PREVIOUS_SHIM_HASH" >&2
+auto_suspend_mode=${13:-}
+[ -n "$original_hash" ] && [ -n "$shim_hash" ] && [ -n "$app_hash" ] && [ -n "$launcher_hash" ] && [ -n "$host_key_hash" ] && [ -n "$neofetch_command_hash" ] && [ -n "$neofetch_upstream_hash" ] && [ -n "$neofetch_config_hash" ] && [ -n "$neofetch_license_hash" ] && [ -n "$neofetch_logo_hash" ] && [ -n "$previous_shim_hash" ] && [ -n "$auto_suspend_mode" ] || {
+    echo "usage: $0 {install|verify|remove-original} ORIGINAL_HASH SHIM_HASH APP_HASH LAUNCHER_HASH HOST_KEY_HASH NEOFETCH_COMMAND_HASH NEOFETCH_UPSTREAM_HASH NEOFETCH_CONFIG_HASH NEOFETCH_LICENSE_HASH NEOFETCH_LOGO_HASH PREVIOUS_SHIM_HASH {enabled|disabled}" >&2
     exit 64
 }
+case "$auto_suspend_mode" in enabled|disabled) ;; *) echo "invalid automatic suspend mode: $auto_suspend_mode" >&2; exit 64 ;; esac
 
 case "$action" in
-    install) install_default_app "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$host_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash" "$previous_shim_hash" ;;
-    verify) verify_default_app "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$host_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash" ;;
+    install) install_default_app "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$host_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash" "$previous_shim_hash" "$auto_suspend_mode" ;;
+    verify) verify_default_app "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$host_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash" "$auto_suspend_mode" ;;
     remove-original) remove_original_software "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" ;;
     *)
-        echo "usage: $0 {install|verify|remove-original} ORIGINAL_HASH SHIM_HASH APP_HASH LAUNCHER_HASH HOST_KEY_HASH NEOFETCH_COMMAND_HASH NEOFETCH_UPSTREAM_HASH NEOFETCH_CONFIG_HASH NEOFETCH_LICENSE_HASH NEOFETCH_LOGO_HASH PREVIOUS_SHIM_HASH" >&2
+        echo "usage: $0 {install|verify|remove-original} ORIGINAL_HASH SHIM_HASH APP_HASH LAUNCHER_HASH HOST_KEY_HASH NEOFETCH_COMMAND_HASH NEOFETCH_UPSTREAM_HASH NEOFETCH_CONFIG_HASH NEOFETCH_LICENSE_HASH NEOFETCH_LOGO_HASH PREVIOUS_SHIM_HASH {enabled|disabled}" >&2
         exit 64
         ;;
 esac

@@ -39,5 +39,8 @@ bool c1_wifi_read_snapshot(c1_wifi_snapshot *snapshot);
 c1_status c1_wifi_scan(c1_wifi_snapshot *snapshot);
 c1_status c1_wifi_connect(const char *ssid, const char *password, c1_wifi_snapshot *snapshot);
 c1_status c1_wifi_disable(c1_wifi_snapshot *snapshot);
+c1_status c1_wifi_pause(bool *was_enabled, bool *was_connected, bool *was_managed);
+c1_status c1_wifi_resume(bool was_enabled, bool was_connected, bool was_managed);
+void c1_wifi_adopt_snapshot(const c1_wifi_snapshot *snapshot);
 
 #endif
