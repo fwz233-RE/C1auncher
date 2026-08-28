@@ -4,6 +4,7 @@
 #include "display/frame.h"
 #include "platform/stop.h"
 #include "services/terminal.h"
+#include "services/wifi.h"
 #include "ui/canvas.h"
 #include "ui/model.h"
 #include "ui/render.h"
@@ -118,6 +119,38 @@ static bool frame_region_equal(const uint8_t *left,
     return true;
 }
 
+static void test_wifi_ssid_codec(void)
+{
+    static const char escaped[] =
+        "\\xe6\\xb1\\xa4\\xe6\\x82\\xa6\\xe6\\xb8\\xa9\\xe6\\xb3\\x89"
+        "\\xe6\\xb1\\x97\\xe8\\x92\\xb8\\xe9\\xa6\\x86";
+    static const char expected[] = {
+        (char)0xe6, (char)0xb1, (char)0xa4, (char)0xe6, (char)0x82, (char)0xa6,
+        (char)0xe6, (char)0xb8, (char)0xa9, (char)0xe6, (char)0xb3, (char)0x89,
+        (char)0xe6, (char)0xb1, (char)0x97, (char)0xe8, (char)0x92, (char)0xb8,
+        (char)0xe9, (char)0xa6, (char)0x86, '\0'
+    };
+    static const char expected_hex[] =
+        "e6b1a4e682a6e6b8a9e6b389e6b197e892b8e9a686";
+    char decoded[C1_WIFI_SSID_CAPACITY];
+    char encoded[C1_WIFI_SSID_CAPACITY * 2U];
+    char small[8];
+
+    expect(c1_wifi_decode_scan_ssid(escaped, decoded, sizeof(decoded)) &&
+               memcmp(decoded, expected, sizeof(expected)) == 0,
+           "Wi-Fi scan decoding restores an escaped UTF-8 SSID");
+    expect(c1_wifi_encode_control_ssid(decoded, encoded, sizeof(encoded)) &&
+               strcmp(encoded, expected_hex) == 0,
+           "Wi-Fi control encoding preserves every UTF-8 SSID byte");
+    expect(c1_wifi_decode_scan_ssid("Cafe\\\\Guest", decoded, sizeof(decoded)) &&
+               strcmp(decoded, "Cafe\\Guest") == 0,
+           "Wi-Fi scan decoding restores escaped backslashes");
+    expect(!c1_wifi_decode_scan_ssid("bad\\x0", decoded, sizeof(decoded)),
+           "Wi-Fi scan decoding rejects truncated hexadecimal escapes");
+    expect(!c1_wifi_decode_scan_ssid(escaped, small, sizeof(small)),
+           "Wi-Fi scan decoding rejects an SSID that exceeds its destination");
+}
+
 static void test_ui(void)
 {
     c1_ui_state state = c1_ui_initial_state();
@@ -228,9 +261,19 @@ static void test_ui(void)
     transition = c1_ui_step(transition.state, C1_UI_EVENT_DOWN, &status);
     expect(transition.state.selection == 2U,
            "down moves from the action bar to the first network");
+    status.networks[0].secured = false;
     transition = c1_ui_step(transition.state, C1_UI_EVENT_ENTER, &status);
-    expect(transition.state.page == C1_UI_PAGE_WIFI_PASSWORD,
-           "network selection opens the password input page");
+    expect(transition.state.page == C1_UI_PAGE_WIFI &&
+               transition.action == C1_UI_ACTION_WIFI_CONNECT &&
+               transition.state.secret_length == 0U,
+           "open network selection connects immediately without a password page");
+    expect(strcmp(transition.state.selected_ssid, "TEST-NETWORK") == 0,
+           "open network connection retains the selected SSID");
+    status.networks[0].secured = true;
+    transition = c1_ui_step(transition.state, C1_UI_EVENT_ENTER, &status);
+    expect(transition.state.page == C1_UI_PAGE_WIFI_PASSWORD &&
+               transition.action == C1_UI_ACTION_NONE,
+           "secured network selection opens the password input page");
     expect(strcmp(transition.state.selected_ssid, "TEST-NETWORK") == 0,
            "selected SSID is retained for connection");
     expect(transition.state.keyboard_layer == C1_UI_KEYBOARD_LOWER,
@@ -584,6 +627,7 @@ static void test_ndjson(void)
 int main(void)
 {
     test_display_frame();
+    test_wifi_ssid_codec();
     test_ui();
     test_terminal_screen();
     test_terminal_pty();

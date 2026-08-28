@@ -1,4 +1,5 @@
 CROSS_COMPILE ?= mipsel-linux-gnu-
+VERSION := $(strip $(shell cat VERSION))
 CC := $(CROSS_COMPILE)gcc
 READELF := $(CROSS_COMPILE)readelf
 STRIP := $(CROSS_COMPILE)strip
@@ -53,6 +54,7 @@ HOST_TEST_SOURCES := \
 	src/ui/render.c \
 	src/ui/wallpaper.c \
 	src/ui/terminal_screen.c \
+	src/services/wifi.c \
 	src/services/terminal.c \
 	src/platform/stop.c
 
@@ -74,7 +76,7 @@ TSM_INCLUDES := \
 	-Ithird_party/libtsm/src/shared \
 	-Ithird_party/libtsm/external \
 	-Ithird_party/libtsm/external/wcwidth
-CPPFLAGS := -D_POSIX_C_SOURCE=200809L -Isrc $(TSM_INCLUDES)
+CPPFLAGS := -D_POSIX_C_SOURCE=200809L -DC1_VERSION=\"$(VERSION)\" -Isrc $(TSM_INCLUDES)
 COMMON_CFLAGS := -std=c11 -Os -Wall -Wextra -Wpedantic -Werror \
 	-ffunction-sections -fdata-sections -fstack-protector-strong
 TSM_CFLAGS := -std=gnu99 -Os -Wall -Wextra -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L \

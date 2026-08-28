@@ -340,6 +340,106 @@ static bool ensure_wifi_ready(void)
     return false;
 }
 
+static int hex_value(char character)
+{
+    if (character >= '0' && character <= '9') {
+        return character - '0';
+    }
+    if (character >= 'a' && character <= 'f') {
+        return character - 'a' + 10;
+    }
+    if (character >= 'A' && character <= 'F') {
+        return character - 'A' + 10;
+    }
+    return -1;
+}
+
+bool c1_wifi_decode_scan_ssid(const char *encoded, char *decoded, size_t capacity)
+{
+    size_t input_index = 0U;
+    size_t output_index = 0U;
+
+    if (encoded == NULL || decoded == NULL || capacity == 0U) {
+        return false;
+    }
+    while (encoded[input_index] != '\0') {
+        unsigned char value = (unsigned char)encoded[input_index++];
+
+        if (value == '\\') {
+            char escape = encoded[input_index++];
+
+            if (escape == '\0') {
+                return false;
+            }
+            if (escape == 'x') {
+                int high;
+                int low;
+
+                if (encoded[input_index] == '\0' || encoded[input_index + 1U] == '\0') {
+                    return false;
+                }
+                high = hex_value(encoded[input_index]);
+                low = hex_value(encoded[input_index + 1U]);
+                if (high < 0 || low < 0) {
+                    return false;
+                }
+                value = (unsigned char)((high << 4) | low);
+                input_index += 2U;
+            } else {
+                switch (escape) {
+                case '\\':
+                case '"':
+                    value = (unsigned char)escape;
+                    break;
+                case 'n':
+                    value = '\n';
+                    break;
+                case 'r':
+                    value = '\r';
+                    break;
+                case 't':
+                    value = '\t';
+                    break;
+                case 'e':
+                    value = 27U;
+                    break;
+                default:
+                    return false;
+                }
+            }
+        }
+        if (value == 0U || output_index + 1U >= capacity) {
+            return false;
+        }
+        decoded[output_index++] = (char)value;
+    }
+    decoded[output_index] = '\0';
+    return output_index > 0U;
+}
+
+bool c1_wifi_encode_control_ssid(const char *ssid, char *encoded, size_t capacity)
+{
+    static const char digits[] = "0123456789abcdef";
+    size_t index;
+    size_t length;
+
+    if (ssid == NULL || encoded == NULL) {
+        return false;
+    }
+    length = strlen(ssid);
+    if (length == 0U || length > 32U || capacity < length * 2U + 1U) {
+        return false;
+    }
+    for (index = 0U; index < length; ++index) {
+        unsigned char value = (unsigned char)ssid[index];
+
+        encoded[index * 2U] = digits[value >> 4U];
+        encoded[index * 2U + 1U] = digits[value & 0x0fU];
+    }
+    encoded[length * 2U] = '\0';
+    return true;
+}
+
 static int network_compare(const void *left, const void *right)
 {
     const c1_wifi_network *a = left;
@@ -357,12 +457,14 @@ static void parse_scan_results(char *output)
     while (line != NULL) {
         char bssid[24];
         char flags[128];
+        char encoded_ssid[C1_WIFI_SSID_CAPACITY * 4U];
         char ssid[C1_WIFI_SSID_CAPACITY];
         int frequency;
         int signal;
 
-        if (sscanf(line, "%23s\t%d\t%d\t%127s\t%32[^\r\n]", bssid, &frequency, &signal, flags, ssid) == 5 &&
-            strchr(bssid, ':') != NULL && ssid[0] != '\0') {
+        if (sscanf(line, "%23s\t%d\t%d\t%127s\t%131[^\r\n]", bssid, &frequency, &signal, flags, encoded_ssid) == 5 &&
+            strchr(bssid, ':') != NULL &&
+            c1_wifi_decode_scan_ssid(encoded_ssid, ssid, sizeof(ssid))) {
             size_t index;
             bool duplicate = false;
 
@@ -493,7 +595,7 @@ c1_status c1_wifi_scan(c1_wifi_snapshot *snapshot)
 c1_status c1_wifi_connect(const char *ssid, const char *password, c1_wifi_snapshot *snapshot)
 {
     char output[C1_WIFI_OUTPUT_CAPACITY];
-    char quoted_ssid[68];
+    char encoded_ssid[C1_WIFI_SSID_CAPACITY * 2U];
     char quoted_password[132];
     char command[224];
     char network_id[16];
@@ -502,8 +604,8 @@ c1_status c1_wifi_connect(const char *ssid, const char *password, c1_wifi_snapsh
     unsigned int tick;
     c1_status result = C1_STATUS_IO_ERROR;
 
-    if (ssid == NULL || password == NULL || ssid[0] == '\0' || strlen(ssid) > 32U ||
-        !quote_wpa_value(ssid, quoted_ssid, sizeof(quoted_ssid))) {
+    if (ssid == NULL || password == NULL ||
+        !c1_wifi_encode_control_ssid(ssid, encoded_ssid, sizeof(encoded_ssid))) {
         set_error("INVALID NETWORK");
         c1_wifi_read_snapshot(snapshot);
         return C1_STATUS_INVALID_ARGUMENT;
@@ -528,7 +630,7 @@ c1_status c1_wifi_connect(const char *ssid, const char *password, c1_wifi_snapsh
         set_error("NETWORK ID FAILED");
         goto finished;
     }
-    snprintf(command, sizeof(command), "SET_NETWORK %s ssid %s", network_id, quoted_ssid);
+    snprintf(command, sizeof(command), "SET_NETWORK %s ssid %s", network_id, encoded_ssid);
     if (!run_wpa_command(command, output, sizeof(output)) || strstr(output, "OK") == NULL) {
         set_error("SSID REJECTED");
         goto finished;

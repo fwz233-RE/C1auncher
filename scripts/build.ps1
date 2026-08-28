@@ -63,7 +63,14 @@ $requiredPatterns = @(
     'FP ABI:\s+Hard float \(double precision\)'
 )
 
+$versionPath = Join-Path $projectRoot 'VERSION'
+$version = (Get-Content -Raw -LiteralPath $versionPath).Trim()
+if ($version -notmatch '^\d+\.\d+\.\d+$') {
+    throw "VERSION must contain a semantic version such as 1.0.0: $version"
+}
+
 $buildInfo = @(
+    "version=$version"
     "built_at=$([DateTimeOffset]::Now.ToString('o'))"
     "cross_compile=$CrossCompile"
     'target=mips32r2-little-o32-hard-float-double-static'
