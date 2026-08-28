@@ -33,7 +33,7 @@ C1-Slim / MP-D261 的自研用户空间界面，面向 296×152 黑白电子纸�
 | 终端 | 音量键 | 翻阅滚动历史 |
 | 终端 | Wakeup | 打开扩展符号面板 |
 
-任意非首页页面连续 5 分钟无输入会返回首页并锁屏，锁屏 30 秒后请求 Linux `mem` 休眠。**自动深度休眠默认关闭**；必须先完成物理唤醒和 ADB 重连探测，再使用 `-EnableAutoSuspend` 显式启用。详细步骤见 [`docs/power-validation.md`](docs/power-validation.md)。
+首页及其他页面连续 5 分钟无输入会进入壁纸锁屏，锁屏 30 秒后请求 Linux `mem` 休眠。**自动深度休眠默认关闭**；必须先完成物理唤醒和 ADB 重连探测，再使用 `-EnableAutoSuspend` 显式启用。详细步骤见 [`docs/power-validation.md`](docs/power-validation.md)。
 
 ## 构建
 

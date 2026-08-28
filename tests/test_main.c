@@ -512,54 +512,67 @@ static void test_power_policy(void)
     c1_power_policy policy;
     c1_ui_state state = c1_ui_initial_state();
     int64_t now = 1000;
+    int64_t non_desktop_locked_at;
 
     c1_power_policy_init(&policy, now);
     expect(policy.state == C1_POWER_ACTIVE,
            "power policy starts active");
+    expect(c1_power_policy_timeout(&policy, now) == C1_POWER_IDLE_TIMEOUT_MS,
+           "active policy schedules the five-minute idle deadline on the desktop");
     expect(c1_power_policy_tick(&policy,
-                                now + C1_POWER_IDLE_TIMEOUT_MS + 1,
-                                true) == C1_POWER_ACTION_NONE,
-           "idle desktop remains active");
+                                now + C1_POWER_IDLE_TIMEOUT_MS - 1) ==
+               C1_POWER_ACTION_NONE,
+           "idle desktop remains active before five minutes");
+    c1_power_policy_note_activity(&policy, now + C1_POWER_IDLE_TIMEOUT_MS - 1);
+    expect(c1_power_policy_tick(&policy,
+                                now + (2 * C1_POWER_IDLE_TIMEOUT_MS) - 2) ==
+               C1_POWER_ACTION_NONE,
+           "desktop input resets the idle deadline");
+    expect(c1_power_policy_tick(&policy,
+                                now + (2 * C1_POWER_IDLE_TIMEOUT_MS) - 1) ==
+               C1_POWER_ACTION_ENTER_LOCK,
+           "idle desktop requests lock at five minutes");
+    expect(c1_ui_enter_lock(&state) && state.page == C1_UI_PAGE_LOCK,
+           "idle desktop enters the wallpaper lock screen");
+    expect(c1_power_policy_unlock(&policy, now + (2 * C1_POWER_IDLE_TIMEOUT_MS)) &&
+               c1_ui_unlock(&state),
+           "desktop idle-lock test returns to active state");
 
     state.page = C1_UI_PAGE_WIFI_PASSWORD;
     snprintf(state.secret, sizeof(state.secret), "%s", "temporary-password");
     state.secret_length = strlen(state.secret);
     state.terminal_symbol_picker = true;
-    expect(c1_power_policy_tick(&policy,
-                                now + C1_POWER_IDLE_TIMEOUT_MS,
-                                false) == C1_POWER_ACTION_ENTER_LOCK,
-           "idle non-desktop page requests lock");
+    non_desktop_locked_at = now + (3 * C1_POWER_IDLE_TIMEOUT_MS);
+    expect(c1_power_policy_tick(&policy, non_desktop_locked_at) ==
+               C1_POWER_ACTION_ENTER_LOCK,
+           "idle non-desktop page still requests lock");
     expect(c1_ui_enter_lock(&state) && state.page == C1_UI_PAGE_LOCK &&
                state.secret_length == 0U && state.secret[0] == '\0' &&
                !state.terminal_symbol_picker,
            "automatic lock clears transient input state");
     expect(c1_power_policy_tick(&policy,
-                                now + C1_POWER_IDLE_TIMEOUT_MS +
-                                    C1_POWER_LOCK_TIMEOUT_MS - 1,
-                                false) == C1_POWER_ACTION_NONE,
+                                non_desktop_locked_at +
+                                    C1_POWER_LOCK_TIMEOUT_MS - 1) == C1_POWER_ACTION_NONE,
            "lock grace period delays suspend");
     expect(c1_power_policy_tick(&policy,
-                                now + C1_POWER_IDLE_TIMEOUT_MS +
-                                    C1_POWER_LOCK_TIMEOUT_MS,
-                                false) == C1_POWER_ACTION_SUSPEND,
+                                non_desktop_locked_at +
+                                    C1_POWER_LOCK_TIMEOUT_MS) == C1_POWER_ACTION_SUSPEND,
            "locked policy requests suspend after grace period");
 
-    c1_power_policy_suspend_failed(&policy, now + C1_POWER_IDLE_TIMEOUT_MS +
+    c1_power_policy_suspend_failed(&policy, non_desktop_locked_at +
                                                 C1_POWER_LOCK_TIMEOUT_MS);
     expect(policy.state == C1_POWER_LOCKED,
            "failed suspend returns to locked state");
     expect(c1_power_policy_tick(&policy,
-                                now + C1_POWER_IDLE_TIMEOUT_MS +
+                                non_desktop_locked_at +
                                     C1_POWER_LOCK_TIMEOUT_MS +
-                                    C1_POWER_RETRY_DELAY_MS - 1,
-                                false) == C1_POWER_ACTION_NONE,
+                                    C1_POWER_RETRY_DELAY_MS - 1) == C1_POWER_ACTION_NONE,
            "failed suspend uses bounded retry delay");
 
     expect(c1_power_policy_tick(&policy,
-                                now + C1_POWER_IDLE_TIMEOUT_MS +
+                                non_desktop_locked_at +
                                     C1_POWER_LOCK_TIMEOUT_MS +
-                                    C1_POWER_RETRY_DELAY_MS,
-                                false) == C1_POWER_ACTION_SUSPEND,
+                                    C1_POWER_RETRY_DELAY_MS) == C1_POWER_ACTION_SUSPEND,
            "failed suspend retries after the bounded delay");
     c1_power_policy_suspend_failed(&policy, now + 1000000);
 
@@ -582,9 +595,8 @@ static void test_power_policy(void)
     c1_power_policy_suspend_unavailable(&policy);
     expect(c1_power_policy_tick(&policy,
                                 now + C1_POWER_LOCK_TIMEOUT_MS +
-                                    C1_POWER_RETRY_DELAY_MS,
-                                true) == C1_POWER_ACTION_NONE &&
-               c1_power_policy_timeout(&policy, now, true) == -1,
+                                    C1_POWER_RETRY_DELAY_MS) == C1_POWER_ACTION_NONE &&
+               c1_power_policy_timeout(&policy, now) == -1,
            "unsupported suspend leaves locked policy indefinitely blocked");
 }
 
