@@ -23,6 +23,18 @@ modify and relink these components are included in this repository's
 `Makefile`. The installed `C1ancher` binary statically contains the listed
 components; no separate libtsm runtime is required on the device.
 
+## ed25519
+
+The `c1pkg` package manager vendors the portable Ed25519 implementation by
+Orson Peters (`orlp/ed25519`), based on SUPERCOP ref10, from:
+
+https://github.com/orlp/ed25519
+
+It is distributed under the permissive zlib license. The full terms are in
+`third_party/ed25519/LICENSE.txt`. Only the verification, SHA-512, scalar and
+field arithmetic sources are linked into the static `c1pkg` executable; key
+generation and signing remain administrator-side operations.
+
 ## Neofetch
 
 This project vendors Neofetch version 7.1.0 by Dylan Araps from:

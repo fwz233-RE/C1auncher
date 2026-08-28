@@ -9,13 +9,11 @@
 
 typedef struct {
     bool terminal_running;
-    bool ssh_enabled;
     bool wifi_enabled;
     bool wifi_connected;
     bool wifi_managed;
     bool adb_enabled;
     bool terminal_paused;
-    bool ssh_paused;
     bool wifi_paused;
     bool adb_paused;
 } c1_linux_power_context;

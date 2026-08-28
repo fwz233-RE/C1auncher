@@ -161,7 +161,6 @@ static void test_ui(void)
         .network_count = 1U,
         .wifi_connected_ssid = "TEST-NETWORK",
         .networks = {{"TEST-NETWORK", -48, true}},
-        .ssh_enabled = false,
         .time_available = true,
         .hour = 23U,
         .minute = 5U
@@ -184,7 +183,6 @@ static void test_ui(void)
     {
         static const c1_ui_page confirm_pages[] = {
             C1_UI_PAGE_WIFI,
-            C1_UI_PAGE_SSH,
             C1_UI_PAGE_TERMINAL,
             C1_UI_PAGE_WIFI_PASSWORD
         };
@@ -221,28 +219,14 @@ static void test_ui(void)
 
     state = c1_ui_initial_state();
     transition = c1_ui_step(state, C1_UI_EVENT_LEFT, &status);
-    expect(transition.state.page == C1_UI_PAGE_SSH,
-           "left opens the SSH page immediately");
-    transition = c1_ui_step(transition.state, C1_UI_EVENT_ENTER, &status);
-    expect(transition.state.page == C1_UI_PAGE_SSH &&
-               transition.action == C1_UI_ACTION_SSH_ENABLE,
-           "SSH page enables service directly without a password page");
-    status.ssh_enabled = true;
-    transition = c1_ui_step(transition.state, C1_UI_EVENT_ENTER, &status);
-    expect(transition.action == C1_UI_ACTION_SSH_DISABLE,
-           "SSH page disables an active service directly");
-    status.ssh_enabled = false;
-
-    state.page = C1_UI_PAGE_SSH;
-    status.ssh_enabled = true;
-    snprintf(status.ssh_ipv4, sizeof(status.ssh_ipv4), "%s", "172.16.99.62");
-    c1_ui_render(connected_status, &state, &status, NULL);
-    expect(frame_pixel(connected_status, 148U, 80U),
-           "enabled SSH page renders a visible large address");
-    expect(frame_pixel(connected_status, 12U, 105U),
-           "enabled SSH page identifies passwordless root access");
-    status.ssh_enabled = false;
-    status.ssh_ipv4[0] = '\0';
+    expect(transition.state.page == C1_UI_PAGE_TERMINAL &&
+               transition.action == C1_UI_ACTION_TERMINAL_APP,
+           "left opens APP in the shared terminal");
+    state = transition.state;
+    transition = c1_ui_step(state, C1_UI_EVENT_NONE, &status);
+    expect(transition.state.page == C1_UI_PAGE_TERMINAL &&
+               transition.action == C1_UI_ACTION_NONE,
+           "APP direction requests c1pkg only for its entry event");
 
     state = c1_ui_initial_state();
     transition = c1_ui_step(state, C1_UI_EVENT_UP, &status);
@@ -446,6 +430,21 @@ static void test_terminal_screen(void)
     count = c1_terminal_screen_take_reply(&terminal, reply, sizeof(reply));
     expect(count >= 3U && reply[0] == '\033' && reply[1] == '[',
            "cursor key produces an ANSI sequence");
+    expect(c1_terminal_screen_special(&terminal, C1_TERMINAL_KEY_PAGE_UP, 0U),
+           "terminal screen accepts the APP previous-list key");
+    count = c1_terminal_screen_take_reply(&terminal, reply, sizeof(reply));
+    expect(count == 4U && memcmp(reply, "\033[5~", 4U) == 0,
+           "APP previous-list key produces Page Up for volume minus");
+    expect(c1_terminal_screen_special(&terminal, C1_TERMINAL_KEY_PAGE_DOWN, 0U),
+           "terminal screen accepts the APP next-list key");
+    count = c1_terminal_screen_take_reply(&terminal, reply, sizeof(reply));
+    expect(count == 4U && memcmp(reply, "\033[6~", 4U) == 0,
+           "APP next-list key produces Page Down for volume plus");
+    expect(c1_terminal_screen_special(&terminal, C1_TERMINAL_KEY_ENTER, 0U),
+           "terminal screen accepts the APP Enter and OK confirmation key");
+    count = c1_terminal_screen_take_reply(&terminal, reply, sizeof(reply));
+    expect(count == 1U && reply[0] == '\r',
+           "APP Enter and OK confirmation produces carriage return");
 
     c1_terminal_screen_feed(&terminal, "\033[19;1H\033[7m \033[0m", 16U);
     state.page = C1_UI_PAGE_TERMINAL;
@@ -475,6 +474,13 @@ static void test_terminal_pty(void)
         c1_terminal_stop(&session);
         return;
     }
+    deadline = test_milliseconds() + 2000;
+    while (test_milliseconds() < deadline && !c1_terminal_shell_is_foreground(&session)) {
+        struct timespec pause = {0, 10000000L};
+        (void)nanosleep(&pause, NULL);
+    }
+    expect(c1_terminal_shell_is_foreground(&session),
+           "terminal detects the interactive shell as PTY foreground owner");
     expect(c1_terminal_write(&session, command, sizeof(command) - 1U) == C1_STATUS_OK,
            "terminal service writes interactive input");
     deadline = test_milliseconds() + 5000;

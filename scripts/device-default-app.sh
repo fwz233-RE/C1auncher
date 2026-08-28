@@ -20,9 +20,13 @@ factory_init_script=/etc/init.d/S80app
 staged_shim=/dev/shm/C1ancher-daemon.shim
 staged_app=/dev/shm/C1ancher.install
 staged_launcher=/dev/shm/C1ancher-launcher.install
-staged_host_key=/dev/shm/c1-ssh-host-key.install
-ssh_dir=/usr/data/c1/ssh
-ssh_host_key=$ssh_dir/ssh_host_ed25519_key
+pkg=$bin_dir/c1pkg
+staged_pkg=/dev/shm/c1pkg.install
+pkg_state_dir=/usr/data/c1/pkg
+repository_public_key=$pkg_state_dir/repository.ed25519.pub
+staged_repository_public_key=/dev/shm/c1pkg-repository-key.install
+legacy_ssh_run_dir=/run/c1/ssh
+legacy_ssh_dir=/usr/data/c1/ssh
 neofetch_dir=/usr/data/c1/neofetch
 neofetch_command=$bin_dir/neofetch
 staged_neofetch_command=/dev/shm/c1-neofetch.install
@@ -173,17 +177,57 @@ install_binary() {
     mv "$temporary" "$destination"
 }
 
-install_host_key() {
-    expected=$1
-
-    mkdir -p "$ssh_dir"
-    chmod 700 "$ssh_dir"
-    if [ -f "$ssh_host_key" ]; then
-        chmod 600 "$ssh_host_key"
-        return
+cleanup_legacy_ssh() {
+    if [ -r "$legacy_ssh_run_dir/sshd.pid" ]; then
+        legacy_pid=$(cat "$legacy_ssh_run_dir/sshd.pid" 2>/dev/null || true)
+        case "$legacy_pid" in
+            ''|*[!0-9]*) legacy_pid= ;;
+        esac
+        if [ -n "$legacy_pid" ] && [ "$legacy_pid" -gt 1 ] && [ -r "/proc/$legacy_pid/cmdline" ]; then
+            legacy_cmdline=$(tr '\000' ' ' < "/proc/$legacy_pid/cmdline")
+            case "$legacy_cmdline" in
+                *"/usr/sbin/sshd"*"/run/c1/ssh/sshd_config"*)
+                    kill "$legacy_pid" 2>/dev/null || true
+                    count=0
+                    while [ "$count" -lt 30 ] && kill -0 "$legacy_pid" 2>/dev/null; do
+                        sleep 1
+                        count=$((count + 1))
+                    done
+                    kill -9 "$legacy_pid" 2>/dev/null || true
+                    ;;
+            esac
+        fi
     fi
-    install_binary "$staged_host_key" "$ssh_host_key" "$expected"
-    chmod 600 "$ssh_host_key"
+    if [ -f "$legacy_ssh_run_dir/shadow" ] && [ -e /etc/shadow ]; then
+        run_shadow_id=$(stat -c '%d:%i' "$legacy_ssh_run_dir/shadow" 2>/dev/null || true)
+        etc_shadow_id=$(stat -c '%d:%i' /etc/shadow 2>/dev/null || true)
+        if [ -n "$run_shadow_id" ] && [ "$run_shadow_id" = "$etc_shadow_id" ]; then
+            umount /etc/shadow 2>/dev/null || umount -l /etc/shadow 2>/dev/null || return 1
+        fi
+    fi
+    rm -rf "$legacy_ssh_run_dir" "$legacy_ssh_dir"
+}
+
+install_package_manager() {
+    pkg_hash=$1
+    public_key_hash=$2
+
+    mkdir -p "$bin_dir" "$pkg_state_dir"
+    chmod 700 "$pkg_state_dir"
+    install_binary "$staged_pkg" "$pkg" "$pkg_hash"
+    install_binary "$staged_repository_public_key" "$repository_public_key" "$public_key_hash"
+    chmod 700 "$pkg"
+    chmod 600 "$repository_public_key"
+}
+
+verify_package_manager() {
+    pkg_hash=$1
+    public_key_hash=$2
+
+    require_hash "$pkg" "$pkg_hash"
+    require_hash "$repository_public_key" "$public_key_hash"
+    [ "$(wc -c < "$repository_public_key")" -eq 32 ]
+    "$pkg" --help >/dev/null
 }
 
 install_neofetch() {
@@ -231,21 +275,23 @@ write_manifest() {
     shim_hash=$3
     app_hash=$4
     launcher_hash=$5
-    host_key_hash=$6
-    neofetch_command_hash=$7
-    neofetch_upstream_hash=$8
-    neofetch_config_hash=$9
+    pkg_hash=$6
+    public_key_hash=$7
+    neofetch_command_hash=$8
+    neofetch_upstream_hash=$9
     shift 9
-    neofetch_license_hash=$1
-    neofetch_logo_hash=$2
+    neofetch_config_hash=$1
+    neofetch_license_hash=$2
+    neofetch_logo_hash=$3
     temporary=$directory/manifest.txt.new.$$
     {
-        echo 'feature=default-C1ancher'
+        echo 'feature=default-C1ancher-app-store'
         echo "original_app_daemon_sha256=$original_hash"
         echo "shim_sha256=$shim_hash"
         echo "c1ancher_sha256=$app_hash"
         echo "c1ancher_launcher_sha256=$launcher_hash"
-        echo "ssh_host_key_sha256=$host_key_hash"
+        echo "c1pkg_sha256=$pkg_hash"
+        echo "repository_public_key_sha256=$public_key_hash"
         echo "neofetch_command_sha256=$neofetch_command_hash"
         echo "neofetch_upstream_sha256=$neofetch_upstream_hash"
         echo "neofetch_config_sha256=$neofetch_config_hash"
@@ -297,23 +343,23 @@ install_default_app() {
     shim_hash=$2
     app_hash=$3
     launcher_hash=$4
-    host_key_hash=$5
-    neofetch_command_hash=$6
-    neofetch_upstream_hash=$7
-    neofetch_config_hash=$8
-    neofetch_license_hash=$9
+    pkg_hash=$5
+    public_key_hash=$6
+    neofetch_command_hash=$7
+    neofetch_upstream_hash=$8
+    neofetch_config_hash=$9
     shift 9
-    neofetch_logo_hash=$1
-    previous_shim_hash=$2
-    auto_suspend_mode=$3
+    neofetch_license_hash=$1
+    neofetch_logo_hash=$2
+    previous_shim_hash=$3
+    auto_suspend_mode=$4
     current_hash=$(hash_file "$target")
 
     require_hash "$staged_shim" "$shim_hash"
     require_hash "$staged_app" "$app_hash"
     require_hash "$staged_launcher" "$launcher_hash"
-    if [ ! -f "$ssh_host_key" ]; then
-        require_hash "$staged_host_key" "$host_key_hash"
-    fi
+    require_hash "$staged_pkg" "$pkg_hash"
+    require_hash "$staged_repository_public_key" "$public_key_hash"
     require_hash "$staged_neofetch_command" "$neofetch_command_hash"
     require_hash "$staged_neofetch_upstream" "$neofetch_upstream_hash"
     require_hash "$staged_neofetch_config" "$neofetch_config_hash"
@@ -328,7 +374,7 @@ install_default_app() {
         stop_application_chain
         install_binary "$staged_app" "$app" "$app_hash"
         install_binary "$staged_launcher" "$launcher" "$launcher_hash"
-        install_host_key "$host_key_hash"
+        install_package_manager "$pkg_hash" "$public_key_hash"
     else
         [ "$current_hash" = "$original_hash" ] || [ "$current_hash" = "$previous_shim_hash" ] || {
             echo "refusing install: unexpected current hash $current_hash" >&2
@@ -336,7 +382,7 @@ install_default_app() {
         }
         install_binary "$staged_app" "$app" "$app_hash"
         install_binary "$staged_launcher" "$launcher" "$launcher_hash"
-        install_host_key "$host_key_hash"
+        install_package_manager "$pkg_hash" "$public_key_hash"
         stop_application_chain
         remount_root_rw
         ensure_backup "$root_backup" "$original_hash"
@@ -351,14 +397,15 @@ install_default_app() {
     fi
 
     rm -f "$legacy_app"
+    cleanup_legacy_ssh
+    verify_package_manager "$pkg_hash" "$public_key_hash"
     install_neofetch "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash"
     verify_neofetch "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash"
-    require_hash "$ssh_host_key" "$host_key_hash"
     cp "$0" "$data_dir/device-default-app.sh"
     cp "$0" "$storage_dir/device-default-app.sh"
     chmod 700 "$data_dir/device-default-app.sh" "$storage_dir/device-default-app.sh"
-    write_manifest "$data_dir" "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$host_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash"
-    write_manifest "$storage_dir" "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$host_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash"
+    write_manifest "$data_dir" "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$pkg_hash" "$public_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash"
+    write_manifest "$storage_dir" "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$pkg_hash" "$public_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash"
     configure_auto_suspend "$auto_suspend_mode"
     temporary=$enabled.new.$$
     echo 'enabled' > "$temporary"
@@ -368,7 +415,7 @@ install_default_app() {
     root_is_read_only
     rollback_needed=0
     start_application_chain
-    echo 'default C1ancher, app_daemon, Neofetch, and SSH host identity installed'
+    echo 'default C1ancher, app_daemon, Neofetch, and c1pkg installed'
 }
 
 verify_default_app() {
@@ -376,14 +423,15 @@ verify_default_app() {
     shim_hash=$2
     app_hash=$3
     launcher_hash=$4
-    host_key_hash=$5
-    neofetch_command_hash=$6
-    neofetch_upstream_hash=$7
-    neofetch_config_hash=$8
-    neofetch_license_hash=$9
+    pkg_hash=$5
+    public_key_hash=$6
+    neofetch_command_hash=$7
+    neofetch_upstream_hash=$8
+    neofetch_config_hash=$9
     shift 9
-    neofetch_logo_hash=$1
-    auto_suspend_mode=$2
+    neofetch_license_hash=$1
+    neofetch_logo_hash=$2
+    auto_suspend_mode=$3
 
     require_hash "$target" "$shim_hash"
     require_hash "$root_backup" "$original_hash"
@@ -392,7 +440,9 @@ verify_default_app() {
     require_hash "$app" "$app_hash"
     [ ! -e "$legacy_app" ]
     require_hash "$launcher" "$launcher_hash"
-    require_hash "$ssh_host_key" "$host_key_hash"
+    verify_package_manager "$pkg_hash" "$public_key_hash"
+    [ ! -e "$legacy_ssh_run_dir" ]
+    [ ! -e "$legacy_ssh_dir" ]
     verify_neofetch "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash"
     verify_auto_suspend "$auto_suspend_mode"
     [ -f "$enabled" ]
@@ -401,7 +451,7 @@ verify_default_app() {
         ! grep -q 'mpenMain\|/usr/bin/d261\|force-original' "$factory_init_script"
     fi
     root_is_read_only
-    echo 'default C1ancher, app_daemon, and Neofetch persistent files verified'
+    echo 'default C1ancher, app_daemon, Neofetch, and c1pkg persistent files verified'
 }
 
 remove_original_software() {
@@ -447,26 +497,27 @@ original_hash=${2:-}
 shim_hash=${3:-}
 app_hash=${4:-}
 launcher_hash=${5:-}
-host_key_hash=${6:-}
-neofetch_command_hash=${7:-}
-neofetch_upstream_hash=${8:-}
-neofetch_config_hash=${9:-}
-neofetch_license_hash=${10:-}
-neofetch_logo_hash=${11:-}
-previous_shim_hash=${12:-}
-auto_suspend_mode=${13:-}
-[ -n "$original_hash" ] && [ -n "$shim_hash" ] && [ -n "$app_hash" ] && [ -n "$launcher_hash" ] && [ -n "$host_key_hash" ] && [ -n "$neofetch_command_hash" ] && [ -n "$neofetch_upstream_hash" ] && [ -n "$neofetch_config_hash" ] && [ -n "$neofetch_license_hash" ] && [ -n "$neofetch_logo_hash" ] && [ -n "$previous_shim_hash" ] && [ -n "$auto_suspend_mode" ] || {
-    echo "usage: $0 {install|verify|remove-original} ORIGINAL_HASH SHIM_HASH APP_HASH LAUNCHER_HASH HOST_KEY_HASH NEOFETCH_COMMAND_HASH NEOFETCH_UPSTREAM_HASH NEOFETCH_CONFIG_HASH NEOFETCH_LICENSE_HASH NEOFETCH_LOGO_HASH PREVIOUS_SHIM_HASH {enabled|disabled}" >&2
+pkg_hash=${6:-}
+public_key_hash=${7:-}
+neofetch_command_hash=${8:-}
+neofetch_upstream_hash=${9:-}
+neofetch_config_hash=${10:-}
+neofetch_license_hash=${11:-}
+neofetch_logo_hash=${12:-}
+previous_shim_hash=${13:-}
+auto_suspend_mode=${14:-}
+[ -n "$original_hash" ] && [ -n "$shim_hash" ] && [ -n "$app_hash" ] && [ -n "$launcher_hash" ] && [ -n "$pkg_hash" ] && [ -n "$public_key_hash" ] && [ -n "$neofetch_command_hash" ] && [ -n "$neofetch_upstream_hash" ] && [ -n "$neofetch_config_hash" ] && [ -n "$neofetch_license_hash" ] && [ -n "$neofetch_logo_hash" ] && [ -n "$previous_shim_hash" ] && [ -n "$auto_suspend_mode" ] || {
+    echo "usage: $0 {install|verify|remove-original} ORIGINAL_HASH SHIM_HASH APP_HASH LAUNCHER_HASH C1PKG_HASH REPOSITORY_PUBLIC_KEY_HASH NEOFETCH_COMMAND_HASH NEOFETCH_UPSTREAM_HASH NEOFETCH_CONFIG_HASH NEOFETCH_LICENSE_HASH NEOFETCH_LOGO_HASH PREVIOUS_SHIM_HASH {enabled|disabled}" >&2
     exit 64
 }
 case "$auto_suspend_mode" in enabled|disabled) ;; *) echo "invalid automatic suspend mode: $auto_suspend_mode" >&2; exit 64 ;; esac
 
 case "$action" in
-    install) install_default_app "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$host_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash" "$previous_shim_hash" "$auto_suspend_mode" ;;
-    verify) verify_default_app "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$host_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash" "$auto_suspend_mode" ;;
+    install) install_default_app "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$pkg_hash" "$public_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash" "$previous_shim_hash" "$auto_suspend_mode" ;;
+    verify) verify_default_app "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$pkg_hash" "$public_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash" "$auto_suspend_mode" ;;
     remove-original) remove_original_software "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" ;;
     *)
-        echo "usage: $0 {install|verify|remove-original} ORIGINAL_HASH SHIM_HASH APP_HASH LAUNCHER_HASH HOST_KEY_HASH NEOFETCH_COMMAND_HASH NEOFETCH_UPSTREAM_HASH NEOFETCH_CONFIG_HASH NEOFETCH_LICENSE_HASH NEOFETCH_LOGO_HASH PREVIOUS_SHIM_HASH {enabled|disabled}" >&2
+        echo "usage: $0 {install|verify|remove-original} ORIGINAL_HASH SHIM_HASH APP_HASH LAUNCHER_HASH C1PKG_HASH REPOSITORY_PUBLIC_KEY_HASH NEOFETCH_COMMAND_HASH NEOFETCH_UPSTREAM_HASH NEOFETCH_CONFIG_HASH NEOFETCH_LICENSE_HASH NEOFETCH_LOGO_HASH PREVIOUS_SHIM_HASH {enabled|disabled}" >&2
         exit 64
         ;;
 esac

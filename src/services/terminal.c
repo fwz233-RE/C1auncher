@@ -237,6 +237,17 @@ bool c1_terminal_is_running(c1_terminal_session *session)
     return session->state == C1_TERMINAL_RUNNING && session->master_fd >= 0;
 }
 
+bool c1_terminal_shell_is_foreground(c1_terminal_session *session)
+{
+    pid_t foreground;
+
+    if (!c1_terminal_is_running(session) || session->child_pid <= 0) {
+        return false;
+    }
+    foreground = tcgetpgrp(session->master_fd);
+    return foreground > 0 && foreground == session->child_pid;
+}
+
 c1_terminal_state c1_terminal_get_state(c1_terminal_session *session)
 {
     if (session == NULL) {

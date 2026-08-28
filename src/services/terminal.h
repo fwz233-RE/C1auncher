@@ -9,9 +9,9 @@
 
 typedef enum {
     C1_TERMINAL_STOPPED = 0,
-    C1_TERMINAL_RUNNING,
-    C1_TERMINAL_EXITED,
-    C1_TERMINAL_FAILED
+    C1_TERMINAL_RUNNING = 1,
+    C1_TERMINAL_EXITED = 2,
+    C1_TERMINAL_FAILED = 3
 } c1_terminal_state;
 
 typedef struct {
@@ -32,6 +32,7 @@ c1_status c1_terminal_start(c1_terminal_session *session,
 int c1_terminal_fd(const c1_terminal_session *session);
 short c1_terminal_poll_events(const c1_terminal_session *session);
 bool c1_terminal_is_running(c1_terminal_session *session);
+bool c1_terminal_shell_is_foreground(c1_terminal_session *session);
 c1_terminal_state c1_terminal_get_state(c1_terminal_session *session);
 int c1_terminal_exit_code(const c1_terminal_session *session);
 c1_status c1_terminal_write(c1_terminal_session *session, const void *bytes, size_t count);

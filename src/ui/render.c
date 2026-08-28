@@ -18,9 +18,8 @@ static void render_status_bar(uint8_t *frame, const c1_ui_status *status)
 
     snprintf(left,
              sizeof(left),
-             "C1 WIFI %s  SSH %s",
-             status->wifi_connected ? "CONNECTED" : "OFF",
-             status->ssh_enabled ? "ON" : "OFF");
+             "C1 WIFI %s",
+             status->wifi_connected ? "CONNECTED" : "OFF");
     if (status->time_available && status->battery_available) {
         snprintf(right,
                  sizeof(right),
@@ -78,7 +77,6 @@ static void render_desktop_origin(uint8_t *frame)
 static void render_desktop(uint8_t *frame, const c1_ui_status *status)
 {
     char wifi[12];
-    char ssh[12];
     char battery[12];
     char time[12];
 
@@ -93,13 +91,12 @@ static void render_desktop(uint8_t *frame, const c1_ui_status *status)
     c1_canvas_fill_rect(frame, 199U, 103U, 97U, 49U, true);
     c1_canvas_fill_rect(frame, 100U, 52U, 97U, 49U, true);
     render_desktop_cell_text(frame, 1U, 0U, "WI-FI", 2U, true);
-    render_desktop_cell_text(frame, 0U, 1U, "SSH", 2U, true);
+    render_desktop_cell_text(frame, 0U, 1U, "APP", 2U, true);
     render_desktop_origin(frame);
     render_desktop_cell_text(frame, 2U, 1U, "TERMINAL", 2U, true);
     render_desktop_cell_text(frame, 1U, 2U, "DEVICE", 2U, true);
 
     snprintf(wifi, sizeof(wifi), "%s", status->wifi_connected ? "WIFI ON" : "WIFI OFF");
-    snprintf(ssh, sizeof(ssh), "%s", status->ssh_enabled ? "SSH ON" : "SSH OFF");
     if (status->battery_available) {
         snprintf(battery, sizeof(battery), "%u%%", status->battery_percent);
     } else {
@@ -111,7 +108,6 @@ static void render_desktop(uint8_t *frame, const c1_ui_status *status)
         snprintf(time, sizeof(time), "--:--");
     }
     render_desktop_cell_text(frame, 0U, 0U, wifi, 2U, false);
-    render_desktop_cell_text(frame, 2U, 0U, ssh, 2U, false);
     render_desktop_cell_text(frame, 0U, 2U, battery, 3U, false);
     render_desktop_cell_text(frame, 2U, 2U, time, 3U, false);
 }
@@ -269,45 +265,6 @@ static void render_wifi(uint8_t *frame, const c1_ui_state *state, const c1_ui_st
                        1U,
                        true);
     }
-}
-
-static void render_ssh(uint8_t *frame, const c1_ui_status *status)
-{
-    char address[24];
-    uint32_t address_scale;
-    uint32_t address_width;
-    uint32_t address_x;
-
-    render_title(frame, "SSH - ROOT LOGIN");
-    c1_canvas_text(frame,
-                   12U,
-                   40U,
-                   status->ssh_enabled ? "STATUS  ENABLED" : "STATUS  DISABLED",
-                   2U,
-                   true);
-    if (status->ssh_enabled && status->ssh_ipv4[0] != '\0') {
-        c1_canvas_text(frame, 12U, 61U, "CONNECT TO THIS ADDRESS", 1U, true);
-        snprintf(address, sizeof(address), "%s:22", status->ssh_ipv4);
-        address_scale = c1_canvas_text_width(address, 3U) <= C1_DISPLAY_WIDTH - 16U ? 3U : 2U;
-        address_width = c1_canvas_text_width(address, address_scale);
-        address_x = (C1_DISPLAY_WIDTH - address_width) / 2U;
-        c1_canvas_text(frame, address_x, 74U, address, address_scale, true);
-        c1_canvas_text(frame, 12U, 104U, "USER ROOT  NO PASSWORD", 2U, true);
-    } else if (status->ssh_enabled) {
-        c1_canvas_text(frame, 12U, 75U, "WAITING FOR A WI-FI ADDRESS", 1U, true);
-    } else {
-        c1_canvas_text(frame, 12U, 75U, "PRESS ENTER TO ENABLE", 2U, true);
-        c1_canvas_text(frame, 12U, 103U, "NO PASSWORD REQUIRED", 1U, true);
-    }
-    if (status->ssh_message[0] != '\0') {
-        c1_canvas_text(frame, 12U, 122U, status->ssh_message, 1U, true);
-    }
-    c1_canvas_text(frame,
-                   12U,
-                   138U,
-                   status->ssh_enabled ? "ENTER OR REBOOT DISABLES SSH" : "REBOOT KEEPS SSH DISABLED",
-                   1U,
-                   true);
 }
 
 static void render_terminal_symbols(uint8_t *frame, const c1_ui_state *state)
@@ -489,9 +446,6 @@ void c1_ui_render(uint8_t *frame,
         break;
     case C1_UI_PAGE_WIFI:
         render_wifi(frame, state, status);
-        break;
-    case C1_UI_PAGE_SSH:
-        render_ssh(frame, status);
         break;
     case C1_UI_PAGE_TERMINAL:
         render_terminal(frame, state, terminal);

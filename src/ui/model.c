@@ -130,7 +130,7 @@ static c1_ui_state reduce_desktop(c1_ui_state state, c1_ui_event event)
         state.selection = 0U;
         break;
     case C1_UI_EVENT_LEFT:
-        state.page = C1_UI_PAGE_SSH;
+        state.page = C1_UI_PAGE_TERMINAL;
         state.selection = 0U;
         break;
     case C1_UI_EVENT_RIGHT:
@@ -213,6 +213,8 @@ c1_ui_transition c1_ui_step(c1_ui_state state, c1_ui_event event, const c1_ui_st
             transition.action = C1_UI_ACTION_WIFI_SCAN;
         } else if (event == C1_UI_EVENT_DOWN) {
             transition.action = C1_UI_ACTION_TERMINAL_NEOFETCH;
+        } else if (event == C1_UI_EVENT_LEFT) {
+            transition.action = C1_UI_ACTION_TERMINAL_APP;
         }
         return transition;
     }
@@ -258,12 +260,6 @@ c1_ui_transition c1_ui_step(c1_ui_state state, c1_ui_event event, const c1_ui_st
                 }
             }
         }
-        return transition;
-    }
-    if (state.page == C1_UI_PAGE_SSH && event == C1_UI_EVENT_ENTER) {
-        transition.action = status != NULL && status->ssh_enabled
-                                ? C1_UI_ACTION_SSH_DISABLE
-                                : C1_UI_ACTION_SSH_ENABLE;
         return transition;
     }
     if (state.page == C1_UI_PAGE_WIFI_PASSWORD) {

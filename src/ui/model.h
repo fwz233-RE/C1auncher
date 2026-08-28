@@ -14,39 +14,37 @@
 
 typedef enum {
     C1_UI_PAGE_DESKTOP = 0,
-    C1_UI_PAGE_WIFI,
-    C1_UI_PAGE_SSH,
-    C1_UI_PAGE_TERMINAL,
-    C1_UI_PAGE_WIFI_PASSWORD,
-    C1_UI_PAGE_LOCK
+    C1_UI_PAGE_WIFI = 1,
+    C1_UI_PAGE_TERMINAL = 3,
+    C1_UI_PAGE_WIFI_PASSWORD = 4,
+    C1_UI_PAGE_LOCK = 5
 } c1_ui_page;
 
 typedef enum {
     C1_UI_EVENT_NONE = 0,
-    C1_UI_EVENT_UP,
-    C1_UI_EVENT_DOWN,
-    C1_UI_EVENT_LEFT,
-    C1_UI_EVENT_RIGHT,
-    C1_UI_EVENT_ENTER,
-    C1_UI_EVENT_SUBMIT,
-    C1_UI_EVENT_BACK,
-    C1_UI_EVENT_HOME
+    C1_UI_EVENT_UP = 1,
+    C1_UI_EVENT_DOWN = 2,
+    C1_UI_EVENT_LEFT = 3,
+    C1_UI_EVENT_RIGHT = 4,
+    C1_UI_EVENT_ENTER = 5,
+    C1_UI_EVENT_SUBMIT = 6,
+    C1_UI_EVENT_BACK = 7,
+    C1_UI_EVENT_HOME = 8
 } c1_ui_event;
 
 typedef enum {
     C1_UI_ACTION_NONE = 0,
-    C1_UI_ACTION_WIFI_SCAN,
-    C1_UI_ACTION_WIFI_CONNECT,
-    C1_UI_ACTION_WIFI_DISABLE,
-    C1_UI_ACTION_SSH_ENABLE,
-    C1_UI_ACTION_SSH_DISABLE,
-    C1_UI_ACTION_TERMINAL_NEOFETCH
+    C1_UI_ACTION_WIFI_SCAN = 1,
+    C1_UI_ACTION_WIFI_CONNECT = 2,
+    C1_UI_ACTION_WIFI_DISABLE = 3,
+    C1_UI_ACTION_TERMINAL_NEOFETCH = 6,
+    C1_UI_ACTION_TERMINAL_APP = 7
 } c1_ui_action;
 
 typedef enum {
     C1_UI_KEYBOARD_LOWER = 0,
-    C1_UI_KEYBOARD_UPPER,
-    C1_UI_KEYBOARD_SYMBOLS
+    C1_UI_KEYBOARD_UPPER = 1,
+    C1_UI_KEYBOARD_SYMBOLS = 2
 } c1_ui_keyboard_layer;
 
 typedef struct {
@@ -76,9 +74,6 @@ typedef struct {
     char wifi_connected_ssid[C1_UI_SSID_CAPACITY];
     char wifi_ipv4[C1_UI_IP_CAPACITY];
     char wifi_message[C1_UI_MESSAGE_CAPACITY];
-    bool ssh_enabled;
-    char ssh_ipv4[C1_UI_IP_CAPACITY];
-    char ssh_message[C1_UI_MESSAGE_CAPACITY];
     bool time_available;
     uint32_t hour;
     uint32_t minute;

@@ -13,6 +13,8 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $appPath = Join-Path $projectRoot 'build\C1ancher'
 $launcherPath = Join-Path $projectRoot 'build\C1ancher-launcher'
+$pkgPath = Join-Path $projectRoot 'build\c1pkg'
+$repositoryPublicKeyPath = Join-Path $projectRoot 'config\app-repo\repository.ed25519.pub'
 $neofetchRoot = Join-Path $projectRoot 'third_party\neofetch'
 $neofetchCommandPath = Join-Path $neofetchRoot 'neofetch'
 $neofetchUpstreamPath = Join-Path $neofetchRoot 'neofetch.upstream'
@@ -26,21 +28,19 @@ $remoteScript = '/dev/shm/c1-device-default-app.sh'
 $remoteShim = '/dev/shm/C1ancher-daemon.shim'
 $remoteApp = '/dev/shm/C1ancher.install'
 $remoteLauncher = '/dev/shm/C1ancher-launcher.install'
-$remoteHostKey = '/dev/shm/c1-ssh-host-key.install'
+$remotePkg = '/dev/shm/c1pkg.install'
+$remoteRepositoryPublicKey = '/dev/shm/c1pkg-repository-key.install'
 $remoteNeofetchCommand = '/dev/shm/c1-neofetch.install'
 $remoteNeofetchUpstream = '/dev/shm/c1-neofetch-upstream.install'
 $remoteNeofetchConfig = '/dev/shm/c1-neofetch-config.install'
 $remoteNeofetchLogo = '/dev/shm/c1-neofetch-logo.install'
 $remoteNeofetchLicense = '/dev/shm/c1-neofetch-license.install'
-$hostKeyPath = Join-Path $uploadRoot 'ssh_host_ed25519_key'
 $expectedOriginalHash = 'ceb56ddf2ff3c10f7c4c2cd6216b298da1cea799ca7170322f8229d5e9af6ee7'
 $expectedPreviousShimHash = 'feff5a9df87fd350cb9fdc56c4d5245c9ca19755e9706a189002c720c9ef9e60'
 $openAdbHash = '626e4c5d600b543531337eb67220b0a7520d461211cc7ecafd36666d4f8905cb'
 $script:Adb = $null
 $script:Serial = $null
 $uploaded = $false
-$hostKeyUploaded = $false
-$hostKeyHash = $null
 
 function Resolve-Adb {
     if (Test-Path -LiteralPath $AdbPath) { return (Resolve-Path -LiteralPath $AdbPath).Path }
@@ -208,6 +208,8 @@ function Write-Evidence([string]$Name, [string]$Content) {
 foreach ($required in @(
     $appPath,
     $launcherPath,
+    $pkgPath,
+    $repositoryPublicKeyPath,
     $deviceScriptPath,
     $neofetchCommandPath,
     $neofetchUpstreamPath,
@@ -237,6 +239,9 @@ exec /usr/data/c1/bin/app_daemon
 $shimHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $shimPath).Hash.ToLowerInvariant()
 $appHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $appPath).Hash.ToLowerInvariant()
 $launcherHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $launcherPath).Hash.ToLowerInvariant()
+$pkgHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $pkgPath).Hash.ToLowerInvariant()
+$repositoryPublicKeyHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $repositoryPublicKeyPath).Hash.ToLowerInvariant()
+if ((Get-Item -LiteralPath $repositoryPublicKeyPath).Length -ne 32) { throw 'Repository Ed25519 public key must be exactly 32 bytes.' }
 $neofetchCommandHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $neofetchCommandPath).Hash.ToLowerInvariant()
 $neofetchUpstreamHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $neofetchUpstreamPath).Hash.ToLowerInvariant()
 $neofetchConfigHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $neofetchConfigPath).Hash.ToLowerInvariant()
@@ -251,19 +256,6 @@ try {
     Write-Evidence 'clock-sync.txt' ($clockSync + [Environment]::NewLine)
     $suspendCapability = if ($EnableAutoSuspend) { Assert-SuspendCapability } else { 'automatic_suspend=disabled_by_default' }
     Write-Evidence 'suspend-capability.txt' ($suspendCapability + [Environment]::NewLine)
-    $hostKeyProbe = Invoke-Remote "if [ -f /usr/data/c1/ssh/ssh_host_ed25519_key ]; then sha256sum /usr/data/c1/ssh/ssh_host_ed25519_key; fi"
-    if ($hostKeyProbe.Output -match '^([0-9a-fA-F]{64})\s+') {
-        $hostKeyHash = $matches[1].ToLowerInvariant()
-    } elseif ($Action -eq 'Install') {
-        $sshKeygen = (Get-Command ssh-keygen -ErrorAction Stop).Source
-        & $sshKeygen -q -t ed25519 -N '""' -f $hostKeyPath
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $hostKeyPath)) {
-            throw 'Failed to generate a unique SSH host key.'
-        }
-        $hostKeyHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $hostKeyPath).Hash.ToLowerInvariant()
-    } else {
-        throw 'Persistent SSH host key is missing.'
-    }
     $currentHash = (Invoke-Remote 'sha256sum /etc/app_daemon').Output.Split()[0].ToLowerInvariant()
     if ($currentHash -notin @($expectedOriginalHash, $expectedPreviousShimHash, $shimHash)) { throw "Unexpected device app_daemon hash: $currentHash" }
     $expectedBefore = if ($currentHash -eq $expectedOriginalHash) { 'Original' } else { 'C1OrLegacy' }
@@ -278,7 +270,8 @@ try {
         "shim_sha256=$shimHash"
         "app_sha256=$appHash"
         "launcher_sha256=$launcherHash"
-        "ssh_host_key_sha256=$hostKeyHash"
+        "c1pkg_sha256=$pkgHash"
+        "repository_public_key_sha256=$repositoryPublicKeyHash"
         "neofetch_command_sha256=$neofetchCommandHash"
         "neofetch_upstream_sha256=$neofetchUpstreamHash"
         "neofetch_config_sha256=$neofetchConfigHash"
@@ -294,23 +287,21 @@ try {
     Invoke-Adb -Arguments @('push', $shimPath, $remoteShim) | Out-Null
     Invoke-Adb -Arguments @('push', $appPath, $remoteApp) | Out-Null
     Invoke-Adb -Arguments @('push', $launcherPath, $remoteLauncher) | Out-Null
+    Invoke-Adb -Arguments @('push', $pkgPath, $remotePkg) | Out-Null
+    Invoke-Adb -Arguments @('push', $repositoryPublicKeyPath, $remoteRepositoryPublicKey) | Out-Null
     Invoke-Adb -Arguments @('push', $neofetchCommandPath, $remoteNeofetchCommand) | Out-Null
     Invoke-Adb -Arguments @('push', $neofetchUpstreamPath, $remoteNeofetchUpstream) | Out-Null
     Invoke-Adb -Arguments @('push', $neofetchConfigPath, $remoteNeofetchConfig) | Out-Null
     Invoke-Adb -Arguments @('push', $neofetchLogoPath, $remoteNeofetchLogo) | Out-Null
     Invoke-Adb -Arguments @('push', $neofetchLicensePath, $remoteNeofetchLicense) | Out-Null
-    if (Test-Path -LiteralPath $hostKeyPath) {
-        Invoke-Adb -Arguments @('push', $hostKeyPath, $remoteHostKey) | Out-Null
-        $hostKeyUploaded = $true
-    }
-    Invoke-Remote "chmod 700 $remoteScript; chmod 600 $remoteShim $remoteApp $remoteLauncher $remoteHostKey $remoteNeofetchCommand $remoteNeofetchUpstream $remoteNeofetchConfig $remoteNeofetchLogo $remoteNeofetchLicense 2>/dev/null || true" | Out-Null
+    Invoke-Remote "chmod 700 $remoteScript; chmod 600 $remoteShim $remoteApp $remoteLauncher $remotePkg $remoteRepositoryPublicKey $remoteNeofetchCommand $remoteNeofetchUpstream $remoteNeofetchConfig $remoteNeofetchLogo $remoteNeofetchLicense 2>/dev/null || true" | Out-Null
     $uploaded = $true
 
     Invoke-CheckedRemote "sh -n $remoteScript" | Out-Null
     Invoke-CheckedRemote "sh -n $remoteShim" | Out-Null
     $actionName = if ($Action -eq 'RemoveOriginal') { 'remove-original' } else { $Action.ToLowerInvariant() }
     $autoSuspendMode = if ($EnableAutoSuspend) { 'enabled' } else { 'disabled' }
-    $deviceHashArguments = "$expectedOriginalHash $shimHash $appHash $launcherHash $hostKeyHash $neofetchCommandHash $neofetchUpstreamHash $neofetchConfigHash $neofetchLicenseHash $neofetchLogoHash $expectedPreviousShimHash $autoSuspendMode"
+    $deviceHashArguments = "$expectedOriginalHash $shimHash $appHash $launcherHash $pkgHash $repositoryPublicKeyHash $neofetchCommandHash $neofetchUpstreamHash $neofetchConfigHash $neofetchLicenseHash $neofetchLogoHash $expectedPreviousShimHash $autoSuspendMode"
     $operation = Invoke-CheckedRemote "$remoteScript $actionName $deviceHashArguments"
     Write-Evidence 'operation.log' $operation
     Assert-SystemState | Out-Null
@@ -347,7 +338,7 @@ try {
     }
 } finally {
     if ($uploaded -and $null -ne $script:Serial) {
-        Invoke-Remote "rm -f $remoteScript $remoteShim $remoteApp $remoteLauncher $remoteHostKey $remoteNeofetchCommand $remoteNeofetchUpstream $remoteNeofetchConfig $remoteNeofetchLogo $remoteNeofetchLicense" -AllowFailure | Out-Null
+        Invoke-Remote "rm -f $remoteScript $remoteShim $remoteApp $remoteLauncher $remotePkg $remoteRepositoryPublicKey $remoteNeofetchCommand $remoteNeofetchUpstream $remoteNeofetchConfig $remoteNeofetchLogo $remoteNeofetchLicense" -AllowFailure | Out-Null
     }
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $uploadRoot
 }
@@ -357,6 +348,8 @@ Write-Host "Original app_daemon SHA-256: $expectedOriginalHash"
 Write-Host "Installed shim SHA-256: $shimHash"
 Write-Host "C1ancher SHA-256: $appHash"
 Write-Host "C1ancher launcher SHA-256: $launcherHash"
+Write-Host "c1pkg SHA-256: $pkgHash"
+Write-Host "Repository public key SHA-256: $repositoryPublicKeyHash"
 Write-Host "Neofetch launcher SHA-256: $neofetchCommandHash"
 Write-Host "Neofetch 7.1.0 SHA-256: $neofetchUpstreamHash"
 Write-Host "Evidence: $runRoot"
