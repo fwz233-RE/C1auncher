@@ -33,8 +33,7 @@ typedef struct {
 void c1_power_policy_init(c1_power_policy *policy, int64_t now);
 void c1_power_policy_note_activity(c1_power_policy *policy, int64_t now);
 c1_power_action c1_power_policy_tick(c1_power_policy *policy,
-                                     int64_t now,
-                                     bool desktop_page);
+                                     int64_t now);
 bool c1_power_policy_lock(c1_power_policy *policy, int64_t now);
 bool c1_power_policy_unlock(c1_power_policy *policy, int64_t now);
 void c1_power_policy_suspend_failed(c1_power_policy *policy, int64_t now);
@@ -42,7 +41,6 @@ void c1_power_policy_suspend_unavailable(c1_power_policy *policy);
 void c1_power_policy_resumed(c1_power_policy *policy, int64_t now);
 bool c1_power_policy_filter_wakeup(c1_power_policy *policy, bool pressed);
 int c1_power_policy_timeout(const c1_power_policy *policy,
-                            int64_t now,
-                            bool desktop_page);
+                            int64_t now);
 
 #endif

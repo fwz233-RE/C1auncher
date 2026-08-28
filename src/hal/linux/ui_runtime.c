@@ -692,8 +692,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
             break;
         }
         {
-            c1_power_action power_action = c1_power_policy_tick(
-                &power_policy, now, state.page == C1_UI_PAGE_DESKTOP);
+            c1_power_action power_action = c1_power_policy_tick(&power_policy, now);
 
             if (power_action == C1_POWER_ACTION_ENTER_LOCK) {
                 (void)c1_ui_enter_lock(&state);
@@ -823,8 +822,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
             poll_count = C1_UI_INPUT_COUNT + 2U;
         }
         {
-            int poll_timeout = c1_power_policy_timeout(
-                &power_policy, now, state.page == C1_UI_PAGE_DESKTOP);
+            int poll_timeout = c1_power_policy_timeout(&power_policy, now);
 
             if (state.page != C1_UI_PAGE_TERMINAL && state.page != C1_UI_PAGE_LOCK) {
                 poll_timeout = deadline_timeout(poll_timeout, next_status_at, now);

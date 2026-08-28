@@ -58,13 +58,12 @@ bool c1_power_policy_unlock(c1_power_policy *policy, int64_t now)
 }
 
 c1_power_action c1_power_policy_tick(c1_power_policy *policy,
-                                     int64_t now,
-                                     bool desktop_page)
+                                     int64_t now)
 {
     if (policy == NULL) {
         return C1_POWER_ACTION_NONE;
     }
-    if (policy->state == C1_POWER_ACTIVE && !desktop_page &&
+    if (policy->state == C1_POWER_ACTIVE &&
         now - policy->last_activity_at >= C1_POWER_IDLE_TIMEOUT_MS) {
         if (c1_power_policy_lock(policy, now)) {
             return C1_POWER_ACTION_ENTER_LOCK;
@@ -122,13 +121,12 @@ bool c1_power_policy_filter_wakeup(c1_power_policy *policy, bool pressed)
 }
 
 int c1_power_policy_timeout(const c1_power_policy *policy,
-                            int64_t now,
-                            bool desktop_page)
+                            int64_t now)
 {
     if (policy == NULL) {
         return -1;
     }
-    if (policy->state == C1_POWER_ACTIVE && !desktop_page) {
+    if (policy->state == C1_POWER_ACTIVE) {
         return timeout_until(policy->last_activity_at + C1_POWER_IDLE_TIMEOUT_MS, now);
     }
     if (policy->state == C1_POWER_LOCKED && !policy->suspend_disabled) {
