@@ -2,6 +2,7 @@
 #include "core/record.h"
 #include "core/status.h"
 #include "display/frame.h"
+#include "hal/linux/led.h"
 #include "platform/stop.h"
 #include "services/terminal.h"
 #include "services/wifi.h"
@@ -18,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -119,6 +121,44 @@ static bool frame_region_equal(const uint8_t *left,
     return true;
 }
 
+static bool frame_region_bounds(const uint8_t *frame,
+                                uint32_t x,
+                                uint32_t y,
+                                uint32_t width,
+                                uint32_t height,
+                                uint32_t *ink_x,
+                                uint32_t *ink_y,
+                                uint32_t *ink_width,
+                                uint32_t *ink_height)
+{
+    uint32_t min_x = x + width;
+    uint32_t min_y = y + height;
+    uint32_t max_x = x;
+    uint32_t max_y = y;
+    uint32_t row;
+    uint32_t column;
+    bool found = false;
+
+    for (row = y; row < y + height; ++row) {
+        for (column = x; column < x + width; ++column) {
+            if (frame_pixel(frame, column, row)) {
+                if (!found || column < min_x) min_x = column;
+                if (!found || column > max_x) max_x = column;
+                if (!found || row < min_y) min_y = row;
+                if (!found || row > max_y) max_y = row;
+                found = true;
+            }
+        }
+    }
+    if (found) {
+        *ink_x = min_x;
+        *ink_y = min_y;
+        *ink_width = max_x - min_x + 1U;
+        *ink_height = max_y - min_y + 1U;
+    }
+    return found;
+}
+
 static void test_wifi_ssid_codec(void)
 {
     static const char escaped[] =
@@ -170,6 +210,10 @@ static void test_ui(void)
     uint8_t page[C1_DISPLAY_FRAME_BYTES];
     uint8_t connected_status[C1_DISPLAY_FRAME_BYTES];
     uint8_t generic_status[C1_DISPLAY_FRAME_BYTES];
+    uint32_t ink_x;
+    uint32_t ink_y;
+    uint32_t ink_width;
+    uint32_t ink_height;
 
     expect(state.page == C1_UI_PAGE_DESKTOP && state.selection == 4U,
            "UI starts locked on the center desktop cell");
@@ -323,6 +367,22 @@ static void test_ui(void)
 
     state = c1_ui_initial_state();
     c1_ui_render(desktop, &state, &status, NULL);
+    expect(frame_region_bounds(desktop, 100U, 0U, 97U, 50U,
+                               &ink_x, &ink_y, &ink_width, &ink_height) &&
+               ink_x == 110U && ink_y == 5U && ink_width == 76U && ink_height == 40U,
+           "desktop WI-FI label is visually centered and fills most of its direction cell");
+    expect(frame_region_bounds(desktop, 0U, 52U, 98U, 49U,
+                               &ink_x, &ink_y, &ink_width, &ink_height) &&
+               ink_x == 10U && ink_y == 56U && ink_width == 77U && ink_height == 40U,
+           "desktop APP label is visually centered and fills most of its direction cell");
+    expect(frame_region_bounds(desktop, 199U, 52U, 97U, 49U,
+                               &ink_x, &ink_y, &ink_width, &ink_height) &&
+               ink_x == 201U && ink_y == 56U && ink_width == 93U && ink_height == 40U,
+           "desktop TERMINAL label is visually centered and fills most of its direction cell");
+    expect(frame_region_bounds(desktop, 100U, 103U, 97U, 49U,
+                               &ink_x, &ink_y, &ink_width, &ink_height) &&
+               ink_x == 102U && ink_y == 107U && ink_width == 92U && ink_height == 40U,
+           "desktop DEVICE label is visually centered and fills most of its direction cell");
     expect(frame_pixel(desktop, 100U, 52U), "center desktop cell is locked black");
     expect(!frame_pixel(desktop, 146U, 72U) && !frame_pixel(desktop, 148U, 76U),
            "center desktop cell shows a white origin point instead of HOME text");
@@ -341,8 +401,8 @@ static void test_ui(void)
     status.wifi_connected = false;
     status.wifi_connected_ssid[0] = '\0';
     c1_ui_render(generic_status, &state, &status, NULL);
-    expect(!frame_region_equal(connected_status, generic_status, 0U, 0U, 99U, 51U),
-           "top-left status cell distinguishes connected and disconnected Wi-Fi");
+    expect(frame_region_equal(connected_status, generic_status, 0U, 0U, 98U, 50U),
+           "top-left desktop cell no longer renders Wi-Fi status text");
 
     status.wifi_connected = true;
     snprintf(status.wifi_connected_ssid,
@@ -606,6 +666,114 @@ static void test_power_policy(void)
            "unsupported suspend leaves locked policy indefinitely blocked");
 }
 
+static bool test_file_write(const char *path, const char *value)
+{
+    FILE *stream = fopen(path, "w");
+
+    if (stream == NULL) {
+        return false;
+    }
+    if (fputs(value, stream) == EOF) {
+        fclose(stream);
+        return false;
+    }
+    return fclose(stream) == 0;
+}
+
+static bool test_file_read(const char *path, char *value, size_t value_size)
+{
+    FILE *stream = fopen(path, "r");
+    size_t length;
+
+    if (stream == NULL || fgets(value, (int)value_size, stream) == NULL) {
+        if (stream != NULL) {
+            fclose(stream);
+        }
+        return false;
+    }
+    fclose(stream);
+    length = strlen(value);
+    while (length > 0U && (value[length - 1U] == '\n' || value[length - 1U] == '\r')) {
+        value[--length] = '\0';
+    }
+    return true;
+}
+
+static void test_led_chaser(void)
+{
+    char root[] = "/tmp/c1-led-test-XXXXXX";
+    c1_linux_led_chaser chaser;
+    unsigned int index;
+    bool files_ready = true;
+    char *created = mkdtemp(root);
+
+    expect(created != NULL, "LED test directory is created");
+    if (created == NULL) {
+        return;
+    }
+    for (index = 0U; index < C1_LED_CHASER_COUNT; ++index) {
+        char directory[320];
+        char path[352];
+        char brightness[16];
+
+        (void)snprintf(directory, sizeof(directory), "%s/led%u", root, index + 2U);
+        files_ready = files_ready && mkdir(directory, 0700) == 0;
+        (void)snprintf(path, sizeof(path), "%s/trigger", directory);
+        files_ready = files_ready && test_file_write(path, "none [timer] heartbeat\n");
+        (void)snprintf(path, sizeof(path), "%s/brightness", directory);
+        (void)snprintf(brightness, sizeof(brightness), "%u\n", index + 10U);
+        files_ready = files_ready && test_file_write(path, brightness);
+        (void)snprintf(path, sizeof(path), "%s/delay_on", directory);
+        files_ready = files_ready && test_file_write(path, "500\n");
+        (void)snprintf(path, sizeof(path), "%s/delay_off", directory);
+        files_ready = files_ready && test_file_write(path, "500\n");
+    }
+    expect(files_ready, "LED test sysfs files are created");
+    if (files_ready) {
+        char path[352];
+        char value[64];
+
+        expect(c1_linux_led_chaser_start(&chaser, root, 1000),
+               "LED chaser takes temporary control of all four lights");
+        (void)snprintf(path, sizeof(path), "%s/led2/brightness", root);
+        expect(test_file_read(path, value, sizeof(value)) && strcmp(value, "255") == 0,
+               "LED chaser starts with the first light on");
+        (void)snprintf(path, sizeof(path), "%s/led3/brightness", root);
+        expect(test_file_read(path, value, sizeof(value)) && strcmp(value, "0") == 0,
+               "LED chaser starts with the second light off");
+        expect(c1_linux_led_chaser_timeout(&chaser, 1000) == 180,
+               "LED chaser exposes its next event-loop deadline");
+        c1_linux_led_chaser_tick(&chaser, 1180);
+        (void)snprintf(path, sizeof(path), "%s/led2/brightness", root);
+        expect(test_file_read(path, value, sizeof(value)) && strcmp(value, "0") == 0,
+               "LED chaser turns the previous light off");
+        (void)snprintf(path, sizeof(path), "%s/led3/brightness", root);
+        expect(test_file_read(path, value, sizeof(value)) && strcmp(value, "255") == 0,
+               "LED chaser advances to the next light");
+        c1_linux_led_chaser_stop(&chaser);
+        (void)snprintf(path, sizeof(path), "%s/led2/trigger", root);
+        expect(test_file_read(path, value, sizeof(value)) && strcmp(value, "timer") == 0,
+               "LED chaser restores the original trigger");
+        (void)snprintf(path, sizeof(path), "%s/led2/brightness", root);
+        expect(test_file_read(path, value, sizeof(value)) && strcmp(value, "10") == 0,
+               "LED chaser restores the original brightness");
+    }
+    for (index = 0U; index < C1_LED_CHASER_COUNT; ++index) {
+        char directory[320];
+        char path[352];
+        static const char *attributes[] = {"trigger", "brightness", "delay_on", "delay_off"};
+        size_t attribute;
+
+        (void)snprintf(directory, sizeof(directory), "%s/led%u", root, index + 2U);
+        for (attribute = 0U; attribute < sizeof(attributes) / sizeof(attributes[0]); ++attribute) {
+            (void)snprintf(path, sizeof(path), "%s/%s", directory, attributes[attribute]);
+            (void)unlink(path);
+        }
+        (void)rmdir(directory);
+    }
+    (void)rmdir(root);
+}
+
 static void test_stop_signal(void)
 {
     c1_stop_reset();
@@ -650,6 +818,7 @@ int main(void)
     test_terminal_screen();
     test_terminal_pty();
     test_power_policy();
+    test_led_chaser();
     test_stop_signal();
     test_ndjson();
 

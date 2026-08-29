@@ -65,6 +65,26 @@ static void render_desktop_cell_text(uint8_t *frame,
     c1_canvas_text(frame, x, y, text, scale, black);
 }
 
+static void render_desktop_cell_label(uint8_t *frame,
+                                      uint32_t column,
+                                      uint32_t row,
+                                      const char *text,
+                                      uint32_t x_scale,
+                                      uint32_t y_scale,
+                                      bool black)
+{
+    static const uint32_t x_positions[] = {0U, 100U, 199U};
+    static const uint32_t widths[] = {98U, 97U, 97U};
+    static const uint32_t y_positions[] = {0U, 52U, 103U};
+    static const uint32_t heights[] = {50U, 49U, 49U};
+    uint32_t text_width = c1_canvas_text_width(text, x_scale) - x_scale;
+    uint32_t text_height = 5U * y_scale;
+    uint32_t x = x_positions[column] + (widths[column] - text_width) / 2U;
+    uint32_t y = y_positions[row] + (heights[row] - text_height) / 2U;
+
+    c1_canvas_text_scaled(frame, x, y, text, x_scale, y_scale, black);
+}
+
 static void render_desktop_origin(uint8_t *frame)
 {
     c1_canvas_fill_rect(frame, 146U, 72U, 4U, 1U, false);
@@ -76,7 +96,6 @@ static void render_desktop_origin(uint8_t *frame)
 
 static void render_desktop(uint8_t *frame, const c1_ui_status *status)
 {
-    char wifi[12];
     char battery[12];
     char time[12];
 
@@ -90,13 +109,12 @@ static void render_desktop(uint8_t *frame, const c1_ui_status *status)
     c1_canvas_fill_rect(frame, 0U, 103U, 98U, 49U, true);
     c1_canvas_fill_rect(frame, 199U, 103U, 97U, 49U, true);
     c1_canvas_fill_rect(frame, 100U, 52U, 97U, 49U, true);
-    render_desktop_cell_text(frame, 1U, 0U, "WI-FI", 2U, true);
-    render_desktop_cell_text(frame, 0U, 1U, "APP", 2U, true);
+    render_desktop_cell_label(frame, 1U, 0U, "WI-FI", 4U, 8U, true);
+    render_desktop_cell_label(frame, 0U, 1U, "APP", 7U, 8U, true);
     render_desktop_origin(frame);
-    render_desktop_cell_text(frame, 2U, 1U, "TERMINAL", 2U, true);
-    render_desktop_cell_text(frame, 1U, 2U, "DEVICE", 2U, true);
+    render_desktop_cell_label(frame, 2U, 1U, "TERMINAL", 3U, 8U, true);
+    render_desktop_cell_label(frame, 1U, 2U, "DEVICE", 4U, 8U, true);
 
-    snprintf(wifi, sizeof(wifi), "%s", status->wifi_connected ? "WIFI ON" : "WIFI OFF");
     if (status->battery_available) {
         snprintf(battery, sizeof(battery), "%u%%", status->battery_percent);
     } else {
@@ -107,7 +125,6 @@ static void render_desktop(uint8_t *frame, const c1_ui_status *status)
     } else {
         snprintf(time, sizeof(time), "--:--");
     }
-    render_desktop_cell_text(frame, 0U, 0U, wifi, 2U, false);
     render_desktop_cell_text(frame, 0U, 2U, battery, 3U, false);
     render_desktop_cell_text(frame, 2U, 2U, time, 3U, false);
 }

@@ -154,6 +154,7 @@ static void child_exec(int master,
     (void)setenv("HOME", "/root", 1);
     (void)setenv("USER", "root", 1);
     (void)setenv("LOGNAME", "root", 1);
+    (void)setenv("C1_C1ANCHER_TERMINAL", "1", 1);
     if (access("/usr/data", X_OK) == 0 && chdir("/usr/data") != 0 && chdir("/") != 0) {
         _exit(126);
     }

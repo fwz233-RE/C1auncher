@@ -5,6 +5,7 @@
 #include "display/frame.h"
 #include "core/power_policy.h"
 #include "hal/linux/display.h"
+#include "hal/linux/led.h"
 #include "hal/linux/power.h"
 #include "hal/linux/system_state.h"
 #include "services/terminal.h"
@@ -34,6 +35,7 @@
 #define C1_TERMINAL_READ_BUDGET 4096U
 #define C1_TERMINAL_REPEAT_DELAY_MS 450
 #define C1_TERMINAL_REPEAT_INTERVAL_MS 90
+#define C1_LED_SYSFS_ROOT "/sys/class/leds"
 #define C1_TERMINAL_NEOFETCH_COMMAND "clear; neofetch\r"
 #define C1_TERMINAL_APP_COMMAND "clear; /usr/data/c1/bin/c1pkg tui\r"
 
@@ -654,6 +656,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
     c1_terminal_screen terminal_screen;
     c1_service_worker service_worker;
     c1_power_policy power_policy;
+    c1_linux_led_chaser led_chaser;
     c1_status status;
     int64_t started_at;
     int64_t next_status_at;
@@ -674,6 +677,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
 
     c1_terminal_init(&terminal_session);
     service_worker_init(&service_worker);
+    memset(&led_chaser, 0, sizeof(led_chaser));
     status = c1_terminal_screen_init(&terminal_screen);
     if (status != C1_STATUS_OK) {
         return status;
@@ -693,6 +697,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
     if (status != C1_STATUS_OK) {
         goto done;
     }
+    (void)c1_linux_led_chaser_start(&led_chaser, C1_LED_SYSFS_ROOT, started_at);
     next_status_at = started_at + C1_UI_STATUS_INTERVAL_MS;
 
     for (;;) {
@@ -709,6 +714,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
             status = C1_STATUS_INTERRUPTED;
             break;
         }
+        c1_linux_led_chaser_tick(&led_chaser, now);
         {
             c1_power_action power_action = c1_power_policy_tick(&power_policy, now);
 
@@ -743,6 +749,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                         c1_linux_power_rollback(&power_context, &terminal_session);
                         break;
                     }
+                    c1_linux_led_chaser_stop(&led_chaser);
                     suspend_status = c1_linux_power_suspend(sink);
                     resume_status = c1_linux_power_resume(&power_context, &terminal_session);
                     shift_pressed = false;
@@ -756,6 +763,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                         status = C1_STATUS_IO_ERROR;
                         break;
                     }
+                    (void)c1_linux_led_chaser_start(&led_chaser, C1_LED_SYSFS_ROOT, now);
                     if (suspend_status == C1_STATUS_OK) {
                         c1_power_policy_resumed(&power_policy, now);
                         c1_linux_display_reset_cache();
@@ -840,7 +848,11 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
         }
         {
             int poll_timeout = c1_power_policy_timeout(&power_policy, now);
+            int led_timeout = c1_linux_led_chaser_timeout(&led_chaser, now);
 
+            if (led_timeout >= 0 && (poll_timeout < 0 || led_timeout < poll_timeout)) {
+                poll_timeout = led_timeout;
+            }
             if (state.page != C1_UI_PAGE_TERMINAL && state.page != C1_UI_PAGE_LOCK) {
                 poll_timeout = deadline_timeout(poll_timeout, next_status_at, now);
             }
@@ -991,6 +1003,12 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                             repeat_code = 0U;
                             repeat_at = -1;
                             state.terminal_symbol_picker = false;
+                            if (terminal_app_mode) {
+                                c1_terminal_stop(&terminal_session);
+                                terminal_app_mode = false;
+                                terminal_started_once = false;
+                                terminal_ended_announced = false;
+                            }
                             state.page = C1_UI_PAGE_DESKTOP;
                             state.selection = 4U;
                             terminal_app_mode = false;
@@ -1282,25 +1300,42 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
         }
         if (terminal_started_once && !c1_terminal_is_running(&terminal_session) &&
             !terminal_ended_announced) {
-            char ended[48];
-            int length = snprintf(ended,
-                                  sizeof(ended),
-                                  "\r\n[SESSION ENDED %d]\r\nENTER RESTARTS\r\n",
-                                  c1_terminal_exit_code(&terminal_session));
+            if (terminal_app_mode) {
+                state.page = C1_UI_PAGE_DESKTOP;
+                state.selection = 4U;
+                terminal_app_mode = false;
+                terminal_ended_announced = true;
+                pending_terminal_action = C1_UI_ACTION_NONE;
+                repeat_code = 0U;
+                repeat_at = -1;
+                terminal_dirty = false;
+                terminal_render_at = -1;
+                status = render_current(state, &terminal_screen, true, sink);
+                if (status != C1_STATUS_OK) {
+                    break;
+                }
+            } else {
+                char ended[48];
+                int length = snprintf(ended,
+                                      sizeof(ended),
+                                      "\r\n[SESSION ENDED %d]\r\nENTER RESTARTS\r\n",
+                                      c1_terminal_exit_code(&terminal_session));
 
-            if (length > 0) {
-                c1_terminal_screen_feed(&terminal_screen, ended, (size_t)length);
+                if (length > 0) {
+                    c1_terminal_screen_feed(&terminal_screen, ended, (size_t)length);
+                }
+                terminal_ended_announced = true;
+                pending_terminal_action = C1_UI_ACTION_NONE;
+                repeat_code = 0U;
+                repeat_at = -1;
+                terminal_dirty = true;
+                terminal_render_at = now;
             }
-            terminal_ended_announced = true;
-            pending_terminal_action = C1_UI_ACTION_NONE;
-            repeat_code = 0U;
-            repeat_at = -1;
-            terminal_dirty = true;
-            terminal_render_at = now;
         }
     }
 
 done:
+    c1_linux_led_chaser_stop(&led_chaser);
     service_worker_stop(&service_worker);
     c1_terminal_stop(&terminal_session);
     c1_terminal_screen_destroy(&terminal_screen);

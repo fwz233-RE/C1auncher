@@ -108,6 +108,7 @@ static void final_border(void)
 struct tui_state {
     struct c1pkg_index index;
     struct c1pkg_installed_list installed;
+    struct c1pkg_download_list downloads;
     size_t selected[2];
     size_t offset[2];
     unsigned int tab;
@@ -116,7 +117,7 @@ struct tui_state {
 
 static size_t item_count(const struct tui_state *state)
 {
-    return state->tab == 0U ? state->installed.count : state->index.count;
+    return state->tab == 0U ? state->installed.count : state->downloads.count;
 }
 
 static void clamp_selection(struct tui_state *state)
@@ -140,6 +141,25 @@ static void clamp_selection(struct tui_state *state)
     }
 }
 
+static const char *download_mark(enum c1pkg_download_status status)
+{
+    switch (status) {
+    case C1PKG_DOWNLOAD_NOT_INSTALLED: return " ";
+    case C1PKG_DOWNLOAD_CURRENT: return "=";
+    case C1PKG_DOWNLOAD_UPDATE_AVAILABLE: return "U";
+    case C1PKG_DOWNLOAD_INSTALLED_NEWER: return ">";
+    case C1PKG_DOWNLOAD_VERSION_UNKNOWN: return "?";
+    case C1PKG_DOWNLOAD_REMOVED: return "X";
+    }
+    return "?";
+}
+
+static const char *download_version(const struct c1pkg_download_item *item)
+{
+    return item->status == C1PKG_DOWNLOAD_REMOVED ? item->installed_version :
+                                                    item->available_version;
+}
+
 static void render(const struct tui_state *state)
 {
     size_t row;
@@ -160,19 +180,29 @@ static void render(const struct tui_state *state)
             frame_line("%c %-31.31s %11.11s", item == state->selected[0] ? '>' : ' ',
                        installed->id, installed->version);
         } else {
-            const struct c1pkg_package *package = &state->index.packages[item];
-            const char *installed_version = NULL;
-            const char *mark = c1pkg_store_is_installed(&state->installed, package->id,
-                                                        &installed_version) ? "*" : " ";
+            const struct c1pkg_download_item *download = &state->downloads.items[item];
             frame_line("%c%s %-28.28s %12.12s", item == state->selected[1] ? '>' : ' ',
-                       mark, package->name, package->version);
+                       download_mark(download->status), download->name,
+                       download_version(download));
         }
     }
     border();
-    frame_line(" r:refresh q:quit");
+    frame_line(" =current U=update X=removed r=refresh q=quit");
     frame_line(" %.46s", state->status);
     final_border();
     (void)fflush(stdout);
+}
+
+static int rebuild_downloads(struct tui_state *state)
+{
+    if (c1pkg_download_list_build(&state->index, &state->installed,
+                                  &state->downloads) != 0) {
+        (void)snprintf(state->status, sizeof(state->status),
+                       "ERROR: cannot build download list");
+        return -1;
+    }
+    clamp_selection(state);
+    return 0;
 }
 
 static int reload_installed(struct tui_state *state)
@@ -182,8 +212,7 @@ static int reload_installed(struct tui_state *state)
         (void)snprintf(state->status, sizeof(state->status), "ERROR: %.220s", error);
         return -1;
     }
-    clamp_selection(state);
-    return 0;
+    return rebuild_downloads(state);
 }
 
 static void refresh(struct tui_state *state, const struct c1pkg_config *config)
@@ -209,58 +238,6 @@ static void refresh(struct tui_state *state, const struct c1pkg_config *config)
     clamp_selection(state);
 }
 
-static void check_download_selected(struct tui_state *state,
-                                    const struct c1pkg_config *config,
-                                    const char *id)
-{
-    char error[C1PKG_ERROR_MAX] = "";
-    struct c1pkg_index fresh;
-    const struct c1pkg_package *package;
-    const char *installed_version = NULL;
-    int installed;
-
-    (void)snprintf(state->status, sizeof(state->status),
-                   "Checking signed repository for %.32s...", id);
-    render(state);
-    if (c1pkg_repo_refresh(config, &fresh, error, sizeof(error)) != 0) {
-        (void)snprintf(state->status, sizeof(state->status),
-                       "CHECK FAILED: %.217s", error);
-        return;
-    }
-    state->index = fresh;
-    package = c1pkg_repo_find(&state->index, id);
-    if (package == NULL) {
-        (void)snprintf(state->status, sizeof(state->status),
-                       "%.32s is no longer available", id);
-        clamp_selection(state);
-        return;
-    }
-    state->selected[1] = (size_t)(package - state->index.packages);
-    clamp_selection(state);
-    if (reload_installed(state) != 0) {
-        return;
-    }
-    installed = c1pkg_store_is_installed(&state->installed, id, &installed_version);
-    if (installed && strcmp(installed_version, package->version) == 0) {
-        (void)snprintf(state->status, sizeof(state->status),
-                       "%.32s %.48s is already the latest version",
-                       id, package->version);
-        return;
-    }
-
-    (void)snprintf(state->status, sizeof(state->status),
-                   "%s and verifying %.32s...", installed ? "Updating" : "Installing", id);
-    render(state);
-    if (c1pkg_store_install(config, package, error, sizeof(error)) != 0) {
-        (void)snprintf(state->status, sizeof(state->status), "%s FAILED: %.216s",
-                       installed ? "UPDATE" : "INSTALL", error);
-    } else {
-        (void)snprintf(state->status, sizeof(state->status), "%s %.32s %.48s",
-                       installed ? "Updated" : "Installed", id, package->version);
-        (void)reload_installed(state);
-    }
-}
-
 static void launch_selected_app(const char *id)
 {
     static const char clear_sequence[] = "\033[2J\033[H";
@@ -273,26 +250,6 @@ static void launch_selected_app(const char *id)
     execl("/usr/data/c1/bin/c1pkg", "c1pkg", "launch", id, (char *)NULL);
     (void)fprintf(stderr, "c1pkg: cannot start standalone launcher: %s\n", strerror(errno));
     _exit(127);
-}
-
-static int perform_action(struct tui_state *state, const struct c1pkg_config *config)
-{
-    size_t count = item_count(state);
-
-    if (count == 0U) {
-        (void)snprintf(state->status, sizeof(state->status), "No item selected");
-        return 0;
-    }
-    if (state->tab == 0U) {
-        char id[C1PKG_ID_MAX + 1U];
-        (void)strcpy(id, state->installed.items[state->selected[0]].id);
-        launch_selected_app(id);
-    } else {
-        char id[C1PKG_ID_MAX + 1U];
-        (void)strcpy(id, state->index.packages[state->selected[1]].id);
-        check_download_selected(state, config, id);
-    }
-    return 0;
 }
 
 enum input_key {
@@ -356,6 +313,236 @@ static enum input_key read_key(void)
     if (bytes[0] == (unsigned char)'r') return KEY_REFRESH;
     if (bytes[0] == (unsigned char)'\r' || bytes[0] == (unsigned char)'\n') return KEY_ENTER;
     return KEY_NONE;
+}
+
+enum manage_action {
+    MANAGE_UPDATE,
+    MANAGE_REMOVE,
+    MANAGE_CANCEL
+};
+
+static const char *download_state_text(enum c1pkg_download_status status)
+{
+    switch (status) {
+    case C1PKG_DOWNLOAD_CURRENT: return "Already the latest version";
+    case C1PKG_DOWNLOAD_UPDATE_AVAILABLE: return "Update available";
+    case C1PKG_DOWNLOAD_INSTALLED_NEWER: return "Installed version is newer";
+    case C1PKG_DOWNLOAD_VERSION_UNKNOWN: return "Versions cannot be compared";
+    case C1PKG_DOWNLOAD_REMOVED: return "Removed from repository";
+    case C1PKG_DOWNLOAD_NOT_INSTALLED: return "Not installed";
+    }
+    return "Unknown state";
+}
+
+static size_t manage_action_count(const struct c1pkg_download_item *item)
+{
+    return item->status == C1PKG_DOWNLOAD_UPDATE_AVAILABLE ? 3U : 2U;
+}
+
+static enum manage_action manage_action_at(const struct c1pkg_download_item *item,
+                                           size_t selection)
+{
+    if (item->status == C1PKG_DOWNLOAD_UPDATE_AVAILABLE) {
+        static const enum manage_action actions[] = {
+            MANAGE_UPDATE, MANAGE_REMOVE, MANAGE_CANCEL
+        };
+        return actions[selection];
+    }
+    return selection == 0U ? MANAGE_REMOVE : MANAGE_CANCEL;
+}
+
+static const char *manage_action_text(enum manage_action action)
+{
+    switch (action) {
+    case MANAGE_UPDATE: return "Update";
+    case MANAGE_REMOVE: return "Uninstall";
+    case MANAGE_CANCEL: return "Cancel";
+    }
+    return "Cancel";
+}
+
+static void render_manage_dialog(const struct c1pkg_download_item *item,
+                                 size_t selection)
+{
+    size_t row;
+    size_t count = manage_action_count(item);
+
+    (void)fputs("\033[H", stdout);
+    border();
+    frame_line(" Manage installed application");
+    border();
+    frame_line("");
+    frame_line(" App: %.32s", item->id);
+    frame_line(" Installed: %.35s", item->installed_version);
+    if (item->available_version[0] != '\0') {
+        frame_line(" Available: %.35s", item->available_version);
+    } else {
+        frame_line(" Available: (removed)");
+    }
+    frame_line("");
+    frame_line(" %s", download_state_text(item->status));
+    frame_line("");
+    for (row = 0U; row < 3U; ++row) {
+        if (row < count) {
+            frame_line(" %c %s", row == selection ? '>' : ' ',
+                       manage_action_text(manage_action_at(item, row)));
+        } else {
+            frame_line("");
+        }
+    }
+    frame_line("");
+    frame_line("");
+    frame_line("");
+    frame_line(" Up/Down:select  Enter:confirm  q:cancel");
+    frame_line("");
+    final_border();
+    (void)fflush(stdout);
+}
+
+static int confirm_uninstall(const struct c1pkg_download_item *item)
+{
+    size_t selection = 1U;
+
+    for (;;) {
+        enum input_key key;
+
+        (void)fputs("\033[H", stdout);
+        border();
+        frame_line(" Confirm uninstall");
+        border();
+        frame_line("");
+        frame_line(" Remove %.32s?", item->id);
+        frame_line(" Installed version: %.28s", item->installed_version);
+        frame_line("");
+        frame_line(" This removes every installed version.");
+        frame_line("");
+        frame_line("");
+        frame_line(" %c Uninstall", selection == 0U ? '>' : ' ');
+        frame_line(" %c Cancel", selection == 1U ? '>' : ' ');
+        frame_line("");
+        frame_line("");
+        frame_line("");
+        frame_line("");
+        frame_line(" Up/Down:select  Enter:confirm  q:cancel");
+        frame_line("");
+        final_border();
+        (void)fflush(stdout);
+        key = read_key();
+        if (key == KEY_QUIT) {
+            return 0;
+        }
+        if (key == KEY_UP || key == KEY_DOWN) {
+            selection = selection == 0U ? 1U : 0U;
+        } else if (key == KEY_ENTER) {
+            return selection == 0U ? 1 : 0;
+        }
+    }
+}
+
+static void install_download(struct tui_state *state,
+                             const struct c1pkg_config *config,
+                             const struct c1pkg_download_item *item,
+                             int updating)
+{
+    char error[C1PKG_ERROR_MAX] = "";
+    const struct c1pkg_package *package;
+
+    if (item->package_index >= state->index.count) {
+        (void)snprintf(state->status, sizeof(state->status),
+                       "INSTALL FAILED: package is unavailable");
+        return;
+    }
+    package = &state->index.packages[item->package_index];
+    (void)snprintf(state->status, sizeof(state->status), "%s and verifying %.32s...",
+                   updating != 0 ? "Updating" : "Installing", item->id);
+    render(state);
+    if (c1pkg_store_install(config, package, error, sizeof(error)) != 0) {
+        (void)snprintf(state->status, sizeof(state->status), "%s FAILED: %.216s",
+                       updating != 0 ? "UPDATE" : "INSTALL", error);
+        return;
+    }
+    (void)snprintf(state->status, sizeof(state->status), "%s %.32s %.48s",
+                   updating != 0 ? "Updated" : "Installed", item->id, package->version);
+    (void)reload_installed(state);
+}
+
+static void uninstall_download(struct tui_state *state,
+                               const struct c1pkg_download_item *item)
+{
+    char error[C1PKG_ERROR_MAX] = "";
+
+    (void)snprintf(state->status, sizeof(state->status), "Uninstalling %.32s...", item->id);
+    render(state);
+    if (c1pkg_store_remove(item->id, error, sizeof(error)) != 0) {
+        (void)snprintf(state->status, sizeof(state->status),
+                       "UNINSTALL FAILED: %.207s", error);
+        return;
+    }
+    (void)snprintf(state->status, sizeof(state->status), "Uninstalled %.32s", item->id);
+    (void)reload_installed(state);
+}
+
+static void manage_download(struct tui_state *state,
+                            const struct c1pkg_config *config,
+                            const struct c1pkg_download_item *selected_item)
+{
+    struct c1pkg_download_item item = *selected_item;
+    size_t selection = 0U;
+
+    for (;;) {
+        enum input_key key;
+        size_t count = manage_action_count(&item);
+
+        render_manage_dialog(&item, selection);
+        key = read_key();
+        if (key == KEY_QUIT) {
+            return;
+        }
+        if (key == KEY_UP && selection > 0U) {
+            --selection;
+        } else if (key == KEY_DOWN && selection + 1U < count) {
+            ++selection;
+        } else if (key == KEY_ENTER) {
+            enum manage_action action = manage_action_at(&item, selection);
+
+            if (action == MANAGE_UPDATE) {
+                install_download(state, config, &item, 1);
+                return;
+            }
+            if (action == MANAGE_REMOVE) {
+                if (confirm_uninstall(&item) != 0) {
+                    uninstall_download(state, &item);
+                }
+                return;
+            }
+            return;
+        }
+    }
+}
+
+static int perform_action(struct tui_state *state, const struct c1pkg_config *config)
+{
+    size_t count = item_count(state);
+
+    if (count == 0U) {
+        (void)snprintf(state->status, sizeof(state->status), "No item selected");
+        return 0;
+    }
+    if (state->tab == 0U) {
+        char id[C1PKG_ID_MAX + 1U];
+        (void)strcpy(id, state->installed.items[state->selected[0]].id);
+        launch_selected_app(id);
+    } else {
+        const struct c1pkg_download_item *item =
+            &state->downloads.items[state->selected[1]];
+        if (item->status == C1PKG_DOWNLOAD_NOT_INSTALLED) {
+            struct c1pkg_download_item copy = *item;
+            install_download(state, config, &copy, 0);
+        } else {
+            manage_download(state, config, item);
+        }
+    }
+    return 0;
 }
 
 int c1pkg_tui(const struct c1pkg_config *config)

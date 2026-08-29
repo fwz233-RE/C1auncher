@@ -2,17 +2,18 @@
 
 C1-Slim / MP-D261 的自研用户空间界面，面向 296×152 黑白电子纸、实体键盘和 MIPS Buildroot 系统。
 
-- 当前版本：**1.2.0**
-- 上一个已发布版本：[GitHub Release v1.0.0](https://github.com/fwz233-RE/C1ancher/releases/tag/v1.0.0)
+- 当前版本：**1.3.0**
+- 上一个已发布版本：[GitHub Release v1.2.0](https://github.com/fwz233-RE/C1ancher/releases/tag/v1.2.0)
 - 目标 ABI：ELF32、MIPS32r2、小端、o32、hard-float double、完全静态链接
 
 ## 功能
 
-- 九宫格首页：Wi-Fi、APP、终端、设备信息、电量和时间。
+- 九宫格首页：放大居中的 Wi-Fi、APP、终端和设备信息入口，以及电量和时间。
 - 开放 Wi-Fi 点击后直接连接；加密 Wi-Fi 使用实体键盘输入密码。
 - 支持 `wpa_supplicant` 转义的 UTF-8 SSID，可连接中文热点。
-- `APP` 复用终端并启动 49×19 的 `c1pkg` TUI，显示已安装与服务器应用，支持安装、更新、卸载和启动。
-- 软件仓库索引使用内置 Ed25519 验签，软件包使用 SHA-256 校验、受限路径解包、原子版本切换和回滚保护。
+- `APP` 复用终端并启动 49×19 的 `c1pkg` TUI，合并已安装与服务器应用，支持启动、安装、版本感知更新和带确认的卸载管理。
+- 软件仓库索引使用内置 Ed25519 验签，支持验签缓存回退；软件包使用 SHA-256 校验、受限路径解包、原子版本切换和回滚保护。
+- 运行期间驱动右上角四灯循环跑马灯，退出或休眠时恢复原有 LED 状态。
 - 49×19 持久 PTY root 终端，支持 ANSI/xterm、滚动历史和常用全屏程序。
 - `DEVICE` 复用终端并自动运行随附的 Neofetch 7.1.0。
 - 壁纸锁屏、事件驱动主循环、相同帧去重和按变化刷新。
@@ -61,7 +62,7 @@ build/build-info.txt
 
 ```sh
 ./build/C1ancher --version
-# C1ancher 1.2.0
+# C1ancher 1.3.0
 ```
 
 ## 安装
@@ -109,9 +110,10 @@ clear; /usr/data/c1/bin/c1pkg tui
 
 | 文件 | 内容 |
 | --- | --- |
-| `C1ancher-v1.0.0-c1-slim-mipsel-static.tar.gz` | 完整应用固件部署包 |
-| `C1ancher-v1.0.0-mipsel-static` | 静态主程序 |
-| `C1ancher-launcher-v1.0.0-mipsel-static` | 静态 supervisor |
+| `C1ancher-v1.2.0-c1-slim-mipsel-static.tar.gz` | 完整应用固件部署包 |
+| `C1ancher-v1.2.0-mipsel-static` | 静态主程序 |
+| `C1ancher-launcher-v1.2.0-mipsel-static` | 静态 supervisor |
+| `c1pkg-v1.2.0-mipsel-static` | 静态 APP 包管理器 |
 | `SHA256SUMS.txt` | SHA-256 校验值 |
 
 这些文件是 **C1ancher 应用固件和安装工具**，不是包含分区表、内核和根文件系统的整机刷机镜像。
