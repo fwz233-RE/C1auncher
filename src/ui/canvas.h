@@ -17,6 +17,13 @@ void c1_canvas_stroke_rect(uint8_t *frame,
                            uint32_t height,
                            uint32_t thickness,
                            bool black);
+void c1_canvas_text_scaled(uint8_t *frame,
+                           uint32_t x,
+                           uint32_t y,
+                           const char *text,
+                           uint32_t x_scale,
+                           uint32_t y_scale,
+                           bool black);
 void c1_canvas_text(uint8_t *frame,
                     uint32_t x,
                     uint32_t y,

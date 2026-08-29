@@ -141,16 +141,17 @@ void c1_canvas_stroke_rect(uint8_t *frame,
     c1_canvas_fill_rect(frame, x + width - thickness, y, thickness, height, black);
 }
 
-void c1_canvas_text(uint8_t *frame,
-                    uint32_t x,
-                    uint32_t y,
-                    const char *text,
-                    uint32_t scale,
-                    bool black)
+void c1_canvas_text_scaled(uint8_t *frame,
+                           uint32_t x,
+                           uint32_t y,
+                           const char *text,
+                           uint32_t x_scale,
+                           uint32_t y_scale,
+                           bool black)
 {
     size_t index;
 
-    if (frame == NULL || text == NULL || scale == 0U) {
+    if (frame == NULL || text == NULL || x_scale == 0U || y_scale == 0U) {
         return;
     }
     for (index = 0U; text[index] != '\0'; ++index) {
@@ -165,15 +166,25 @@ void c1_canvas_text(uint8_t *frame,
 
                 if ((bits & mask) != 0U) {
                     c1_canvas_fill_rect(frame,
-                                        x + (uint32_t)index * 4U * scale + column * scale,
-                                        y + row * scale,
-                                        scale,
-                                        scale,
+                                        x + (uint32_t)index * 4U * x_scale + column * x_scale,
+                                        y + row * y_scale,
+                                        x_scale,
+                                        y_scale,
                                         black);
                 }
             }
         }
     }
+}
+
+void c1_canvas_text(uint8_t *frame,
+                    uint32_t x,
+                    uint32_t y,
+                    const char *text,
+                    uint32_t scale,
+                    bool black)
+{
+    c1_canvas_text_scaled(frame, x, y, text, scale, scale, black);
 }
 
 static const uint8_t terminal_font[95][5] = {

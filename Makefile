@@ -11,6 +11,7 @@ LAUNCHER_TARGET := $(BUILD_DIR)/C1ancher-launcher
 PKG_TARGET := $(BUILD_DIR)/c1pkg
 HOST_TEST := $(BUILD_DIR)/host-tests
 HOST_LAUNCHER_TEST := $(BUILD_DIR)/host-launcher-tests
+HOST_PKG_TEST := $(BUILD_DIR)/host-pkg-tests
 HOST_PKG_TARGET := $(BUILD_DIR)/host-c1pkg
 ABI_REPORT := $(BUILD_DIR)/abi.txt
 LAUNCHER_ABI_REPORT := $(BUILD_DIR)/launcher-abi.txt
@@ -32,6 +33,7 @@ SOURCES := \
 	src/hal/linux/power.c \
 	src/hal/linux/system_state.c \
 	src/hal/linux/display.c \
+	src/hal/linux/led.c \
 	src/hal/linux/ui_runtime.c \
 	src/platform/stop.c
 
@@ -58,6 +60,7 @@ HOST_TEST_SOURCES := \
 	src/ui/terminal_screen.c \
 	src/services/wifi.c \
 	src/services/terminal.c \
+	src/hal/linux/led.c \
 	src/platform/stop.c
 
 LAUNCHER_SOURCES := \
@@ -73,7 +76,12 @@ PKG_SOURCES := \
 	src/pkg/repo.c \
 	src/pkg/store.c \
 	src/pkg/tui.c \
+	src/pkg/tui_model.c \
 	src/pkg/util.c
+
+HOST_PKG_TEST_SOURCES := \
+	tests/test_pkg.c \
+	src/pkg/tui_model.c
 
 ED25519_VERIFY_SOURCES := \
 	third_party/ed25519/fe.c \
@@ -165,9 +173,13 @@ $(HOST_TEST): $(HOST_TEST_OBJECTS) $(HOST_TSM_OBJECTS) | $(BUILD_DIR)
 $(HOST_LAUNCHER_TEST): $(HOST_LAUNCHER_TEST_SOURCES) | $(BUILD_DIR)
 	$(HOST_CC) $(CPPFLAGS) $(COMMON_CFLAGS) $(HOST_LAUNCHER_TEST_SOURCES) -o $@
 
-host-test: $(HOST_TEST) $(HOST_LAUNCHER_TEST) $(HOST_PKG_TARGET)
+$(HOST_PKG_TEST): $(HOST_PKG_TEST_SOURCES) | $(BUILD_DIR)
+	$(HOST_CC) $(PKG_CPPFLAGS) $(COMMON_CFLAGS) $(HOST_PKG_TEST_SOURCES) -o $@
+
+host-test: $(HOST_TEST) $(HOST_LAUNCHER_TEST) $(HOST_PKG_TEST) $(HOST_PKG_TARGET)
 	$(HOST_TEST)
 	$(HOST_LAUNCHER_TEST)
+	$(HOST_PKG_TEST)
 	$(HOST_PKG_TARGET) --help >/dev/null
 
 verify: $(TARGET) $(LAUNCHER_TARGET) $(PKG_TARGET)

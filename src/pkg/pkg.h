@@ -14,6 +14,8 @@
 #define C1PKG_FILE_MAX (16U * 1024U * 1024U)
 #define C1PKG_UNPACKED_MAX (64U * 1024U * 1024U)
 #define C1PKG_MAX_PACKAGES 128U
+#define C1PKG_MAX_DOWNLOAD_ITEMS (C1PKG_MAX_PACKAGES * 2U)
+#define C1PKG_PACKAGE_NONE C1PKG_MAX_PACKAGES
 #define C1PKG_PATH_MAX 4096U
 #define C1PKG_ID_MAX 32U
 #define C1PKG_VERSION_MAX 48U
@@ -44,6 +46,29 @@ struct c1pkg_installed {
 
 struct c1pkg_installed_list {
     struct c1pkg_installed items[C1PKG_MAX_PACKAGES];
+    size_t count;
+};
+
+enum c1pkg_download_status {
+    C1PKG_DOWNLOAD_NOT_INSTALLED,
+    C1PKG_DOWNLOAD_CURRENT,
+    C1PKG_DOWNLOAD_UPDATE_AVAILABLE,
+    C1PKG_DOWNLOAD_INSTALLED_NEWER,
+    C1PKG_DOWNLOAD_VERSION_UNKNOWN,
+    C1PKG_DOWNLOAD_REMOVED
+};
+
+struct c1pkg_download_item {
+    char id[C1PKG_ID_MAX + 1U];
+    char name[C1PKG_NAME_MAX + 1U];
+    char installed_version[C1PKG_VERSION_MAX + 1U];
+    char available_version[C1PKG_VERSION_MAX + 1U];
+    size_t package_index;
+    enum c1pkg_download_status status;
+};
+
+struct c1pkg_download_list {
+    struct c1pkg_download_item items[C1PKG_MAX_DOWNLOAD_ITEMS];
     size_t count;
 };
 
@@ -89,6 +114,11 @@ int c1pkg_store_launch(const char *id, char *const extra_argv[],
                        char *error, size_t error_size);
 int c1pkg_store_is_installed(const struct c1pkg_installed_list *list,
                              const char *id, const char **version);
+
+int c1pkg_version_compare(const char *left, const char *right, int *comparison);
+int c1pkg_download_list_build(const struct c1pkg_index *index,
+                              const struct c1pkg_installed_list *installed,
+                              struct c1pkg_download_list *list);
 
 int c1pkg_tui(const struct c1pkg_config *config);
 
