@@ -12,6 +12,7 @@
 !/App/
 !/Pinao/
 !/ChiChuGames/
+!/C1ancher-server/
 
 # Build products, device evidence, caches and local environments.
 **/build/
