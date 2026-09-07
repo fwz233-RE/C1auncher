@@ -4,11 +4,13 @@
 #include "display/frame.h"
 #include "hal/linux/led.h"
 #include "platform/stop.h"
+#include "platform/update_health.h"
 #include "services/terminal.h"
 #include "services/wifi.h"
 #include "ui/canvas.h"
 #include "ui/model.h"
 #include "ui/render.h"
+#include "pkg/text.h"
 #include "ui/wallpaper.h"
 
 #include <errno.h>
@@ -121,15 +123,16 @@ static bool frame_region_equal(const uint8_t *left,
     return true;
 }
 
-static bool frame_region_bounds(const uint8_t *frame,
-                                uint32_t x,
-                                uint32_t y,
-                                uint32_t width,
-                                uint32_t height,
-                                uint32_t *ink_x,
-                                uint32_t *ink_y,
-                                uint32_t *ink_width,
-                                uint32_t *ink_height)
+static bool frame_region_color_bounds(const uint8_t *frame,
+                                      uint32_t x,
+                                      uint32_t y,
+                                      uint32_t width,
+                                      uint32_t height,
+                                      bool black,
+                                      uint32_t *ink_x,
+                                      uint32_t *ink_y,
+                                      uint32_t *ink_width,
+                                      uint32_t *ink_height)
 {
     uint32_t min_x = x + width;
     uint32_t min_y = y + height;
@@ -141,7 +144,7 @@ static bool frame_region_bounds(const uint8_t *frame,
 
     for (row = y; row < y + height; ++row) {
         for (column = x; column < x + width; ++column) {
-            if (frame_pixel(frame, column, row)) {
+            if (frame_pixel(frame, column, row) == black) {
                 if (!found || column < min_x) min_x = column;
                 if (!found || column > max_x) max_x = column;
                 if (!found || row < min_y) min_y = row;
@@ -157,6 +160,34 @@ static bool frame_region_bounds(const uint8_t *frame,
         *ink_height = max_y - min_y + 1U;
     }
     return found;
+}
+
+static bool frame_region_bounds(const uint8_t *frame,
+                                uint32_t x,
+                                uint32_t y,
+                                uint32_t width,
+                                uint32_t height,
+                                uint32_t *ink_x,
+                                uint32_t *ink_y,
+                                uint32_t *ink_width,
+                                uint32_t *ink_height)
+{
+    return frame_region_color_bounds(frame, x, y, width, height, true,
+                                     ink_x, ink_y, ink_width, ink_height);
+}
+
+static bool frame_region_white_bounds(const uint8_t *frame,
+                                      uint32_t x,
+                                      uint32_t y,
+                                      uint32_t width,
+                                      uint32_t height,
+                                      uint32_t *ink_x,
+                                      uint32_t *ink_y,
+                                      uint32_t *ink_width,
+                                      uint32_t *ink_height)
+{
+    return frame_region_color_bounds(frame, x, y, width, height, false,
+                                     ink_x, ink_y, ink_width, ink_height);
 }
 
 static void test_wifi_ssid_codec(void)
@@ -200,6 +231,7 @@ static void test_ui(void)
         .wifi_connected = true,
         .network_count = 1U,
         .wifi_connected_ssid = "TEST-NETWORK",
+        .wifi_ipv4 = "172.16.21.119",
         .networks = {{"TEST-NETWORK", -48, true}},
         .time_available = true,
         .hour = 23U,
@@ -246,8 +278,36 @@ static void test_ui(void)
     transition = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
     expect(transition.state.page == C1_UI_PAGE_DESKTOP &&
                transition.state.selection == 4U &&
+               transition.action == C1_UI_ACTION_UPDATE_REFRESH,
+           "online center Enter checks in the background without opening a terminal");
+    transition = c1_ui_step(state, C1_UI_EVENT_ENTER, NULL);
+    expect(memcmp(&transition.state, &state, sizeof(state)) == 0 &&
                transition.action == C1_UI_ACTION_NONE,
-           "Enter does not activate a desktop direction");
+           "missing network status makes center Enter a no-op");
+    status.wifi_connected = false;
+    transition = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(memcmp(&transition.state, &state, sizeof(state)) == 0 &&
+               transition.action == C1_UI_ACTION_NONE,
+           "offline center Enter preserves the desktop without any action");
+    status.update_available = true;
+    transition = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(transition.state.page == C1_UI_PAGE_DESKTOP &&
+               transition.action == C1_UI_ACTION_NONE,
+           "offline center Enter remains a no-op even with a cached prepared update");
+    status.wifi_connected = true;
+    status.wifi_ipv4[0] = '\0';
+    transition = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(transition.state.page == C1_UI_PAGE_DESKTOP &&
+               transition.action == C1_UI_ACTION_NONE,
+           "stale connected status without a live IP cannot open the updater");
+    snprintf(status.wifi_ipv4, sizeof(status.wifi_ipv4), "172.16.21.119");
+    transition = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(transition.state.page == C1_UI_PAGE_TERMINAL &&
+               transition.state.selection == 0U &&
+               transition.action == C1_UI_ACTION_TERMINAL_UPDATE,
+           "online center Enter opens only a prepared update for confirmation");
+    status.update_available = false;
+    state = c1_ui_reduce(transition.state, C1_UI_EVENT_HOME);
     transition = c1_ui_step(state, C1_UI_EVENT_RIGHT, &status);
     expect(transition.state.page == C1_UI_PAGE_TERMINAL &&
                transition.action == C1_UI_ACTION_NONE,
@@ -272,6 +332,8 @@ static void test_ui(void)
                transition.action == C1_UI_ACTION_NONE,
            "APP direction requests c1pkg only for its entry event");
 
+    status.wifi_connected = false;
+    status.wifi_enabled = true;
     state = c1_ui_initial_state();
     transition = c1_ui_step(state, C1_UI_EVENT_UP, &status);
     expect(transition.state.page == C1_UI_PAGE_WIFI && transition.action == C1_UI_ACTION_WIFI_SCAN,
@@ -298,10 +360,16 @@ static void test_ui(void)
     expect(strcmp(transition.state.selected_ssid, "TEST-NETWORK") == 0,
            "open network connection retains the selected SSID");
     status.networks[0].secured = true;
+    status.networks[0].security = C1_WIFI_SECURITY_WPA_PSK;
     transition = c1_ui_step(transition.state, C1_UI_EVENT_ENTER, &status);
     expect(transition.state.page == C1_UI_PAGE_WIFI_PASSWORD &&
                transition.action == C1_UI_ACTION_NONE,
            "secured network selection opens the password input page");
+    expect(transition.state.secret_visible, "password entry starts visible by default");
+    transition = c1_ui_step(transition.state, C1_UI_EVENT_TOGGLE_SECRET, &status);
+    expect(!transition.state.secret_visible, "Tab can hide the initially visible password");
+    transition = c1_ui_step(transition.state, C1_UI_EVENT_TOGGLE_SECRET, &status);
+    expect(transition.state.secret_visible, "Tab can reveal the password again");
     expect(strcmp(transition.state.selected_ssid, "TEST-NETWORK") == 0,
            "selected SSID is retained for connection");
     expect(transition.state.keyboard_layer == C1_UI_KEYBOARD_LOWER,
@@ -346,8 +414,9 @@ static void test_ui(void)
     expect(transition.state.secret_length == 2U, "direct physical input updates secret length");
     c1_ui_clear_secret(&transition.state);
     transition = c1_ui_step(transition.state, C1_UI_EVENT_ENTER, &status);
-    expect(transition.state.secret_length == 0U && transition.action == C1_UI_ACTION_NONE,
-           "OK does nothing when no extended symbol palette is visible");
+    expect(transition.state.secret_length == 0U && transition.action == C1_UI_ACTION_NONE &&
+               strcmp(transition.state.wifi_notice, "USE 8-63 CHARACTERS") == 0,
+           "OK validates an empty password on the input page without starting work");
     transition.state.keyboard_layer = C1_UI_KEYBOARD_SYMBOLS;
     transition.state.symbol_selection = 0U;
     transition = c1_ui_step(transition.state, C1_UI_EVENT_ENTER, &status);
@@ -358,13 +427,27 @@ static void test_ui(void)
     expect(strcmp(transition.state.secret, "!+") == 0,
            "arrows select another extended symbol");
     transition = c1_ui_step(transition.state, C1_UI_EVENT_SUBMIT, &status);
+    expect(transition.action == C1_UI_ACTION_NONE && transition.state.secret_length == 2U,
+           "short password is retained and rejected before creating a worker");
+    for (unsigned int i = 0; i < 6U; ++i) c1_ui_secret_append(&transition.state, 'a');
+    transition = c1_ui_step(transition.state, C1_UI_EVENT_SUBMIT, &status);
     expect(transition.action == C1_UI_ACTION_WIFI_CONNECT, "physical Enter requests Wi-Fi connection");
-    c1_display_frame_clear(page, false);
-    c1_canvas_text(page, 12U, 52U, transition.state.secret, 2U, true);
+    transition.state.keyboard_layer = C1_UI_KEYBOARD_LOWER;
+    transition = c1_ui_step(transition.state, C1_UI_EVENT_ENTER, &status);
+    expect(transition.action == C1_UI_ACTION_WIFI_CONNECT, "center OK also submits a valid password");
     c1_ui_render(desktop, &transition.state, &status, NULL);
-    expect(frame_region_equal(desktop, page, 12U, 52U, 16U, 10U),
+    c1_display_frame_clear(page, false);
+    c1_canvas_text(page, 12U, 56U, "********", 2U, true);
+    expect(frame_region_equal(desktop, page, 12U, 56U, 64U, 10U),
+           "password is masked when visibility is disabled");
+    transition = c1_ui_step(transition.state, C1_UI_EVENT_TOGGLE_SECRET, &status);
+    c1_display_frame_clear(page, false);
+    c1_canvas_text(page, 12U, 56U, transition.state.secret, 2U, true);
+    c1_ui_render(desktop, &transition.state, &status, NULL);
+    expect(frame_region_equal(desktop, page, 12U, 56U, 16U, 10U),
            "Wi-Fi password input displays entered characters at double size");
 
+    status.wifi_connected = true;
     state = c1_ui_initial_state();
     c1_ui_render(desktop, &state, &status, NULL);
     expect(frame_region_bounds(desktop, 100U, 0U, 97U, 50U,
@@ -384,8 +467,17 @@ static void test_ui(void)
                ink_x == 102U && ink_y == 107U && ink_width == 92U && ink_height == 40U,
            "desktop DEVICE label is visually centered and fills most of its direction cell");
     expect(frame_pixel(desktop, 100U, 52U), "center desktop cell is locked black");
-    expect(!frame_pixel(desktop, 146U, 72U) && !frame_pixel(desktop, 148U, 76U),
-           "center desktop cell shows a white origin point instead of HOME text");
+    expect(frame_region_white_bounds(desktop, 100U, 52U, 97U, 49U,
+                                     &ink_x, &ink_y, &ink_width, &ink_height) &&
+               ink_x == 143U && ink_y == 72U && ink_width == 10U && ink_height == 9U,
+           "desktop center cell shows the original no-update dot");
+    status.update_available = true;
+    c1_ui_render(desktop, &state, &status, NULL);
+    expect(frame_region_white_bounds(desktop, 100U, 52U, 97U, 49U,
+                                     &ink_x, &ink_y, &ink_width, &ink_height) &&
+               ink_x == 102U && ink_y == 56U && ink_width == 92U && ink_height == 40U,
+           "desktop center cell expands UPDATE to fill its grid cell");
+    status.update_available = false;
     expect(!frame_pixel(desktop, 100U, 10U), "direction cells remain unselected");
     expect(frame_pixel(desktop, 98U, 25U) && frame_pixel(desktop, 99U, 25U) &&
                frame_pixel(desktop, 197U, 25U) && frame_pixel(desktop, 198U, 25U),
@@ -397,12 +489,36 @@ static void test_ui(void)
                frame_pixel(desktop, 0U, 151U) && frame_pixel(desktop, 295U, 151U),
            "four corner status cells use black backgrounds to the screen edge");
 
+    expect(frame_region_white_bounds(desktop, 0U, 0U, 98U, 50U,
+                                     &ink_x, &ink_y, &ink_width, &ink_height) &&
+               ink_x == 3U && ink_y == 5U && ink_width == 92U && ink_height == 40U,
+           "desktop IPv4 prefix fills the top-left status cell");
+    expect(frame_region_white_bounds(desktop, 199U, 0U, 97U, 50U,
+                                     &ink_x, &ink_y, &ink_width, &ink_height) &&
+               ink_x == 201U && ink_y == 5U && ink_width == 92U && ink_height == 40U,
+           "desktop IPv4 suffix fills the top-right status cell");
+    expect(frame_region_white_bounds(desktop, 0U, 103U, 98U, 49U,
+                                     &ink_x, &ink_y, &ink_width, &ink_height) &&
+               ink_x == 5U && ink_y == 107U && ink_width == 88U && ink_height == 40U,
+           "desktop battery value fills the bottom-left status cell");
+    expect(frame_region_white_bounds(desktop, 199U, 103U, 97U, 49U,
+                                     &ink_x, &ink_y, &ink_width, &ink_height) &&
+               ink_x == 200U && ink_y == 107U && ink_width == 95U && ink_height == 40U,
+           "desktop time fills the bottom-right status cell");
+
     c1_ui_render(connected_status, &state, &status, NULL);
     status.wifi_connected = false;
     status.wifi_connected_ssid[0] = '\0';
+    status.wifi_ipv4[0] = '\0';
     c1_ui_render(generic_status, &state, &status, NULL);
-    expect(frame_region_equal(connected_status, generic_status, 0U, 0U, 98U, 50U),
-           "top-left desktop cell no longer renders Wi-Fi status text");
+    expect(!frame_region_equal(connected_status, generic_status, 0U, 0U, 98U, 50U) &&
+               !frame_region_equal(connected_status, generic_status, 199U, 0U, 97U, 50U),
+           "disconnecting clears both IPv4 halves from the desktop");
+    expect(!frame_region_white_bounds(generic_status, 0U, 0U, 98U, 50U,
+                                      &ink_x, &ink_y, &ink_width, &ink_height) &&
+               !frame_region_white_bounds(generic_status, 199U, 0U, 97U, 50U,
+                                          &ink_x, &ink_y, &ink_width, &ink_height),
+           "disconnected top status cells remain completely blank");
 
     status.wifi_connected = true;
     snprintf(status.wifi_connected_ssid,
@@ -417,8 +533,8 @@ static void test_ui(void)
     c1_ui_render(generic_status, &state, &status, NULL);
     expect(!frame_region_equal(connected_status, generic_status, 220U, 59U, 68U, 19U),
            "connected network row has a prominent connection label");
-    expect(!frame_region_equal(connected_status, generic_status, 8U, 145U, 180U, 7U),
-           "Wi-Fi page footer identifies the connected network");
+    expect(!frame_region_equal(connected_status, generic_status, 8U, 133U, 180U, 7U),
+           "Wi-Fi page footer identifies the connected address");
 
     status.wifi_connected = true;
     snprintf(status.wifi_connected_ssid,
@@ -427,8 +543,11 @@ static void test_ui(void)
              "TEST-NETWORK");
     status.wifi_busy = true;
     c1_ui_render(page, &state, &status, NULL);
-    expect(frame_pixel(page, 66U, 124U),
-           "Wi-Fi scanning state renders a visible loading indicator");
+    expect(frame_region_bounds(page, 12U, 76U, 260U, 12U,
+                               &ink_x, &ink_y, &ink_width, &ink_height),
+           "Wi-Fi scanning state renders readable text rather than a fake progress bar");
+    expect(!frame_region_equal(page, connected_status, 8U, 58U, 280U, 66U),
+           "busy page replaces actionable stale network rows");
     status.wifi_busy = false;
     state = c1_ui_initial_state();
     transition = c1_ui_step(state, C1_UI_EVENT_DOWN, &status);
@@ -443,6 +562,162 @@ static void test_ui(void)
     c1_ui_render(page, &state, &status, NULL);
     expect(memcmp(desktop, page, sizeof(page)) != 0,
            "bottom DEVICE direction reuses the terminal instead of a detail page");
+}
+
+static void test_wifi_typography(void)
+{
+    c1_ui_state state = c1_ui_initial_state();
+    c1_ui_status status = {0};
+    uint8_t frame[C1_DISPLAY_FRAME_BYTES], expected[C1_DISPLAY_FRAME_BYTES];
+    uint8_t short_name[C1_DISPLAY_FRAME_BYTES];
+    state.page = C1_UI_PAGE_WIFI;
+    state.selection = 0U;
+    status.wifi_enabled = true;
+    status.network_count = 4U;
+    for (size_t i = 0; i < status.network_count; ++i) {
+        snprintf(status.networks[i].ssid, sizeof(status.networks[i].ssid), "Network-%u", (unsigned int)i);
+        status.networks[i].security = C1_WIFI_SECURITY_WPA_PSK;
+        status.networks[i].secured = true;
+    }
+    snprintf(status.networks[0].ssid, sizeof(status.networks[0].ssid), "书房网络");
+    c1_ui_render(frame, &state, &status, NULL);
+    c1_display_frame_clear(expected, false);
+    c1pkg_text(expected, 36, 60, "书房网络", 208, 1);
+    expect(frame_region_equal(frame, expected, 36U, 60U, 208U, 16U),
+           "Chinese SSIDs render complete bitmap glyphs instead of blank bytes");
+
+    snprintf(status.networks[0].ssid, sizeof(status.networks[0].ssid), "Short");
+    c1_ui_render(short_name, &state, &status, NULL);
+    snprintf(status.networks[0].ssid, sizeof(status.networks[0].ssid), "01234567890123456789012345678901");
+    c1_ui_render(frame, &state, &status, NULL);
+    expect(frame_region_equal(frame, short_name, 248U, 58U, 40U, 21U),
+           "long SSIDs cannot overwrite the network security label");
+    c1_display_frame_clear(expected, false);
+    c1pkg_text(expected, 220, 60, "...", 24, 1);
+    expect(frame_region_equal(frame, expected, 220U, 60U, 24U, 16U),
+           "long SSIDs have a visible pixel-budget ellipsis");
+
+    state.selection = 5U;
+    c1_ui_render(frame, &state, &status, NULL);
+    c1_display_frame_clear(expected, false);
+    c1_canvas_fill_rect(expected, 8U, 58U, 280U, 21U, true);
+    c1pkg_text(expected, 36, 60, "Network-3", 208, 0);
+    expect(frame_region_equal(frame, expected, 36U, 60U, 208U, 16U),
+           "fourth network starts the next page with white text on black selection");
+    expect(frame_region_equal(frame, expected, 8U, 80U, 280U, 43U),
+           "last page does not retain stale rows from previous page");
+}
+
+static void test_wifi_saved_interactions(void)
+{
+    c1_ui_state state = c1_ui_initial_state();
+    state.page = C1_UI_PAGE_WIFI;
+    state.selection = 2U;
+    c1_ui_status status = {0};
+    status.wifi_enabled = true;
+    status.network_count = 3U;
+    status.networks[0] = (c1_ui_network){"Guest", -40, false, C1_WIFI_SECURITY_OPEN, false};
+    status.networks[1] = (c1_ui_network){"Home", -50, true, C1_WIFI_SECURITY_WPA_PSK, true};
+    status.networks[2] = (c1_ui_network){"Office", -60, true, C1_WIFI_SECURITY_WPA_PSK, true};
+    c1_ui_transition next = c1_ui_autoconnect(state, &status);
+    expect(next.action == C1_UI_ACTION_WIFI_CONNECT && next.state.selected_saved &&
+               strcmp(next.state.selected_ssid, "Home") == 0 && next.state.secret_length == 0U,
+           "fresh scan automatically selects strongest saved network without exposing credentials");
+    status.wifi_connected = true;
+    expect(c1_ui_autoconnect(state, &status).action == C1_UI_ACTION_NONE,
+           "automatic reconnect never replaces an existing live connection");
+    status.wifi_connected = false;
+    status.wifi_stop_pending = true;
+    expect(c1_ui_autoconnect(state, &status).action == C1_UI_ACTION_NONE,
+           "pending turn off takes precedence over saved auto-connect");
+    status.wifi_stop_pending = false;
+    status.service_busy = true;
+    expect(c1_ui_autoconnect(state, &status).action == C1_UI_ACTION_NONE,
+           "auto-connect cannot race an existing worker");
+    status.service_busy = false;
+    state.page = C1_UI_PAGE_DESKTOP;
+    expect(c1_ui_autoconnect(state, &status).action == C1_UI_ACTION_NONE,
+           "leaving Wi-Fi before scan completion prevents automatic connection");
+    state.page = C1_UI_PAGE_WIFI;
+    state.selection = 3U;
+    next = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(next.action == C1_UI_ACTION_WIFI_CONNECT && next.state.selected_saved &&
+               next.state.page == C1_UI_PAGE_WIFI && next.state.secret_length == 0U,
+           "manual saved network selection connects directly instead of opening password page");
+    status.networks[1].saved = false;
+    next = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(next.action == C1_UI_ACTION_NONE && !next.state.selected_saved &&
+               next.state.page == C1_UI_PAGE_WIFI_PASSWORD && next.state.secret_visible,
+           "unremembered secured networks still open visible password input");
+    status.networks[2].saved = false;
+    expect(c1_ui_autoconnect(state, &status).action == C1_UI_ACTION_NONE,
+           "no saved credentials means no automatic connection to an arbitrary open network");
+}
+
+static void test_wifi_interactions(void)
+{
+    c1_ui_state state = c1_ui_initial_state();
+    c1_ui_status status = {0};
+    c1_ui_transition next;
+    status.service_busy = true;
+    next = c1_ui_step(state, C1_UI_EVENT_UP, &status);
+    expect(next.state.page == C1_UI_PAGE_WIFI && next.action == C1_UI_ACTION_NONE &&
+               next.state.wifi_notice[0] != '\0', "entering Wi-Fi during an update explains why no scan starts");
+    state = next.state;
+    state.selection = 1U;
+    next = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(next.action == C1_UI_ACTION_WIFI_DISABLE, "turn off can be requested while worker is busy");
+    status.wifi_busy = true;
+    state.selection = 0U;
+    next = c1_ui_step(state, C1_UI_EVENT_DOWN, &status);
+    expect(next.state.selection == 0U, "busy view cannot navigate hidden network rows");
+    status.service_busy = false;
+    status.wifi_busy = false;
+    status.wifi_connected = true;
+    status.network_count = 1U;
+    snprintf(status.networks[0].ssid, sizeof(status.networks[0].ssid), "HOME");
+    snprintf(status.wifi_connected_ssid, sizeof(status.wifi_connected_ssid), "HOME");
+    status.networks[0].secured = true;
+    status.networks[0].security = C1_WIFI_SECURITY_WPA_PSK;
+    state.selection = 2U;
+    next = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(next.state.page == C1_UI_PAGE_WIFI && next.action == C1_UI_ACTION_NONE &&
+               strstr(next.state.wifi_notice, "ALREADY CONNECTED") != NULL,
+           "selecting current network does not ask for its password again");
+    status.network_count = 2U;
+    status.networks[1] = status.networks[0];
+    status.networks[1].security = C1_WIFI_SECURITY_OPEN;
+    status.networks[1].secured = false;
+    expect(!c1_ui_network_is_current(&status, 0U) && !c1_ui_network_is_current(&status, 1U),
+           "same-name networks with different security are not both marked current");
+    state.selection = 3U;
+    next = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(next.action == C1_UI_ACTION_WIFI_CONNECT &&
+               next.state.selected_security == C1_WIFI_SECURITY_OPEN,
+           "SSID-only connected status cannot swallow selection of another security type");
+    status.network_count = 1U;
+    state.selection = 2U;
+    status.wifi_connected = false;
+    status.networks[0].security = C1_WIFI_SECURITY_ENTERPRISE;
+    next = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(next.action == C1_UI_ACTION_NONE && next.state.page == C1_UI_PAGE_WIFI &&
+               strstr(next.state.wifi_notice, "NOT SUPPORTED") != NULL,
+           "enterprise security is explained rather than treated as a PSK password");
+    status.networks[0].security = C1_WIFI_SECURITY_WPA_PSK;
+    next = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(next.state.selected_security == C1_WIFI_SECURITY_WPA_PSK,
+           "selected authentication type is retained for the connection worker");
+    state.page = C1_UI_PAGE_WIFI_PASSWORD;
+    snprintf(state.secret, sizeof(state.secret), "password123");
+    state.secret_length = strlen(state.secret);
+    state.secret_visible = true;
+    status.service_busy = true;
+    next = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(next.action == C1_UI_ACTION_NONE && next.state.secret_length == state.secret_length,
+           "busy connection submit retains password for retry");
+    next = c1_ui_step(next.state, C1_UI_EVENT_BACK, &status);
+    expect(next.state.page == C1_UI_PAGE_WIFI && next.state.secret_length == 0U &&
+               !next.state.secret_visible, "cancelling clears password and resets visibility");
 }
 
 static int64_t test_milliseconds(void)
@@ -576,6 +851,7 @@ static void test_terminal_pty(void)
 static void test_power_policy(void)
 {
     c1_power_policy policy;
+    c1_power_policy gated_policy;
     c1_ui_state state = c1_ui_initial_state();
     int64_t now = 1000;
     int64_t non_desktop_locked_at;
@@ -585,6 +861,44 @@ static void test_power_policy(void)
            "power policy starts active");
     expect(c1_power_policy_timeout(&policy, now) == C1_POWER_IDLE_TIMEOUT_MS,
            "active policy schedules the five-minute idle deadline on the desktop");
+
+    c1_power_policy_init(&gated_policy, now);
+    expect(c1_power_policy_lock(&gated_policy, now),
+           "external-power gate test enters lock state");
+    expect(c1_power_policy_tick(&gated_policy,
+                                now + C1_POWER_LOCK_TIMEOUT_MS) == C1_POWER_ACTION_NONE &&
+               c1_power_policy_timeout(&gated_policy, now) == -1,
+           "unknown external power fails closed without a suspend deadline");
+    c1_power_policy_set_external_power(&gated_policy, true, true, now);
+    expect(c1_power_policy_tick(&gated_policy,
+                                now + C1_POWER_LOCK_TIMEOUT_MS) == C1_POWER_ACTION_NONE &&
+               c1_power_policy_timeout(&gated_policy, now) == -1,
+           "online external power blocks suspend without periodic policy wakeups");
+    c1_power_policy_set_external_power(&gated_policy, true, false, now + 1000);
+    expect(c1_power_policy_tick(&gated_policy,
+                                now + 1000 + C1_POWER_EXTERNAL_OFFLINE_DELAY_MS - 1) ==
+               C1_POWER_ACTION_NONE,
+           "newly offline power waits for a stable unplug interval");
+    c1_power_policy_set_external_power(&gated_policy, true, true, now + 5000);
+    c1_power_policy_set_external_power(&gated_policy, true, false, now + 6000);
+    expect(c1_power_policy_tick(&gated_policy,
+                                now + 1000 + C1_POWER_EXTERNAL_OFFLINE_DELAY_MS) ==
+               C1_POWER_ACTION_NONE,
+           "an online transition cancels the previous unplug interval");
+    expect(c1_power_policy_tick(&gated_policy,
+                                now + 6000 + C1_POWER_EXTERNAL_OFFLINE_DELAY_MS) ==
+               C1_POWER_ACTION_SUSPEND,
+           "stable offline power permits suspend after twenty seconds while locked");
+    c1_power_policy_suspend_cancelled(&gated_policy);
+    expect(gated_policy.state == C1_POWER_LOCKED && gated_policy.suspend_retry_at < 0,
+           "late power recheck cancellation returns to locked state without retry delay");
+    c1_power_policy_restore_failed(&gated_policy, now + 30000);
+    expect(gated_policy.suspend_disabled &&
+               c1_power_policy_timeout(&gated_policy, now + 30000) == -1 &&
+               c1_power_policy_filter_wakeup(&gated_policy, true),
+           "restore failure disables later suspend attempts and suppresses wake-key leakage");
+
+    c1_power_policy_set_external_power(&policy, true, false, now);
     expect(c1_power_policy_tick(&policy,
                                 now + C1_POWER_IDLE_TIMEOUT_MS - 1) ==
                C1_POWER_ACTION_NONE,
@@ -734,22 +1048,31 @@ static void test_led_chaser(void)
         char value[64];
 
         expect(c1_linux_led_chaser_start(&chaser, root, 1000),
-               "LED chaser takes temporary control of all four lights");
+               "LED feedback takes temporary control of all four lights");
         (void)snprintf(path, sizeof(path), "%s/led2/brightness", root);
-        expect(test_file_read(path, value, sizeof(value)) && strcmp(value, "255") == 0,
-               "LED chaser starts with the first light on");
-        (void)snprintf(path, sizeof(path), "%s/led3/brightness", root);
         expect(test_file_read(path, value, sizeof(value)) && strcmp(value, "0") == 0,
-               "LED chaser starts with the second light off");
+               "LED feedback starts quiet without a periodic deadline");
+        expect(c1_linux_led_chaser_timeout(&chaser, 1000) == -1,
+               "quiet LED feedback does not wake the event loop");
+        c1_linux_led_chaser_pulse(&chaser, 1000);
+        expect(test_file_read(path, value, sizeof(value)) && strcmp(value, "255") == 0,
+               "input feedback starts with the first light on");
         expect(c1_linux_led_chaser_timeout(&chaser, 1000) == 180,
-               "LED chaser exposes its next event-loop deadline");
+               "active LED feedback exposes only its short pulse deadline");
         c1_linux_led_chaser_tick(&chaser, 1180);
-        (void)snprintf(path, sizeof(path), "%s/led2/brightness", root);
         expect(test_file_read(path, value, sizeof(value)) && strcmp(value, "0") == 0,
-               "LED chaser turns the previous light off");
+               "LED feedback turns the previous light off");
         (void)snprintf(path, sizeof(path), "%s/led3/brightness", root);
         expect(test_file_read(path, value, sizeof(value)) && strcmp(value, "255") == 0,
-               "LED chaser advances to the next light");
+               "LED feedback advances to the next light");
+        c1_linux_led_chaser_tick(&chaser, 1720);
+        expect(test_file_read(path, value, sizeof(value)) && strcmp(value, "0") == 0 &&
+                   c1_linux_led_chaser_timeout(&chaser, 1720) == -1,
+               "LED feedback turns fully off after one short cycle");
+        c1_linux_led_chaser_pulse(&chaser, 2000);
+        c1_linux_led_chaser_quiet(&chaser);
+        expect(c1_linux_led_chaser_timeout(&chaser, 2000) == -1,
+               "lock mode immediately cancels LED feedback");
         c1_linux_led_chaser_stop(&chaser);
         (void)snprintf(path, sizeof(path), "%s/led2/trigger", root);
         expect(test_file_read(path, value, sizeof(value)) && strcmp(value, "timer") == 0,
@@ -772,6 +1095,21 @@ static void test_led_chaser(void)
         (void)rmdir(directory);
     }
     (void)rmdir(root);
+}
+
+static void test_update_health_policy(void)
+{
+    struct c1_update_state state;
+
+    memset(&state, 0, sizeof(state));
+    state.phase = C1_UPDATE_PENDING_BOOT;
+    expect(c1_update_health_should_probe(&state),
+           "pending release requires one health probe");
+    state.phase = C1_UPDATE_CONFIRMED;
+    expect(!c1_update_health_should_probe(&state),
+           "confirmed release skips candidate health probes");
+    expect(!c1_update_health_should_probe(NULL),
+           "missing update state cannot authorize a health probe");
 }
 
 static void test_stop_signal(void)
@@ -814,11 +1152,15 @@ int main(void)
 {
     test_display_frame();
     test_wifi_ssid_codec();
+    test_wifi_interactions();
+    test_wifi_saved_interactions();
+    test_wifi_typography();
     test_ui();
     test_terminal_screen();
     test_terminal_pty();
     test_power_policy();
     test_led_chaser();
+    test_update_health_policy();
     test_stop_signal();
     test_ndjson();
 

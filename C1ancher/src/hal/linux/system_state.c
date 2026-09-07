@@ -2,6 +2,7 @@
 
 #include "hal/linux/system_state.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
@@ -57,11 +58,38 @@ static bool read_integer(const char *path, int64_t *value)
     return true;
 }
 
-static bool interface_has_ipv4(const char *interface_name)
+static bool read_online(const char *path, bool *online)
+{
+    int64_t value;
+
+    if (online == NULL || !read_integer(path, &value) || (value != 0 && value != 1)) {
+        return false;
+    }
+    *online = value == 1;
+    return true;
+}
+
+bool c1_linux_external_power_read(bool *online)
+{
+    bool ac_online = false;
+    bool usb_online = false;
+    bool ac_known;
+    bool usb_known;
+
+    if (online == NULL) {
+        return false;
+    }
+    ac_known = read_online("/sys/class/power_supply/ac/online", &ac_online);
+    usb_known = read_online("/sys/class/power_supply/usb/online", &usb_online);
+    *online = (ac_known && ac_online) || (usb_known && usb_online);
+    return ac_known && usb_known;
+}
+
+static bool interface_ipv4(const char *interface_name, char *value, size_t capacity)
 {
     struct ifreq request;
     int descriptor = socket(AF_INET, SOCK_DGRAM, 0);
-    bool present = false;
+    bool found = false;
 
     if (descriptor < 0) {
         return false;
@@ -69,11 +97,19 @@ static bool interface_has_ipv4(const char *interface_name)
     fcntl(descriptor, F_SETFD, FD_CLOEXEC);
     memset(&request, 0, sizeof(request));
     if (strlen(interface_name) < sizeof(request.ifr_name)) {
+        struct sockaddr_in *address;
+
         memcpy(request.ifr_name, interface_name, strlen(interface_name) + 1U);
-        present = ioctl(descriptor, SIOCGIFADDR, &request) == 0;
+        if (ioctl(descriptor, SIOCGIFADDR, &request) == 0) {
+            address = (struct sockaddr_in *)&request.ifr_addr;
+            found = inet_ntop(AF_INET,
+                              &address->sin_addr,
+                              value,
+                              (socklen_t)capacity) != NULL;
+        }
     }
     close(descriptor);
-    return present;
+    return found;
 }
 
 bool c1_linux_system_status_read(c1_ui_status *status)
@@ -95,7 +131,10 @@ bool c1_linux_system_status_read(c1_ui_status *status)
     }
 
     read_integer("/sys/class/net/wlan0/carrier", &carrier);
-    status->wifi_connected = carrier == 1 && interface_has_ipv4("wlan0");
+    status->wifi_connected = carrier == 1 &&
+                             interface_ipv4("wlan0",
+                                            status->wifi_ipv4,
+                                            sizeof(status->wifi_ipv4));
 
     status->time_available = clock_gettime(CLOCK_REALTIME, &current) == 0 &&
                              localtime_r(&current.tv_sec, &local) != NULL;

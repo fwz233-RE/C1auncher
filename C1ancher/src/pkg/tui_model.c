@@ -3,6 +3,127 @@
 #include <ctype.h>
 #include <stddef.h>
 #include <string.h>
+#include <errno.h>
+#include <poll.h>
+#include <time.h>
+#include <unistd.h>
+
+uint64_t c1pkg_input_now_ms(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0U;
+    return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
+}
+
+/* Read exactly one key, never discard the rest of a burst (e.g. PI + Enter).
+ * Escape sequences are consumed through their final byte, including unknown
+ * CSI keys, so navigation bytes cannot become a name prefix. */
+int c1pkg_input_read(int fd, int timeout_ms)
+{
+    struct pollfd input = {fd, POLLIN, 0};
+    unsigned char byte;
+    int ready = poll(&input, 1U, timeout_ms);
+    if (ready < 0) return errno == EINTR ? C1PKG_KEY_NONE : C1PKG_KEY_EOF;
+    if (ready == 0) return C1PKG_KEY_NONE;
+    if (!(input.revents & POLLIN)) return C1PKG_KEY_EOF;
+    if (read(fd, &byte, 1U) != 1) return C1PKG_KEY_EOF;
+    if (byte == 27U) {
+        unsigned char sequence[16];
+        size_t count = 0U;
+        if (poll(&input, 1U, 40) <= 0 || read(fd, &byte, 1U) != 1)
+            return C1PKG_KEY_BACK;
+        if (byte != '[' && byte != 'O') return C1PKG_KEY_NONE;
+        while (count < sizeof(sequence) && poll(&input, 1U, 40) > 0) {
+            if (read(fd, &sequence[count], 1U) != 1) break;
+            byte = sequence[count++];
+            if (byte >= 0x40U && byte <= 0x7eU) break;
+        }
+        if (count == 1U) {
+            if (sequence[0] == 'A') return C1PKG_KEY_UP;
+            if (sequence[0] == 'B') return C1PKG_KEY_DOWN;
+            if (sequence[0] == 'C') return C1PKG_KEY_RIGHT;
+            if (sequence[0] == 'D') return C1PKG_KEY_LEFT;
+        }
+        if (count == 2U && sequence[1] == '~') {
+            if (sequence[0] == '5') return C1PKG_KEY_LEFT;
+            if (sequence[0] == '6') return C1PKG_KEY_RIGHT;
+        }
+        return C1PKG_KEY_NONE;
+    }
+    if (byte == '\r' || byte == '\n') return C1PKG_KEY_ENTER;
+    if (byte == ' ') return C1PKG_KEY_REFRESH;
+    if (byte == 8U || byte == 127U) return C1PKG_KEY_ERASE;
+    if (byte == 21U) return C1PKG_KEY_CLEAR; /* Ctrl-U */
+    if (byte == 3U) return C1PKG_KEY_QUIT;
+    return byte >= 33U && byte <= 126U ? (int)byte : C1PKG_KEY_NONE;
+}
+
+void c1pkg_prefix_clear(struct c1pkg_prefix *prefix)
+{
+    prefix->text[0] = '\0';
+    prefix->updated_ms = 0U;
+}
+
+int c1pkg_prefix_expire(struct c1pkg_prefix *prefix, uint64_t now_ms)
+{
+    if (prefix->text[0] != '\0' &&
+        (now_ms < prefix->updated_ms || now_ms - prefix->updated_ms >= C1PKG_PREFIX_TIMEOUT_MS)) {
+        c1pkg_prefix_clear(prefix);
+        return 1;
+    }
+    return 0;
+}
+
+int c1pkg_prefix_input(struct c1pkg_prefix *prefix, int key, uint64_t now_ms)
+{
+    size_t length;
+    /* Commands must not expire or clear a prefix before the caller validates
+     * Enter. Idle expiry is separately displayed by the GUI/TUI. */
+    if (key != C1PKG_KEY_ERASE && key != C1PKG_KEY_CLEAR && (key < 33 || key > 126)) return 0;
+    (void)c1pkg_prefix_expire(prefix, now_ms);
+    length = strlen(prefix->text);
+    if (key == C1PKG_KEY_ERASE) {
+        if (length > 0U) prefix->text[length - 1U] = '\0';
+    } else if (key == C1PKG_KEY_CLEAR) {
+        c1pkg_prefix_clear(prefix);
+    } else if (key >= 33 && key <= 126) {
+        if (length < C1PKG_NAME_MAX) {
+            prefix->text[length] = (char)(key >= 'A' && key <= 'Z' ? key + ('a' - 'A') : key);
+            prefix->text[length + 1U] = '\0';
+        }
+    } else return 0;
+    prefix->updated_ms = now_ms;
+    return 1;
+}
+
+static int starts_with_ascii(const char *value, const char *prefix)
+{
+    if (value == NULL) return 0;
+    while (*prefix != '\0') {
+        unsigned char byte = (unsigned char)*value++;
+        if (byte >= 'A' && byte <= 'Z') byte += 'a' - 'A';
+        if (byte != (unsigned char)*prefix++) return 0;
+    }
+    return 1;
+}
+
+int c1pkg_prefix_match_rank(const struct c1pkg_prefix *prefix, const char *name, const char *id)
+{
+    size_t length = strlen(prefix->text);
+    int id_matches, name_matches;
+    if (length == 0U) return 0;
+    id_matches = starts_with_ascii(id, prefix->text);
+    name_matches = starts_with_ascii(name, prefix->text);
+    if (id_matches && strlen(id) == length) return 3;
+    if (name_matches && strlen(name) == length) return 2;
+    return id_matches || name_matches ? 1 : 0;
+}
+
+int c1pkg_prefix_matches(const struct c1pkg_prefix *prefix, const char *name, const char *id)
+{
+    return c1pkg_prefix_match_rank(prefix, name, id) != 0;
+}
+
 
 struct semver_view {
     const char *major;
@@ -199,12 +320,45 @@ static int compare_prerelease(const struct semver_view *left,
     return left_offset == left->prerelease_length ? -1 : 1;
 }
 
+/* Repository versions use two to four numeric components. Missing trailing
+ * components compare as zero. Keep legacy three-component prerelease support
+ * below so installed older releases retain their established ordering. */
+static int parse_repository_version(const char *value, const char **parts, size_t *lengths)
+{
+    const char *cursor = value;
+    size_t count = 0U, i;
+    if (value == NULL || strlen(value) > C1PKG_VERSION_MAX) return -1;
+    for (i = 0U; i < 4U; ++i) { parts[i] = "0"; lengths[i] = 1U; }
+    while (*cursor != '\0' && count < 4U) {
+        const char *start = cursor;
+        while (isdigit((unsigned char)*cursor)) ++cursor;
+        if (cursor == start || (cursor - start > 1 && start[0] == '0')) return -1;
+        parts[count] = start;
+        lengths[count++] = (size_t)(cursor - start);
+        if (*cursor == '\0') break;
+        if (*cursor++ != '.' || *cursor == '\0') return -1;
+    }
+    return *cursor == '\0' && count >= 2U ? 0 : -1;
+}
+
 int c1pkg_version_compare(const char *left, const char *right, int *comparison)
 {
+    const char *left_parts[4], *right_parts[4];
+    size_t left_lengths[4], right_lengths[4], i;
     struct semver_view left_view;
     struct semver_view right_view;
     int result;
 
+    if (comparison != NULL &&
+        parse_repository_version(left, left_parts, left_lengths) == 0 &&
+        parse_repository_version(right, right_parts, right_lengths) == 0) {
+        result = 0;
+        for (i = 0U; i < 4U && result == 0; ++i) {
+            result = compare_text_number(left_parts[i], left_lengths[i], right_parts[i], right_lengths[i]);
+        }
+        *comparison = result;
+        return 0;
+    }
     if (comparison == NULL || parse_semver(left, &left_view) != 0 ||
         parse_semver(right, &right_view) != 0) {
         return -1;
@@ -224,6 +378,16 @@ int c1pkg_version_compare(const char *left, const char *right, int *comparison)
     }
     *comparison = result;
     return 0;
+}
+
+int c1pkg_install_decision(const char *installed, const char *available)
+{
+    int comparison;
+    if (available == NULL || available[0] == '\0') return -1;
+    if (installed == NULL || installed[0] == '\0') return 1;
+    if (strcmp(installed, available) == 0) return 0;
+    if (c1pkg_version_compare(available, installed, &comparison) != 0) return -1;
+    return comparison > 0 ? 1 : comparison == 0 ? 0 : -1;
 }
 
 static enum c1pkg_download_status installed_status(const char *installed,
@@ -254,6 +418,7 @@ static void add_repository_item(struct c1pkg_download_list *list,
     (void)memset(item, 0, sizeof(*item));
     (void)strcpy(item->id, package->id);
     (void)strcpy(item->name, package->name);
+    (void)strcpy(item->author, package->author[0] != '\0' ? package->author : "Unknown");
     (void)strcpy(item->available_version, package->version);
     item->package_index = package_index;
     if (installed == NULL) {
@@ -272,6 +437,7 @@ static void add_removed_item(struct c1pkg_download_list *list,
     (void)memset(item, 0, sizeof(*item));
     (void)strcpy(item->id, installed->id);
     (void)strcpy(item->name, installed->id);
+    (void)strcpy(item->author, "Unknown");
     (void)strcpy(item->installed_version, installed->version);
     item->package_index = C1PKG_PACKAGE_NONE;
     item->status = C1PKG_DOWNLOAD_REMOVED;

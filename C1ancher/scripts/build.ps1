@@ -59,6 +59,11 @@ $targets = @(
         Name = 'c1pkg'
         AbiPath = Join-Path $projectRoot 'build\c1pkg-abi.txt'
         BinaryPath = Join-Path $projectRoot 'build\c1pkg'
+    },
+    [pscustomobject]@{
+        Name = 'c1updater'
+        AbiPath = Join-Path $projectRoot 'build\c1updater-abi.txt'
+        BinaryPath = Join-Path $projectRoot 'build\c1updater'
     }
 )
 $requiredPatterns = @(

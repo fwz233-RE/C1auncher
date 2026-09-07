@@ -31,6 +31,7 @@ void c1_ui_clear_secret(c1_ui_state *state)
     }
     secure_clear(state->secret, sizeof(state->secret));
     state->secret_length = 0U;
+    state->secret_visible = false;
 }
 
 bool c1_ui_is_password_page(c1_ui_page page)
@@ -73,6 +74,7 @@ bool c1_ui_secret_append(c1_ui_state *state, char character)
     }
     state->secret[state->secret_length++] = character;
     state->secret[state->secret_length] = '\0';
+    state->wifi_notice[0] = '\0';
     return true;
 }
 
@@ -82,6 +84,7 @@ bool c1_ui_secret_delete(c1_ui_state *state)
         return false;
     }
     state->secret[--state->secret_length] = '\0';
+    state->wifi_notice[0] = '\0';
     return true;
 }
 
@@ -185,6 +188,41 @@ static void activate_extended_symbol(c1_ui_state *state)
     }
 }
 
+bool c1_ui_network_is_current(const c1_ui_status *status, size_t index)
+{
+    if (status == NULL || !status->wifi_connected || index >= status->network_count ||
+        index >= C1_UI_MAX_NETWORKS ||
+        strcmp(status->wifi_connected_ssid, status->networks[index].ssid) != 0) return false;
+    for (size_t i = 0; i < status->network_count && i < C1_UI_MAX_NETWORKS; ++i) {
+        if (strcmp(status->networks[i].ssid, status->networks[index].ssid) == 0 &&
+            status->networks[i].security != status->networks[index].security) return false;
+    }
+    return true;
+}
+
+/* Called once after a successful fresh scan, never by periodic redraws.
+ * Retain a live connection; otherwise choose the strongest visible saved row. */
+c1_ui_transition c1_ui_autoconnect(c1_ui_state state, const c1_ui_status *status)
+{
+    c1_ui_transition next = {state, C1_UI_ACTION_NONE};
+    if (status == NULL || state.page != C1_UI_PAGE_WIFI || status->wifi_connected ||
+        status->service_busy || status->wifi_stop_pending) return next;
+    for (size_t i = 0; i < status->network_count && i < C1_UI_MAX_NETWORKS; ++i) {
+        if (!status->networks[i].saved ||
+            (status->networks[i].security != C1_WIFI_SECURITY_OPEN &&
+             status->networks[i].security != C1_WIFI_SECURITY_WPA_PSK)) continue;
+        c1_ui_clear_secret(&next.state);
+        next.state.selected_saved = true;
+        next.state.selected_security = status->networks[i].security;
+        snprintf(next.state.selected_ssid, sizeof(next.state.selected_ssid), "%s", status->networks[i].ssid);
+        next.state.selection = 0U;
+        next.state.wifi_notice[0] = '\0';
+        next.action = C1_UI_ACTION_WIFI_CONNECT;
+        break;
+    }
+    return next;
+}
+
 c1_ui_transition c1_ui_step(c1_ui_state state, c1_ui_event event, const c1_ui_status *status)
 {
     c1_ui_transition transition = {state, C1_UI_ACTION_NONE};
@@ -210,11 +248,30 @@ c1_ui_transition c1_ui_step(c1_ui_state state, c1_ui_event event, const c1_ui_st
     if (state.page == C1_UI_PAGE_DESKTOP) {
         transition.state = reduce_desktop(state, event);
         if (event == C1_UI_EVENT_UP) {
-            transition.action = C1_UI_ACTION_WIFI_SCAN;
+            transition.state.wifi_notice[0] = '\0';
+            if (status == NULL || !status->service_busy) {
+                transition.action = C1_UI_ACTION_WIFI_SCAN;
+            } else {
+                snprintf(transition.state.wifi_notice, sizeof(transition.state.wifi_notice),
+                         status->wifi_busy ? "WI-FI TASK ALREADY RUNNING" :
+                         "UPDATE CHECK RUNNING; TRY SCAN LATER");
+            }
         } else if (event == C1_UI_EVENT_DOWN) {
             transition.action = C1_UI_ACTION_TERMINAL_NEOFETCH;
         } else if (event == C1_UI_EVENT_LEFT) {
             transition.action = C1_UI_ACTION_TERMINAL_APP;
+        } else if (event == C1_UI_EVENT_ENTER && status != NULL &&
+                   status->wifi_connected && status->wifi_ipv4[0] != '\0') {
+            /* Check/download in the existing background service worker. Never
+             * enter a terminal just to discover an offline or current release.
+             * A later explicit press on UPDATE confirms a prepared release. */
+            if (status->update_available) {
+                transition.state.page = C1_UI_PAGE_TERMINAL;
+                transition.state.selection = 0U;
+                transition.action = C1_UI_ACTION_TERMINAL_UPDATE;
+            } else {
+                transition.action = C1_UI_ACTION_UPDATE_REFRESH;
+            }
         }
         return transition;
     }
@@ -223,6 +280,11 @@ c1_ui_transition c1_ui_step(c1_ui_state state, c1_ui_event event, const c1_ui_st
 
         if (transition.state.selection >= item_count) {
             transition.state.selection = network_count > 0U ? (uint32_t)(item_count - 1U) : 0U;
+        }
+        if (status != NULL && status->wifi_busy &&
+            (event == C1_UI_EVENT_DOWN || event == C1_UI_EVENT_UP)) {
+            transition.state.selection = 0U;
+            return transition;
         }
         if (event == C1_UI_EVENT_LEFT && transition.state.selection == 1U) {
             transition.state.selection = 0U;
@@ -239,13 +301,32 @@ c1_ui_transition c1_ui_step(c1_ui_state state, c1_ui_event event, const c1_ui_st
                 ++transition.state.selection;
             }
         } else if (event == C1_UI_EVENT_ENTER) {
+            transition.state.wifi_notice[0] = '\0';
+            if (status != NULL && status->service_busy && transition.state.selection != 1U) {
+                snprintf(transition.state.wifi_notice, sizeof(transition.state.wifi_notice),
+                         "BUSY - WAIT OR SELECT TURN OFF");
+                return transition;
+            }
             if (transition.state.selection == 0U) {
                 transition.action = C1_UI_ACTION_WIFI_SCAN;
             } else if (transition.state.selection == 1U) {
                 transition.action = C1_UI_ACTION_WIFI_DISABLE;
             } else if (transition.state.selection < item_count && status != NULL) {
                 size_t network_index = transition.state.selection - 2U;
+                transition.state.selected_security = status->networks[network_index].security;
+                transition.state.selected_saved = status->networks[network_index].saved;
+                if (transition.state.selected_security != C1_WIFI_SECURITY_OPEN &&
+                    transition.state.selected_security != C1_WIFI_SECURITY_WPA_PSK) {
+                    snprintf(transition.state.wifi_notice, sizeof(transition.state.wifi_notice),
+                             "THIS SECURITY TYPE IS NOT SUPPORTED");
+                    return transition;
+                }
 
+                if (c1_ui_network_is_current(status, network_index)) {
+                    snprintf(transition.state.wifi_notice, sizeof(transition.state.wifi_notice),
+                             "ALREADY CONNECTED TO THIS NETWORK");
+                    return transition;
+                }
                 snprintf(transition.state.selected_ssid,
                          sizeof(transition.state.selected_ssid),
                          "%s",
@@ -253,8 +334,9 @@ c1_ui_transition c1_ui_step(c1_ui_state state, c1_ui_event event, const c1_ui_st
                 c1_ui_clear_secret(&transition.state);
                 transition.state.symbol_selection = 0U;
                 transition.state.keyboard_layer = C1_UI_KEYBOARD_LOWER;
-                if (status->networks[network_index].secured) {
+                if (status->networks[network_index].secured && !transition.state.selected_saved) {
                     transition.state.page = C1_UI_PAGE_WIFI_PASSWORD;
+                    transition.state.secret_visible = true;
                 } else {
                     transition.action = C1_UI_ACTION_WIFI_CONNECT;
                 }
@@ -263,8 +345,20 @@ c1_ui_transition c1_ui_step(c1_ui_state state, c1_ui_event event, const c1_ui_st
         return transition;
     }
     if (state.page == C1_UI_PAGE_WIFI_PASSWORD) {
-        if (event == C1_UI_EVENT_SUBMIT) {
-            transition.action = C1_UI_ACTION_WIFI_CONNECT;
+        if (event == C1_UI_EVENT_TOGGLE_SECRET) {
+            transition.state.secret_visible = !state.secret_visible;
+        } else if (event == C1_UI_EVENT_SUBMIT ||
+                   (event == C1_UI_EVENT_ENTER && state.keyboard_layer != C1_UI_KEYBOARD_SYMBOLS)) {
+            if (status != NULL && status->service_busy) {
+                snprintf(transition.state.wifi_notice, sizeof(transition.state.wifi_notice),
+                         "BUSY - YOUR PASSWORD IS KEPT");
+            } else if (state.secret_length < 8U || state.secret_length > 63U) {
+                snprintf(transition.state.wifi_notice, sizeof(transition.state.wifi_notice),
+                         "USE 8-63 CHARACTERS");
+            } else {
+                transition.state.wifi_notice[0] = '\0';
+                transition.action = C1_UI_ACTION_WIFI_CONNECT;
+            }
         } else if (state.keyboard_layer == C1_UI_KEYBOARD_SYMBOLS) {
             if (event == C1_UI_EVENT_ENTER) {
                 activate_extended_symbol(&transition.state);

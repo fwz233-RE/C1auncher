@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <NuGetAudit>false</NuGetAudit>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="ui/**/*.cs" />
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.7.0" />
+    <Compile Include="../AdbAdmitLauncher.cs" Link="Production/AdbAdmitLauncher.cs" />
+    <Compile Include="../Payload.cs" Link="Production/Payload.cs" />
+    <Compile Include="../Commands.cs" Link="Production/Commands.cs" />
+    <Compile Include="../RunningProcessProbe.cs" Link="Production/RunningProcessProbe.cs" />
+    <Compile Include="../InstallerEngine.cs" Link="Production/InstallerEngine.cs" />
+  </ItemGroup>
+</Project>

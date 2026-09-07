@@ -3,6 +3,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -194,14 +196,15 @@ int c1pkg_read_file(const char *path, unsigned char **data, size_t *size,
     size_t used = 0U;
     int descriptor;
 
-    if (stat(path, &information) != 0 || information.st_size < 0 ||
-        (uint64_t)information.st_size > (uint64_t)limit) {
-        c1pkg_set_error(error, error_size, "invalid or oversized file: %s", path);
-        return -1;
-    }
-    descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (descriptor < 0) {
         c1pkg_set_error(error, error_size, "open %s: %s", path, strerror(errno));
+        return -1;
+    }
+    if (fstat(descriptor, &information) != 0 || !S_ISREG(information.st_mode) ||
+        information.st_size < 0 || (uint64_t)information.st_size > (uint64_t)limit) {
+        (void)close(descriptor);
+        c1pkg_set_error(error, error_size, "invalid or oversized file: %s", path);
         return -1;
     }
     buffer = malloc((size_t)information.st_size + 1U);
@@ -235,7 +238,7 @@ int c1pkg_write_file(const char *path, const void *data, size_t size, mode_t mod
 {
     const unsigned char *bytes = data;
     size_t written = 0U;
-    int descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+    int descriptor = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, mode);
 
     if (descriptor < 0) {
         c1pkg_set_error(error, error_size, "open %s: %s", path, strerror(errno));
@@ -253,8 +256,45 @@ int c1pkg_write_file(const char *path, const void *data, size_t size, mode_t mod
         }
         written += (size_t)amount;
     }
-    if (fsync(descriptor) != 0 || close(descriptor) != 0) {
-        c1pkg_set_error(error, error_size, "sync %s: %s", path, strerror(errno));
+    {
+        int sync_result = fsync(descriptor);
+        int saved_errno = errno;
+        int close_result = close(descriptor);
+        if (sync_result != 0 || close_result != 0) {
+            if (sync_result != 0) errno = saved_errno;
+            c1pkg_set_error(error, error_size, "sync %s: %s", path, strerror(errno));
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int c1pkg_sync_directory(const char *path, char *error, size_t error_size)
+{
+    struct stat information;
+    int descriptor;
+
+    if (stat(path, &information) != 0 || !S_ISDIR(information.st_mode)) {
+        c1pkg_set_error(error, error_size, "invalid directory %s", path);
+        return -1;
+    }
+    descriptor = open(path, O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) {
+        c1pkg_set_error(error, error_size, "open directory %s: %s", path,
+                        strerror(errno));
+        return -1;
+    }
+    if (fsync(descriptor) != 0) {
+        int error_number = errno;
+
+        (void)close(descriptor);
+        c1pkg_set_error(error, error_size, "sync directory %s: %s", path,
+                        strerror(error_number));
+        return -1;
+    }
+    if (close(descriptor) != 0) {
+        c1pkg_set_error(error, error_size, "close directory %s: %s", path,
+                        strerror(errno));
         return -1;
     }
     return 0;
@@ -265,22 +305,153 @@ const char *c1pkg_helper(const char *absolute, const char *name)
     return access(absolute, X_OK) == 0 ? absolute : name;
 }
 
+static int (*progress_callback)(const char *, void *);
+static void *progress_context;
+static int progress_cancelled;
+
+void c1pkg_set_progress(int (*callback)(const char *, void *), void *context)
+{
+    progress_callback = callback;
+    progress_context = context;
+    progress_cancelled = 0;
+}
+
+int c1pkg_progress(const char *message)
+{
+    if (progress_callback != NULL && progress_callback(message, progress_context) != 0) {
+        progress_cancelled = 1;
+    }
+    return progress_cancelled;
+}
+
+/* Private transport helper, declared locally in repo.c. Body bytes flow through
+ * the parent so both the exact byte ceiling and persistent I/O errno survive.
+ * The child may only write 64 KiB regular files (curl response headers). */
+int c1pkg_run_bounded(char *const argv[], int output, uint64_t limit,
+                      uint64_t *received, int *exit_code, char *error, size_t error_size)
+{
+    int pipes[2], status = 0, failure = 0, saved_errno = 0, eof = 0, reaped = 0;
+    pid_t child;
+    *received = 0U;
+    *exit_code = -1;
+    if (c1pkg_progress(NULL) != 0) {
+        c1pkg_set_error(error, error_size, "Cancelled");
+        errno = ECANCELED;
+        return -2;
+    }
+    if (pipe(pipes) != 0) goto setup_failed;
+    (void)fcntl(pipes[0], F_SETFD, FD_CLOEXEC);
+    (void)fcntl(pipes[1], F_SETFD, FD_CLOEXEC);
+    child = fork();
+    if (child < 0) {
+        saved_errno = errno;
+        (void)close(pipes[0]); (void)close(pipes[1]);
+        errno = saved_errno;
+        goto setup_failed;
+    }
+    if (child == 0) {
+        struct rlimit bound = {65536U, 65536U};
+        (void)setpgid(0, 0);
+        (void)close(pipes[0]);
+        if (dup2(pipes[1], STDOUT_FILENO) < 0 ||
+            setrlimit(RLIMIT_FSIZE, &bound) != 0 || setenv("LC_ALL", "C", 1) != 0) _exit(126);
+        if (pipes[1] != STDOUT_FILENO) (void)close(pipes[1]);
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    (void)setpgid(child, child);
+    (void)close(pipes[1]);
+    while (!eof || !reaped) {
+        struct pollfd event = {pipes[0], POLLIN, 0};
+        if (c1pkg_progress(NULL) != 0) {
+            saved_errno = ECANCELED;
+            c1pkg_set_error(error, error_size, "Cancelled");
+            failure = 1; break;
+        }
+        if (!eof) {
+            int ready = poll(&event, 1U, 100);
+            if (ready < 0 && errno != EINTR) { failure = 1; saved_errno = errno; break; }
+            if (ready > 0) {
+                unsigned char buffer[16384];
+                ssize_t amount = read(pipes[0], buffer, sizeof(buffer));
+                if (amount < 0 && errno != EINTR) { failure = 1; saved_errno = errno; break; }
+                if (amount == 0) eof = 1;
+                if (amount > 0) {
+                    size_t used = 0U;
+                    if ((uint64_t)amount > limit - *received) {
+                        failure = 1; saved_errno = EFBIG;
+                        c1pkg_set_error(error, error_size, "download exceeded size limit");
+                        break;
+                    }
+                    while (used < (size_t)amount) {
+                        ssize_t written = write(output, buffer + used, (size_t)amount - used);
+                        if (written < 0 && errno == EINTR) continue;
+                        if (written <= 0) { failure = 1; saved_errno = written == 0 ? EIO : errno; break; }
+                        used += (size_t)written;
+                        *received += (uint64_t)written;
+                    }
+                    if (failure) break;
+                }
+            }
+        } else if (!reaped) {
+            (void)poll(NULL, 0U, 100);
+        }
+        if (!reaped) {
+            pid_t waited = waitpid(child, &status, WNOHANG);
+            if (waited == child) reaped = 1;
+            else if (waited < 0 && errno != EINTR) { failure = 1; saved_errno = errno; break; }
+        }
+    }
+    if (failure) {
+        /* Kill descendants too, even when the immediate helper already exited. */
+        (void)kill(-child, SIGKILL);
+        if (!reaped) (void)kill(child, SIGKILL);
+    }
+    if (!reaped) while (waitpid(child, &status, 0) < 0 && errno == EINTR) { }
+    (void)close(pipes[0]);
+    if (failure) {
+        if (saved_errno != ECANCELED && saved_errno != EFBIG)
+            c1pkg_set_error(error, error_size, "download I/O: %s", strerror(saved_errno));
+        errno = saved_errno;
+        return -2;
+    }
+    *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (*exit_code == 0) { errno = 0; return 0; }
+    c1pkg_set_error(error, error_size, "%s failed%s", argv[0],
+                    *exit_code == 127 ? " (helper unavailable)" : "");
+    errno = 0;
+    return -1;
+setup_failed:
+    saved_errno = errno;
+    c1pkg_set_error(error, error_size, "download helper setup: %s", strerror(saved_errno));
+    errno = saved_errno;
+    return -2;
+}
+
 int c1pkg_run(char *const argv[], const char *stdout_path, uint64_t file_limit,
               char *error, size_t error_size)
 {
-    pid_t child = fork();
+    pid_t child;
     int status;
+
+    if (c1pkg_progress(NULL) != 0) {
+        c1pkg_set_error(error, error_size, "Cancelled");
+        errno = ECANCELED;
+        return -1;
+    }
+    child = fork();
 
     if (child < 0) {
         c1pkg_set_error(error, error_size, "fork: %s", strerror(errno));
         return -1;
     }
     if (child == 0) {
+        if (progress_callback != NULL) (void)setpgid(0, 0);
         if (setenv("LC_ALL", "C", 1) != 0) {
             _exit(126);
         }
         if (stdout_path != NULL) {
-            int output = open(stdout_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            int output = open(stdout_path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0600);
             if (output < 0 || dup2(output, STDOUT_FILENO) < 0) {
                 _exit(126);
             }
@@ -301,9 +472,21 @@ int c1pkg_run(char *const argv[], const char *stdout_path, uint64_t file_limit,
     }
     {
         pid_t waited;
-        do {
-            waited = waitpid(child, &status, 0);
-        } while (waited < 0 && errno == EINTR);
+        if (progress_callback != NULL) (void)setpgid(child, child);
+        for (;;) {
+            waited = waitpid(child, &status, WNOHANG);
+            if (waited == child || (waited < 0 && errno != EINTR)) {
+                break;
+            }
+            if (c1pkg_progress(NULL) != 0) {
+                (void)kill(-child, SIGKILL);
+                (void)kill(child, SIGKILL);
+                while (waitpid(child, &status, 0) < 0 && errno == EINTR) { }
+                c1pkg_set_error(error, error_size, "Cancelled");
+                return -1;
+            }
+            (void)poll(NULL, 0U, 100);
+        }
         if (waited != child) {
             c1pkg_set_error(error, error_size, "wait for %s: %s", argv[0], strerror(errno));
             return -1;

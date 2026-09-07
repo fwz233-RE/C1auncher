@@ -22,12 +22,16 @@ typedef struct {
     char root[C1_LED_ROOT_MAX];
     unsigned int step;
     int64_t next_step_at;
+    int64_t pulse_until;
     bool active;
+    bool animating;
 } c1_linux_led_chaser;
 
 bool c1_linux_led_chaser_start(c1_linux_led_chaser *chaser,
                                const char *root,
                                int64_t now);
+void c1_linux_led_chaser_pulse(c1_linux_led_chaser *chaser, int64_t now);
+void c1_linux_led_chaser_quiet(c1_linux_led_chaser *chaser);
 void c1_linux_led_chaser_tick(c1_linux_led_chaser *chaser, int64_t now);
 int c1_linux_led_chaser_timeout(const c1_linux_led_chaser *chaser, int64_t now);
 void c1_linux_led_chaser_stop(c1_linux_led_chaser *chaser);

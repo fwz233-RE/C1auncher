@@ -11,6 +11,7 @@ typedef struct {
     uint64_t writes;
     uint64_t full_refreshes;
     uint64_t unchanged_skips;
+    uint64_t lease_skips;
 } c1_linux_display_stats;
 
 c1_status c1_linux_display_write_frame(void *context,

@@ -1,6 +1,7 @@
 #include "hal/linux/display.h"
 
 #include "display/frame.h"
+#include "platform/app_lease.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -43,6 +44,7 @@ static c1_status emit_result(c1_record_sink sink,
                              bool frame_written,
                              bool refresh_requested,
                              bool unchanged_skipped,
+                             bool lease_skipped,
                              int write_error,
                              int refresh_error)
 {
@@ -55,6 +57,7 @@ static c1_status emit_result(c1_record_sink sink,
         c1_record_add_boolean(&record, "frame_written", frame_written) != C1_STATUS_OK ||
         c1_record_add_boolean(&record, "refresh_requested", refresh_requested) != C1_STATUS_OK ||
         c1_record_add_boolean(&record, "unchanged_skipped", unchanged_skipped) != C1_STATUS_OK ||
+        c1_record_add_boolean(&record, "lease_skipped", lease_skipped) != C1_STATUS_OK ||
         c1_record_add_integer(&record, "write_errno", write_error) != C1_STATUS_OK ||
         c1_record_add_integer(&record, "refresh_errno", refresh_error) != C1_STATUS_OK) {
         return C1_STATUS_INVALID_ARGUMENT;
@@ -68,6 +71,7 @@ static c1_status write_frame(const uint8_t *frame,
                              c1_record_sink sink)
 {
     int descriptor;
+    int lease_guard;
     ssize_t written;
     int write_error = 0;
     int refresh_error = 0;
@@ -78,10 +82,19 @@ static c1_status write_frame(const uint8_t *frame,
     if (frame == NULL || size != C1_DISPLAY_FRAME_BYTES || sink.emit == NULL) {
         return C1_STATUS_INVALID_ARGUMENT;
     }
+    lease_guard = c1_app_lease_guard_acquire();
+    if (lease_guard < 0) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            ++display_stats.lease_skips;
+            return emit_result(sink, false, false, false, true, 0, 0);
+        }
+        return C1_STATUS_IO_ERROR;
+    }
     if (!request_refresh && cached_frame_valid &&
         memcmp(cached_frame, frame, C1_DISPLAY_FRAME_BYTES) == 0) {
         ++display_stats.unchanged_skips;
-        return emit_result(sink, false, false, true, 0, 0);
+        c1_app_lease_release(lease_guard);
+        return emit_result(sink, false, false, true, false, 0, 0);
     }
 
     descriptor = open(C1_EPAPER_DEVICE, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
@@ -112,9 +125,11 @@ static c1_status write_frame(const uint8_t *frame,
             ++display_stats.full_refreshes;
         }
     }
+    c1_app_lease_release(lease_guard);
     emit_status = emit_result(sink,
                               frame_written,
                               refresh_requested,
+                              false,
                               false,
                               write_error,
                               refresh_error);

@@ -7,7 +7,8 @@ typedef enum {
     C1_STATUS_UNAVAILABLE,
     C1_STATUS_IO_ERROR,
     C1_STATUS_INTERRUPTED,
-    C1_STATUS_UNSUPPORTED
+    C1_STATUS_UNSUPPORTED,
+    C1_STATUS_UPDATE_REQUESTED
 } c1_status;
 
 const char *c1_status_name(c1_status status);

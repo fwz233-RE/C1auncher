@@ -47,3 +47,18 @@ is retained in `third_party/neofetch/LICENSE.md`. The adjacent `neofetch`
 launcher and `c1-config.conf` are C1-Slim-specific integration files. The
 project installer deploys these files to `/usr/data/c1/` and does not embed
 Neofetch into the statically linked C1ancher executable.
+
+## C1 Package Bitmap / GNU Unifont
+
+The package-manager bitmap font is a renamed subset of GNU Unifont 16.0.04,
+distributed under the SIL Open Font License 1.1 option of its upstream dual
+license. Source archive identity, generation instructions and redistribution
+requirements are in `third_party/pkg_font/README.md`; complete upstream
+copyright and license notices are in `third_party/pkg_font/LICENSE.txt`.
+These notices also accompany the generated font data and device builds.
+
+## Windows installer
+
+The optional Windows installer has separate .NET, Bouncy Castle and tool
+notices in `installer/THIRD-PARTY-NOTICES.txt`. Those notices do not change
+the licenses of the device-side components listed above.

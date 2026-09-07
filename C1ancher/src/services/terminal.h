@@ -16,7 +16,10 @@ typedef enum {
 
 typedef struct {
     int master_fd;
-    pid_t child_pid;
+    pid_t child_pid; /* session supervisor, retained until reaped */
+    pid_t shell_pid;
+    int control_fd;
+    bool direct_exec;
     c1_terminal_state state;
     int exit_code;
     char pending[512];
@@ -29,6 +32,9 @@ void c1_terminal_init(c1_terminal_session *session);
 c1_status c1_terminal_start(c1_terminal_session *session,
                             unsigned int columns,
                             unsigned int rows);
+c1_status c1_terminal_start_exec(c1_terminal_session *session,
+                                 unsigned int columns, unsigned int rows,
+                                 const char *path, char *const argv[]);
 int c1_terminal_fd(const c1_terminal_session *session);
 short c1_terminal_poll_events(const c1_terminal_session *session);
 bool c1_terminal_is_running(c1_terminal_session *session);

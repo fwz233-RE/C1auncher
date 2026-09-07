@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "services/wifi.h"
 
 #define C1_UI_MAX_NETWORKS 8U
 #define C1_UI_SSID_CAPACITY 33U
@@ -29,7 +30,8 @@ typedef enum {
     C1_UI_EVENT_ENTER = 5,
     C1_UI_EVENT_SUBMIT = 6,
     C1_UI_EVENT_BACK = 7,
-    C1_UI_EVENT_HOME = 8
+    C1_UI_EVENT_HOME = 8,
+    C1_UI_EVENT_TOGGLE_SECRET = 9
 } c1_ui_event;
 
 typedef enum {
@@ -38,7 +40,9 @@ typedef enum {
     C1_UI_ACTION_WIFI_CONNECT = 2,
     C1_UI_ACTION_WIFI_DISABLE = 3,
     C1_UI_ACTION_TERMINAL_NEOFETCH = 6,
-    C1_UI_ACTION_TERMINAL_APP = 7
+    C1_UI_ACTION_TERMINAL_APP = 7,
+    C1_UI_ACTION_TERMINAL_UPDATE = 8,
+    C1_UI_ACTION_UPDATE_REFRESH = 9
 } c1_ui_action;
 
 typedef enum {
@@ -51,6 +55,8 @@ typedef struct {
     char ssid[C1_UI_SSID_CAPACITY];
     int signal_dbm;
     bool secured;
+    c1_wifi_security security;
+    bool saved;
 } c1_ui_network;
 
 typedef struct {
@@ -59,7 +65,11 @@ typedef struct {
     uint32_t symbol_selection;
     c1_ui_keyboard_layer keyboard_layer;
     bool terminal_symbol_picker;
+    bool secret_visible;
+    char wifi_notice[C1_UI_MESSAGE_CAPACITY];
     char selected_ssid[C1_UI_SSID_CAPACITY];
+    c1_wifi_security selected_security;
+    bool selected_saved;
     char secret[C1_UI_SECRET_CAPACITY];
     size_t secret_length;
 } c1_ui_state;
@@ -69,6 +79,11 @@ typedef struct {
     uint32_t battery_percent;
     bool wifi_connected;
     bool wifi_busy;
+    bool wifi_enabled;
+    bool service_busy;
+    c1_ui_action wifi_activity;
+    c1_wifi_phase wifi_phase;
+    bool wifi_stop_pending;
     c1_ui_network networks[C1_UI_MAX_NETWORKS];
     size_t network_count;
     char wifi_connected_ssid[C1_UI_SSID_CAPACITY];
@@ -77,6 +92,7 @@ typedef struct {
     bool time_available;
     uint32_t hour;
     uint32_t minute;
+    bool update_available;
 } c1_ui_status;
 
 typedef struct {
@@ -86,6 +102,7 @@ typedef struct {
 
 c1_ui_state c1_ui_initial_state(void);
 c1_ui_state c1_ui_reduce(c1_ui_state state, c1_ui_event event);
+c1_ui_transition c1_ui_autoconnect(c1_ui_state state, const c1_ui_status *status);
 c1_ui_transition c1_ui_step(c1_ui_state state, c1_ui_event event, const c1_ui_status *status);
 char c1_ui_extended_symbol(uint32_t selection);
 c1_ui_keyboard_layer c1_ui_keyboard_next_layer(c1_ui_keyboard_layer layer);
@@ -95,6 +112,9 @@ bool c1_ui_enter_lock(c1_ui_state *state);
 bool c1_ui_unlock(c1_ui_state *state);
 bool c1_ui_secret_append(c1_ui_state *state, char character);
 bool c1_ui_secret_delete(c1_ui_state *state);
+/* SSID-only status cannot distinguish same-name networks with different
+ * security. Only mark an unambiguous scanned row as already connected. */
+bool c1_ui_network_is_current(const c1_ui_status *status, size_t index);
 void c1_ui_clear_secret(c1_ui_state *state);
 
 #endif
