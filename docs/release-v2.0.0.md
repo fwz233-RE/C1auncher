@@ -9,7 +9,7 @@
 - **普通应用 ZIP**：每个 ZIP 均包含原始应用包和适用许可，具体文件见下方应用列表。
 - **C1Slim-Applications-Sources-20260907.zip**：六个应用的对应源码、固定版本依赖、构建与静态库重新链接材料。
 - **C1Slim-Applications-Notices-20260907.zip**：应用第三方许可汇总；每个应用 ZIP 内也包含适用许可。
-- **APPLICATIONS-README-中文.md / APPLICATIONS-MANIFEST.json / APPLICATIONS-SHA256SUMS**：应用使用说明、版本与原包清单、附件校验值。
+- **APPLICATIONS-README.zh-CN.md / APPLICATIONS-MANIFEST.json / APPLICATIONS-SHA256SUMS**：应用使用说明、版本与原包清单、附件校验值。
 - **C1Slim-Publisher-20260907.zip**：电脑端应用发布工具，支持 Windows x64、Linux x64 和 Linux ARM64；整包解压后使用。
 - **C1Slim-Publisher-20260907.zip.sha256**：发布工具 ZIP 的 SHA-256 校验值。包内另有逐文件 `SHA256SUMS`。
 - **Source code**：本标签对应的设备端、普通应用、示例及构建说明。
