@@ -1,7 +1,7 @@
 C1-Slim device-side source licensing
 
 Unless a file or component contains a different license notice, the
-first-party source code in C1ancher/, App/, Pinao/, ChiChuGames/, examples/,
+first-party source code in C1ancher/, C1ancher-server/, App/, Pinao/, ChiChuGames/, examples/,
 and the repository's documentation and packaging scripts is distributed
 under the GNU General Public License, version 3 (GPL-3.0-only).
 

@@ -1,0 +1,18 @@
+# Public source allowlist; deployment files and credentials stay local.
+/*
+!/.gitignore
+!/PUBLIC-README.md
+!/go.mod
+!/cmd/
+!/internal/
+!/examples/
+/cmd/*
+!/cmd/c1publish/
+!/cmd/c1repo/
+!/cmd/c1token/
+!/cmd/c1verify/
+/internal/*
+!/internal/repository/
+/examples/*
+!/examples/open-publish-demo/
+!/examples/self-service-demo/

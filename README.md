@@ -12,7 +12,7 @@
 
 1. 阅读 [设备应用开发入门](docs/app-development.md)。
 2. 从 [最小 C 应用](examples/hello/README.md) 开始，或参考下面的完整应用。
-3. 从 [最新 Release](https://github.com/fwz233-RE/C1ancher/releases/latest) 下载 `C1Slim-Publisher-20260907.zip`，解压后保留整个目录。
+3. 从 [发布器 1.1.0](https://github.com/fwz233-RE/C1ancher/releases/tag/publisher-v1.1.0) 下载 `C1Slim-Publisher-1.1.0.zip`，解压后保留整个目录，双击 EXE 可自助注册作者和发布应用。
 4. 按 [打包与发布说明](docs/publishing.md) 上传应用。用户在设备 APP 列表刷新后自行下载安装。
 
 ## 源码目录
@@ -25,6 +25,7 @@
 - [`Pinao/`](Pinao/README.md)：钢琴应用；保留原目录拼写。
 - [`ChiChuGames/`](ChiChuGames/README.md)：游戏应用。
 - [`examples/hello/`](examples/hello/README.md)：不依赖其他项目的终端应用示例。
+- [`C1ancher-server/`](C1ancher-server/PUBLIC-README.md)：自助注册发布器及共用应用仓库服务源码。
 - [`tools/publisher/`](tools/publisher/README.md)：发布工具下载、完整性校验和使用说明。
 
 所有内容沿用同一个 GitHub 仓库。旧版本提交和标签保留；核心源码现在位于 `C1ancher/`，旧文档中的仓库根构建命令需先进入该目录。
@@ -40,7 +41,7 @@
 ## 使用与安全
 - 发布工具作为 Release 附件分发；程序、公开服务器地址和验签公钥一起提供。
 - 系统备份、原厂固件、个人书籍/音乐/图片、运行日志、令牌和私钥不属于源码分发范围。
-- 开放发布是匿名发布，新应用 ID 并非首发者独占；已有受保护应用和系统核心不能匿名覆盖。
+- 自助注册后，首次成功发布的新应用归作者独占维护；显式 `-open` 仍为匿名发布，不提供独占权。已有受保护应用和系统核心不能被他人覆盖。
 - HTTP 上传不加密，签名不代表恶意代码审核，设备应用目前没有沙箱隔离。详细限制见 [发布说明](docs/publishing.md)。
 
 ## 许可证

@@ -1,16 +1,21 @@
-C1 Publisher binary distribution
+C1 Publisher 1.1.0 distribution
 
-The maintainer distributes these official c1publish binaries for developers
-who wish to package and upload ordinary applications to the existing C1
-application service. Application compilation is a separate step.
+The maintainer distributes c1publish for developers to register a publisher
+identity, package and upload ordinary applications. Application compilation
+is a separate step. New successfully published, unassigned application IDs
+belong to the authenticated author; existing protected applications and core
+components cannot be taken over. Anonymous -open mode grants no exclusivity.
 
-This developer kit provides client executables and their configuration.
-The GPL license of the separate C1ancher device-side project does not by
-itself relicense these independent publisher executables. This distribution
-note does not introduce a new open-source license for the publisher.
+This version's first-party client and shared server source is distributed
+under GPL-3.0-only, as stated in the repository LICENSE. Complete source is
+available at https://github.com/fwz233-RE/C1ancher/tree/publisher-v1.1.0/C1ancher-server
+and the build script at tools/publisher/build_self_service.py under that tag.
+The full GPL text is included as LICENSE. This notice describes version
+1.1.0; historical binary distributions retain their original notices.
 
-Retain the accompanying third-party copyright and license notices. The Go
-runtime and listed standard-library dependencies are described in
-THIRD_PARTY_NOTICES.txt. Server access remains subject to the actual service's
-availability and publication rules; this kit grants no administrator access,
-signing authority, or exclusive ownership of anonymously published app IDs.
+Retain third-party notices in THIRD_PARTY_NOTICES.txt. Server access remains
+subject to service availability, capacity and publication rules. The tool
+grants no administrator access or repository signing authority. Keep and
+back up publisher tokens privately; this release has no account recovery.
+HTTP does not protect registration credentials or uploaded content; prefer
+HTTPS where the repository operator provides it.

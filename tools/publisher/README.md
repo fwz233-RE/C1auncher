@@ -1,54 +1,27 @@
-# C1-Slim 普通应用发布工具
+# C1-Slim 自助发布器 1.1.0
 
-下载入口：https://github.com/fwz233-RE/C1ancher/releases/latest
+下载：https://github.com/fwz233-RE/C1ancher/releases/tag/publisher-v1.1.0
 
-下载 `C1Slim-Publisher-20260907.zip` 和同名 `.sha256` 校验文件，核对后解压并保留整个 `C1-Open-Publisher` 目录。工具在电脑上运行，将已编译的普通应用打包并上传到应用仓库。
+新版文件名为 `C1Slim-Publisher-1.1.0.zip`，配套同名 `.sha256`。旧日期版 EXE 不支持自助注册。请保留完整解压目录，包含 Windows x64 EXE、Linux x64/ARM64 程序、server.url、仓库验签公钥、许可证和校验文件。
 
-## 文件
+Windows 双击 `c1publish.exe`，根据中文菜单注册作者并保存令牌，再用已有令牌发布自己编译的应用。无需管理员审核或逐个授权新应用。作者名和应用 ID 不得冒用已有身份或受保护应用。
 
-- `c1publish.exe`：Windows x64。
-- `c1publish-linux-amd64`：Linux x64。
-- `c1publish-linux-arm64`：Linux ARM64。
-- `server.url` 与 `repository.ed25519.pub`：公开地址与仓库验签公钥。按工具自身目录读取，不要删除或替换成来源不明的公钥。
-- `README.md`、`DISTRIBUTION-NOTE.txt`、`THIRD_PARTY_NOTICES.txt`、`SHA256SUMS`：说明和校验文件。
+命令行也可使用：
 
-本包没有原生 macOS、Windows ARM64 或 32 位电脑版本。上述电脑工具也不能作为 C1 的 MIPS 设备应用运行或上传。
+    .\c1publish.exe -register -author "MyAuthor" -token-file .\my-author.token -allow-insecure-http
+    .\c1publish.exe -id my-example -next-version
+    .\c1publish.exe -token-file .\my-author.token -allow-insecure-http -id my-example -version 0.1.0 -name "My Example" -binary .\my-example
 
-## Windows PowerShell 快速使用
+注册失败时保留令牌，用同一个作者和文件重试。首次成功发布未占用的新应用 ID 后，它自动归属于你；更新保持同一 ID 和令牌，升版本并重新编译即可。已有作者令牌也能发布自己的新 ID。
 
-进入解压目录，先查看帮助并选择自己的应用 ID：
+Linux 先 `chmod +x c1publish-linux-amd64`，然后替换上述程序名；ARM64 使用对应文件。运行 `-tool-version` 应显示 `C1-Slim Publisher 1.1.0`。
 
-    .\c1publish.exe -help
-    .\c1publish.exe -open -id my-example -next-version
+工具负责打包上传，不负责编写或编译应用。上传的是 Linux 静态 MIPS 小端、o32、双精度硬浮点设备 ELF，不是本发布器 EXE。需要资源时使用 `-payload` 和 `-entry`；完整教程在包内 `GUIDE.zh-CN.md`，也见 https://github.com/fwz233-RE/C1ancher/blob/main/docs/publishing.md 。
 
-查询不预留版本。将确定的版本号写进自己的应用，交叉编译为设备用的 MIPS 静态 ELF，然后上传。以下假设实际编译版本为 `0.1.0`：
+重要：令牌私下备份，不能放入上传目录或公开仓库。没有令牌丢失后的自助找回功能。默认 HTTP 会明文传输令牌，可能被截获或篡改，必须显式接受风险；公钥验签不能保护上传链路。服务器地址从程序旁边的 server.url 读取，官方域名失败时仅回退固定官方 IP。不要随意替换可信公钥。
 
-    .\c1publish.exe -open -allow-insecure-http -id my-example -version 0.1.0 -name "My Example" -binary .\my-example
+兼容的 `-open` 是匿名发布，显示 `Anonymous (open)`，任何人都能更新其应用，不能与令牌同时使用。需要作者名及独占更新权时请使用注册后令牌发布。
 
-如果有资源，准备专用 `payload` 目录，程序位于 `payload/bin/my-example`，资源放在同一个目录树，再执行：
+发布不会自动安装到所有设备，签名不等于代码安全审核，设备应用没有沙箱隔离。只安装可信软件。此包不提供 macOS、Windows ARM64 或 32 位电脑原生版本。
 
-    .\c1publish.exe -open -allow-insecure-http -id my-example -version 0.1.0 -name "My Example" -entry bin/my-example -payload .\payload
-
-`-binary` 和 `-payload` 二选一。不要把工作区、源码目录、个人数据或含凭据的目录作为 payload。完整教程：https://github.com/fwz233-RE/C1ancher/blob/main/docs/publishing.md
-
-## Linux
-
-    chmod +x c1publish-linux-amd64
-    sha256sum -c SHA256SUMS
-    ./c1publish-linux-amd64 -help
-
-使用 `./c1publish-linux-amd64` 替换 Windows 命令中的程序名，路径使用 Linux 写法。Linux ARM64 使用 `c1publish-linux-arm64`。ZIP 解压后如丢失执行权限，先执行 chmod。
-
-## 运行要求和风险
-
-应用入口必须为 Linux、ELF32、MIPS 小端、o32、MIPS32/MIPS32r2、双精度硬浮点、静态链接。工具只负责打包上传，不代替交叉编译。版本改变后重新编译；相同版本不同内容会被拒绝。
-
-发布不会自动安装到所有设备，用户需在 APP 列表刷新后下载安装。没有实机测试时请如实说明。
-
-`-open` 是匿名发布，任何人都能为开放应用提交更高版本，首发者不独占 ID。已有受保护应用和核心组件不能匿名覆盖。`-open` 与 `-token-file` 互斥；开放发布不需要令牌。
-
-默认地址为 `http://www.fwz233.com`，特定错误时固定回退到 `http://123.56.214.77`。HTTP 不加密且不能防止上传内容被篡改，因此需要显式使用 `-allow-insecure-http`；下载索引的公钥验签不消除上传风险。签名不代表安全审核，设备应用没有沙箱隔离，请只安装可信软件。
-
-## 分发范围
-
-此目录保存发布工具的使用说明和打包脚本，客户端下载见 Release 附件。分发说明见 `DISTRIBUTION-NOTE.txt`，Go 运行时等第三方声明见 `THIRD_PARTY_NOTICES.txt`。
+发布器和共用服务器源码位于 `C1ancher-server/`，构建脚本为 `tools/publisher/build_self_service.py`，第一方许可见包内 LICENSE。第三方声明见 THIRD_PARTY_NOTICES.txt。
