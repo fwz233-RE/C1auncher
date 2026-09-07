@@ -1,4 +1,4 @@
-"""Package the reviewed publisher binaries without including server source.
+"""Package the reviewed publisher executables, configuration, and documentation.
 
 Maintainer use: python tools/publisher/package_release.py --source PATH --output-dir PATH
 The five pinned inputs must match the already distributed 2026-09-06 tools.
@@ -99,7 +99,7 @@ def main() -> None:
     sha = digest(archive.read_bytes())
     with checksum.open("x", encoding="utf-8", newline="\n") as stream:
         stream.write(f"{sha}  {ASSET}\n")
-    print(f"Verified {len(payload)} explicit members; no server tree was traversed.")
+    print(f"Verified {len(payload)} explicit archive members.")
     print(f"{sha}  {archive.name}")
     print(archive)
     print(checksum)

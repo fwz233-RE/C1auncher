@@ -4,8 +4,7 @@ The maintainer distributes these official c1publish binaries for developers
 who wish to package and upload ordinary applications to the existing C1
 application service. Application compilation is a separate step.
 
-This developer kit contains client executables and public configuration only.
-It does not include or publish the server implementation or client source.
+This developer kit provides client executables and their configuration.
 The GPL license of the separate C1ancher device-side project does not by
 itself relicense these independent publisher executables. This distribution
 note does not introduce a new open-source license for the publisher.

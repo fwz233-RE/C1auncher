@@ -1,8 +1,8 @@
 # C1-Slim 普通应用发布工具
 
-下载入口：https://github.com/fwz233-RE/C1ancher/releases/tag/developer-kit-20260907
+下载入口：https://github.com/fwz233-RE/C1ancher/releases/latest
 
-下载 `C1Slim-Publisher-20260907.zip` 和同名 `.sha256` 校验文件，核对后解压并保留整个 `C1-Open-Publisher` 目录。工具在电脑上运行，将已编译的普通应用打包并上传到现有服务器；不需要 Go、Python、服务器源码、SSH 密码、签名私钥或普通应用上传令牌。
+下载 `C1Slim-Publisher-20260907.zip` 和同名 `.sha256` 校验文件，核对后解压并保留整个 `C1-Open-Publisher` 目录。工具在电脑上运行，将已编译的普通应用打包并上传到应用仓库。
 
 ## 文件
 
@@ -51,4 +51,4 @@
 
 ## 分发范围
 
-此目录在源码仓库中保存公开说明和打包脚本，二进制放在 Release 附件中。发布工具与服务端实现不属于此次设备端源码公开范围；工具作为维护者提供的独立二进制分发，见 `DISTRIBUTION-NOTE.txt`。Go 运行时等第三方声明见 `THIRD_PARTY_NOTICES.txt`。
+此目录保存发布工具的使用说明和打包脚本，客户端下载见 Release 附件。分发说明见 `DISTRIBUTION-NOTE.txt`，Go 运行时等第三方声明见 `THIRD_PARTY_NOTICES.txt`。

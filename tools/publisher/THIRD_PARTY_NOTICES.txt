@@ -8,9 +8,8 @@ modules carry the following identical license text.
 
 Upstream: https://go.dev/ and https://go.googlesource.com/go/
 
-This notice covers the listed third-party software only. It does not grant
-rights to the C1 publisher's original code, disclose server source, or change
-the separate licenses of device software and ordinary applications.
+This notice covers the listed third-party software. Device software and
+ordinary applications retain their respective licenses.
 
 --- Go and listed Go-vendored modules license ---
 

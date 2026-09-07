@@ -2,11 +2,17 @@
 
 这里集中维护 C1-Slim / MP-D261 的设备端核心和普通应用源码，目的是让开发者能阅读实现、编译自己的程序，并通过发布工具把应用上传到现有软件仓库。
 
+## 下载与安装
+
+[最新 Release](https://github.com/fwz233-RE/C1ancher/releases/latest) 集中提供 **2.0.0 Windows 安装包**、普通应用发行包及开发者发布工具。各应用保留自己的版本号，下载说明见 [2.0.0 发行说明](docs/release-v2.0.0.md)。
+
+安装器应整包解压，保留 EXE 和配套 `payload/`；安装会修改设备启动配置，并在确认新核心正常运行后删除原厂学习软件，操作前请阅读随包用户指南并自行备份。已有 C1ancher 的设备可通过应用管理器下载安装普通应用。
+
 ## 从这里开始
 
 1. 阅读 [设备应用开发入门](docs/app-development.md)。
 2. 从 [最小 C 应用](examples/hello/README.md) 开始，或参考下面的完整应用。
-3. 从 [开发者工具 Release](https://github.com/fwz233-RE/C1ancher/releases/tag/developer-kit-20260907) 下载 `C1Slim-Publisher-20260907.zip`，解压后保留整个目录。
+3. 从 [最新 Release](https://github.com/fwz233-RE/C1ancher/releases/latest) 下载 `C1Slim-Publisher-20260907.zip`，解压后保留整个目录。
 4. 按 [打包与发布说明](docs/publishing.md) 上传应用。用户在设备 APP 列表刷新后自行下载安装。
 
 ## 源码目录
@@ -29,11 +35,9 @@
 
 核心组件使用 C 和 MIPS 交叉工具链；普通应用也有 Go 示例。具体依赖和命令见 [开发入门](docs/app-development.md) 以及各应用 README。
 
-本次源码汇总不是新的整机固件发布，也不代表所有本地改动都经过新的实机验收。自动化验证范围见 [验证记录](docs/open-source-validation.md)。
+发行包及验证范围见 [2.0.0 发行说明](docs/release-v2.0.0.md)，源码自动化验证见 [验证记录](docs/open-source-validation.md)。用户空间安装包与普通应用包都不是整机分区镜像。
 
-## 公开范围与安全
-
-- 本仓库提供设备端源码和开发者文档，不包含 `C1ancher-server` 服务端实现。
+## 使用与安全
 - 发布工具作为 Release 附件分发；程序、公开服务器地址和验签公钥一起提供。
 - 系统备份、原厂固件、个人书籍/音乐/图片、运行日志、令牌和私钥不属于源码分发范围。
 - 开放发布是匿名发布，新应用 ID 并非首发者独占；已有受保护应用和系统核心不能匿名覆盖。
