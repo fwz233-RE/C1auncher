@@ -94,7 +94,7 @@ build/build-info.txt
 
 ## APP 软件仓库
 
-普通应用通过独立发布工具上传到现有服务器，开发者不需要服务端源码或服务器密码，见 [打包与发布](../docs/publishing.md)。服务端实现与生产部署记录不包含在本公开仓库中。
+普通应用通过发布工具打包上传，操作步骤见 [打包与发布](../docs/publishing.md)。
 
 旧 `build-app-package.ps1` / `publish-app-repo.ps1` 保留用于历史仓库维护和迁移，不用于覆盖新服务数据；旧 `setup-app-repo.sh` 不能用来覆盖新服务的代理路由。
 

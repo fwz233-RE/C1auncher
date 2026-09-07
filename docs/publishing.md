@@ -2,7 +2,7 @@
 
 ## 下载工具
 
-从本仓库的 [开发者工具 Release](https://github.com/fwz233-RE/C1ancher/releases/tag/developer-kit-20260907) 下载 `C1Slim-Publisher-20260907.zip` 和对应 SHA-256 校验文件。解压后保留以下文件在同一目录：
+从本仓库的 [最新 Release](https://github.com/fwz233-RE/C1ancher/releases/latest) 下载 `C1Slim-Publisher-20260907.zip` 和对应 SHA-256 校验文件。解压后保留以下文件在同一目录：
 
 - `c1publish.exe`：Windows x64。
 - `c1publish-linux-amd64`：Linux x64。
@@ -11,7 +11,7 @@
 - `repository.ed25519.pub`：仓库验签公钥。
 - `README.md` 和包内许可证/校验文件。
 
-工具不依赖 Go、Python 或服务器 SSH。地址和公钥从程序所在目录读取，公钥只负责验证仓库签名，不是上传密码。请从维护者可信渠道取得整个工具包，不要临时下载并信任来源不明的公钥。
+工具是独立可执行程序。地址和公钥从程序所在目录读取，公钥只负责验证仓库签名，不是上传密码。请从维护者可信渠道取得整个工具包，不要临时下载并信任来源不明的公钥。
 
 ## 编译前确定版本
 
@@ -35,7 +35,7 @@
 
     .\c1publish.exe -open -allow-insecure-http -id my-example -version 0.1.0 -name "My Example" -entry bin/my-example -payload "C:\path\to\payload"
 
-`-binary` 和 `-payload` 二选一。工具完成打包和上传，无需自己登录服务器或手动复制 tar.gz 到服务器目录。
+`-binary` 和 `-payload` 二选一。工具自动完成打包和上传。
 
 文件路径不能包含绝对路径、空格或 `..` 段，不能包含符号链接、凭据、源码或个人数据。单文件最多 16 MiB，总内容最多 64 MiB，最多 1024 个文件，压缩包最多 32 MiB。
 
