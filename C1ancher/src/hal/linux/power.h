@@ -3,6 +3,7 @@
 
 #include "core/record.h"
 #include "core/status.h"
+#include "hal/linux/usb_power.h"
 #include "services/terminal.h"
 
 #include <stdbool.h>
@@ -12,10 +13,10 @@ typedef struct {
     bool wifi_enabled;
     bool wifi_connected;
     bool wifi_managed;
-    bool adb_enabled;
+    c1_usb_power_context usb;
     bool terminal_paused;
     bool wifi_paused;
-    bool adb_paused;
+    bool terminal_restore_failed;
 } c1_linux_power_context;
 
 bool c1_linux_power_available(void);

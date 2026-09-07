@@ -3,6 +3,7 @@
 #include "display/frame.h"
 #include "ui/canvas.h"
 #include "ui/wallpaper.h"
+#include "pkg/text.h" /* Reuse the bundled 16px UTF-8 bitmap font for SSIDs. */
 
 #include <stdio.h>
 #include <string.h>
@@ -16,10 +17,7 @@ static void render_status_bar(uint8_t *frame, const c1_ui_status *status)
     char left[32];
     char right[24];
 
-    snprintf(left,
-             sizeof(left),
-             "C1 WIFI %s",
-             status->wifi_connected ? "CONNECTED" : "OFF");
+    snprintf(left, sizeof(left), "C1 / NETWORK");
     if (status->time_available && status->battery_available) {
         snprintf(right,
                  sizeof(right),
@@ -47,22 +45,27 @@ static void render_title(uint8_t *frame, const char *title)
     c1_canvas_fill_rect(frame, 8U, 31U, C1_DISPLAY_WIDTH - 16U, 1U, true);
 }
 
-static void render_desktop_cell_text(uint8_t *frame,
-                                     uint32_t column,
-                                     uint32_t row,
-                                     const char *text,
-                                     uint32_t scale,
-                                     bool black)
+typedef struct {
+    uint32_t x;
+    uint32_t y;
+    uint32_t width;
+    uint32_t height;
+} c1_desktop_cell;
+
+static c1_desktop_cell desktop_cell(uint32_t column, uint32_t row)
 {
     static const uint32_t x_positions[] = {0U, 100U, 199U};
     static const uint32_t widths[] = {98U, 97U, 97U};
     static const uint32_t y_positions[] = {0U, 52U, 103U};
     static const uint32_t heights[] = {50U, 49U, 49U};
-    uint32_t text_width = c1_canvas_text_width(text, scale);
-    uint32_t x = x_positions[column] + (widths[column] - text_width) / 2U;
-    uint32_t y = y_positions[row] + (heights[row] - 7U * scale) / 2U + 1U;
+    c1_desktop_cell cell = {
+        x_positions[column],
+        y_positions[row],
+        widths[column],
+        heights[row]
+    };
 
-    c1_canvas_text(frame, x, y, text, scale, black);
+    return cell;
 }
 
 static void render_desktop_cell_label(uint8_t *frame,
@@ -73,29 +76,88 @@ static void render_desktop_cell_label(uint8_t *frame,
                                       uint32_t y_scale,
                                       bool black)
 {
-    static const uint32_t x_positions[] = {0U, 100U, 199U};
-    static const uint32_t widths[] = {98U, 97U, 97U};
-    static const uint32_t y_positions[] = {0U, 52U, 103U};
-    static const uint32_t heights[] = {50U, 49U, 49U};
+    c1_desktop_cell cell = desktop_cell(column, row);
     uint32_t text_width = c1_canvas_text_width(text, x_scale) - x_scale;
     uint32_t text_height = 5U * y_scale;
-    uint32_t x = x_positions[column] + (widths[column] - text_width) / 2U;
-    uint32_t y = y_positions[row] + (heights[row] - text_height) / 2U;
+    uint32_t x = cell.x + (cell.width - text_width) / 2U;
+    uint32_t y = cell.y + (cell.height - text_height) / 2U;
 
     c1_canvas_text_scaled(frame, x, y, text, x_scale, y_scale, black);
 }
 
-static void render_desktop_origin(uint8_t *frame)
+static void render_desktop_cell_value(uint8_t *frame,
+                                      uint32_t column,
+                                      uint32_t row,
+                                      const char *text)
 {
-    c1_canvas_fill_rect(frame, 146U, 72U, 4U, 1U, false);
-    c1_canvas_fill_rect(frame, 144U, 73U, 8U, 2U, false);
-    c1_canvas_fill_rect(frame, 143U, 75U, 10U, 3U, false);
-    c1_canvas_fill_rect(frame, 144U, 78U, 8U, 2U, false);
-    c1_canvas_fill_rect(frame, 146U, 80U, 4U, 1U, false);
+    c1_desktop_cell cell = desktop_cell(column, row);
+    uint32_t width_units = (uint32_t)strlen(text) * 4U - 1U;
+    uint32_t x_scale = (cell.width - 2U) / width_units;
+    uint32_t y_scale = (cell.height - 8U) / 5U;
+
+    if (x_scale == 0U) {
+        x_scale = 1U;
+    }
+    if (y_scale == 0U) {
+        y_scale = 1U;
+    }
+    render_desktop_cell_label(frame, column, row, text, x_scale, y_scale, false);
+}
+
+static void render_desktop_update_cell(uint8_t *frame,
+                                        const c1_ui_status *status)
+{
+    c1_desktop_cell cell = desktop_cell(1U, 1U);
+
+    if (status->update_available) {
+        render_desktop_cell_label(frame, 1U, 1U, "UPDATE", 4U, 8U, false);
+        return;
+    }
+    c1_canvas_fill_rect(frame, cell.x + 46U, cell.y + 20U, 4U, 1U, false);
+    c1_canvas_fill_rect(frame, cell.x + 44U, cell.y + 21U, 8U, 2U, false);
+    c1_canvas_fill_rect(frame, cell.x + 43U, cell.y + 23U, 10U, 3U, false);
+    c1_canvas_fill_rect(frame, cell.x + 44U, cell.y + 26U, 8U, 2U, false);
+    c1_canvas_fill_rect(frame, cell.x + 46U, cell.y + 28U, 4U, 1U, false);
+}
+
+static bool split_ipv4_address(const char *address,
+                               char *left,
+                               size_t left_capacity,
+                               char *right,
+                               size_t right_capacity)
+{
+    const char *first;
+    const char *second;
+    const char *third;
+    size_t left_length;
+    size_t right_length;
+
+    if (address == NULL || left == NULL || right == NULL) {
+        return false;
+    }
+    first = strchr(address, '.');
+    second = first != NULL ? strchr(first + 1, '.') : NULL;
+    third = second != NULL ? strchr(second + 1, '.') : NULL;
+    if (first == NULL || second == NULL || third == NULL || first == address ||
+        second == first + 1 || third == second + 1 || third[1] == '\0' ||
+        strchr(third + 1, '.') != NULL) {
+        return false;
+    }
+    left_length = (size_t)(second - address);
+    right_length = strlen(second + 1);
+    if (left_length >= left_capacity || right_length >= right_capacity) {
+        return false;
+    }
+    memcpy(left, address, left_length);
+    left[left_length] = '\0';
+    memcpy(right, second + 1, right_length + 1U);
+    return true;
 }
 
 static void render_desktop(uint8_t *frame, const c1_ui_status *status)
 {
+    char ipv4_left[8];
+    char ipv4_right[8];
     char battery[12];
     char time[12];
 
@@ -111,7 +173,7 @@ static void render_desktop(uint8_t *frame, const c1_ui_status *status)
     c1_canvas_fill_rect(frame, 100U, 52U, 97U, 49U, true);
     render_desktop_cell_label(frame, 1U, 0U, "WI-FI", 4U, 8U, true);
     render_desktop_cell_label(frame, 0U, 1U, "APP", 7U, 8U, true);
-    render_desktop_origin(frame);
+    render_desktop_update_cell(frame, status);
     render_desktop_cell_label(frame, 2U, 1U, "TERMINAL", 3U, 8U, true);
     render_desktop_cell_label(frame, 1U, 2U, "DEVICE", 4U, 8U, true);
 
@@ -125,8 +187,17 @@ static void render_desktop(uint8_t *frame, const c1_ui_status *status)
     } else {
         snprintf(time, sizeof(time), "--:--");
     }
-    render_desktop_cell_text(frame, 0U, 2U, battery, 3U, false);
-    render_desktop_cell_text(frame, 2U, 2U, time, 3U, false);
+    if (status->wifi_connected &&
+        split_ipv4_address(status->wifi_ipv4,
+                           ipv4_left,
+                           sizeof(ipv4_left),
+                           ipv4_right,
+                           sizeof(ipv4_right))) {
+        render_desktop_cell_value(frame, 0U, 0U, ipv4_left);
+        render_desktop_cell_value(frame, 2U, 0U, ipv4_right);
+    }
+    render_desktop_cell_value(frame, 0U, 2U, battery);
+    render_desktop_cell_value(frame, 2U, 2U, time);
 }
 
 static unsigned int wifi_signal_bars(int signal_dbm)
@@ -154,6 +225,23 @@ static void render_signal_icon(uint8_t *frame, uint32_t x, uint32_t y, int signa
     }
 }
 
+/* SSIDs are UTF-8 byte strings, not ASCII labels. Clip by glyph width so a
+ * long Chinese name cannot disappear or overlap the security column. */
+static void render_wifi_name(uint8_t *frame, int x, int y, const char *name,
+                              int width, bool black)
+{
+    const char *label = c1pkg_text_width(name) > 0 ? name : "(unreadable name)";
+    /* Retain the bundled font's full license in standalone launcher binaries,
+     * including releases that distribute executables without sidecar files. */
+    (void)c1pkg_font_license();
+    if (c1pkg_text_width(label) > width) {
+        c1pkg_text(frame, x, y, label, width - 24, black);
+        c1pkg_text(frame, x + width - 24, y, "...", 24, black);
+    } else {
+        c1pkg_text(frame, x, y, label, width, black);
+    }
+}
+
 static void render_wifi_network_row(uint8_t *frame,
                                     uint32_t y,
                                     const c1_ui_network *network,
@@ -161,20 +249,19 @@ static void render_wifi_network_row(uint8_t *frame,
                                     bool connected)
 {
     bool ink = !selected;
-    char ssid[49];
-    const char *right_label = connected ? "CONNECTED" : (network->secured ? "LOCK" : "OPEN");
+    const char *right_label = network->security != C1_WIFI_SECURITY_OPEN &&
+                              network->security != C1_WIFI_SECURITY_WPA_PSK ? "N/A" :
+                              connected ? "CURRENT" : network->saved ? "SAVED" :
+                              (network->secured ? "LOCK" : "OPEN");
     uint32_t right_x;
 
-    snprintf(ssid, sizeof(ssid), "%.48s", network->ssid);
     if (selected) {
-        c1_canvas_fill_rect(frame, 8U, y, 280U, 19U, true);
-    } else {
-        c1_canvas_fill_rect(frame, 8U, y + 18U, 280U, 1U, true);
+        c1_canvas_fill_rect(frame, 8U, y, 280U, 21U, true);
     }
-    render_signal_icon(frame, 13U, y + 3U, network->signal_dbm, ink);
-    c1_canvas_text(frame, 32U, y + 7U, ssid, 1U, ink);
+    render_signal_icon(frame, 14U, y + 4U, network->signal_dbm, ink);
+    render_wifi_name(frame, 36, (int)y + 2, network->ssid, 208, ink);
     right_x = C1_DISPLAY_WIDTH - c1_canvas_text_width(right_label, 1U) - 13U;
-    c1_canvas_text(frame, right_x, y + 7U, right_label, 1U, ink);
+    c1_canvas_text(frame, right_x, y + 9U, right_label, 1U, ink);
 }
 
 static void render_wifi_action_button(uint8_t *frame,
@@ -185,11 +272,22 @@ static void render_wifi_action_button(uint8_t *frame,
     uint32_t text_width = c1_canvas_text_width(label, 1U);
 
     if (selected) {
-        c1_canvas_fill_rect(frame, x, 36U, 138U, 20U, true);
+        c1_canvas_fill_rect(frame, x, 37U, 138U, 17U, true);
         c1_canvas_text(frame, x + (138U - text_width) / 2U, 43U, label, 1U, false);
     } else {
-        c1_canvas_stroke_rect(frame, x, 36U, 138U, 20U, 1U, true);
         c1_canvas_text(frame, x + (138U - text_width) / 2U, 43U, label, 1U, true);
+    }
+}
+
+static const char *wifi_progress_label(c1_wifi_phase phase)
+{
+    switch (phase) {
+    case C1_WIFI_PHASE_PREPARING: return "PREPARING WI-FI";
+    case C1_WIFI_PHASE_AUTHENTICATING: return "CHECKING PASSWORD";
+    case C1_WIFI_PHASE_ACQUIRING_ADDRESS: return "GETTING ADDRESS";
+    case C1_WIFI_PHASE_SAVING: return "SAVING CONNECTION";
+    case C1_WIFI_PHASE_RESTORING: return "RESTORING NETWORK";
+    default: return "CONNECTING...";
     }
 }
 
@@ -205,14 +303,18 @@ static void render_wifi(uint8_t *frame, const c1_ui_state *state, const c1_ui_st
     if (status->network_count > 0U && selected_network >= status->network_count) {
         selected_network = status->network_count - 1U;
     }
-    first = selected_network > 1U ? selected_network - 1U : 0U;
+    first = (selected_network / 3U) * 3U;
     render_title(frame, "WI-FI");
-    if (status->wifi_busy) {
-        snprintf(heading, sizeof(heading), "SCANNING...");
+    if (status->wifi_stop_pending) {
+        snprintf(heading, sizeof(heading), "STOP REQUESTED");
+    } else if (status->wifi_busy) {
+        snprintf(heading, sizeof(heading), "%s",
+                 status->wifi_activity == C1_UI_ACTION_WIFI_CONNECT ? "CONNECTING" :
+                 status->wifi_activity == C1_UI_ACTION_WIFI_DISABLE ? "TURNING OFF" : "SCANNING");
     } else if (status->wifi_connected) {
         snprintf(heading, sizeof(heading), "CONNECTED");
     } else {
-        snprintf(heading, sizeof(heading), "%u NETWORKS", (unsigned int)status->network_count);
+        snprintf(heading, sizeof(heading), "%s", status->wifi_enabled ? "NOT CONNECTED" : "OFF");
     }
     c1_canvas_text(frame,
                    C1_DISPLAY_WIDTH - c1_canvas_text_width(heading, 1U) - 8U,
@@ -222,53 +324,55 @@ static void render_wifi(uint8_t *frame, const c1_ui_state *state, const c1_ui_st
                    true);
     render_wifi_action_button(frame,
                               8U,
-                              status->wifi_busy ? "SCANNING..." : "SCAN WI-FI",
+                              status->wifi_busy ? "WORKING..." : "SCAN / REFRESH",
                               state->selection == 0U);
     render_wifi_action_button(frame, 150U, "TURN WI-FI OFF", state->selection == 1U);
 
     if (status->wifi_busy) {
-        const char *loading = "SCANNING WI-FI";
-        const char *waiting = "PLEASE WAIT";
-        uint32_t loading_width = c1_canvas_text_width(loading, 2U);
-        uint32_t waiting_width = c1_canvas_text_width(waiting, 1U);
-
-        c1_canvas_text(frame, (C1_DISPLAY_WIDTH - loading_width) / 2U, 79U, loading, 2U, true);
-        c1_canvas_text(frame, (C1_DISPLAY_WIDTH - waiting_width) / 2U, 104U, waiting, 1U, true);
-        c1_canvas_stroke_rect(frame, 62U, 120U, 172U, 11U, 1U, true);
-        c1_canvas_fill_rect(frame, 66U, 124U, 32U, 3U, true);
-        c1_canvas_fill_rect(frame, 106U, 124U, 32U, 3U, true);
-        c1_canvas_fill_rect(frame, 146U, 124U, 32U, 3U, true);
-        c1_canvas_fill_rect(frame, 186U, 124U, 32U, 3U, true);
+        const char *loading = status->wifi_stop_pending ? "STOP REQUESTED" :
+            status->wifi_activity == C1_UI_ACTION_WIFI_CONNECT ? wifi_progress_label(status->wifi_phase) :
+            status->wifi_activity == C1_UI_ACTION_WIFI_DISABLE ? "TURNING WI-FI OFF" : "FINDING NETWORKS";
+        char detail[35];
+        snprintf(detail, sizeof(detail), "%.34s",
+                 status->wifi_activity == C1_UI_ACTION_WIFI_CONNECT ? state->selected_ssid : "PLEASE WAIT");
+        c1_canvas_text(frame, 12U, 76U, loading, 2U, true);
+        render_wifi_name(frame, 12, 96, detail, 272, true);
+        c1_canvas_fill_rect(frame, 8U, 126U, 280U, 1U, true);
+        c1_canvas_text(frame, 8U, 133U,
+                       status->wifi_stop_pending ? "FINISHING SAFELY, THEN SWITCHING OFF" :
+                       "RIGHT + OK: REQUEST WI-FI OFF", 1U, true);
+        c1_canvas_text(frame, 8U, 145U, "BACK: LEAVE PAGE; TASK CONTINUES", 1U, true);
         return;
     }
     if (status->network_count == 0U) {
-        c1_canvas_text(frame, 86U, 91U, "NO NETWORKS FOUND", 1U, true);
+        c1_canvas_text(frame, 12U, 77U,
+                       status->wifi_enabled ? "NO NETWORKS FOUND" : "WI-FI IS OFF", 2U, true);
+        c1_canvas_text(frame, 12U, 99U, "SELECT SCAN TO FIND A NETWORK", 1U, true);
     }
-    for (row = 0U; row < 4U && first + row < status->network_count; ++row) {
+    for (row = 0U; row < 3U && first + row < status->network_count; ++row) {
         size_t network_index = first + row;
-        uint32_t y = 59U + (uint32_t)row * 21U;
+        uint32_t y = 58U + (uint32_t)row * 22U;
 
         render_wifi_network_row(frame,
                                 y,
                                 &status->networks[network_index],
                                 state->selection == network_index + 2U,
-                                status->wifi_connected &&
-                                    strcmp(status->wifi_connected_ssid,
-                                           status->networks[network_index].ssid) == 0);
+                                c1_ui_network_is_current(status, network_index));
     }
 
-    if (status->wifi_connected) {
-        snprintf(footer,
-                 sizeof(footer),
-                 "CONNECTED TO %.28s",
-                 status->wifi_connected_ssid[0] != '\0' ? status->wifi_connected_ssid : "WI-FI");
+    if (state->wifi_notice[0] != '\0') {
+        snprintf(footer, sizeof(footer), "%.46s", state->wifi_notice);
     } else if (status->wifi_message[0] != '\0') {
-        snprintf(footer, sizeof(footer), "%.42s", status->wifi_message);
+        snprintf(footer, sizeof(footer), "%.46s", status->wifi_message);
+    } else if (status->wifi_connected) {
+        snprintf(footer, sizeof(footer), "CONNECTED / %s", status->wifi_ipv4);
     } else {
-        snprintf(footer, sizeof(footer), "SELECT NETWORK AND PRESS ENTER");
+        snprintf(footer, sizeof(footer), "SELECT A NETWORK TO CONNECT");
     }
-    c1_canvas_text(frame, 8U, 145U, footer, 1U, true);
-    if (status->network_count > 0U && !status->wifi_connected) {
+    c1_canvas_fill_rect(frame, 8U, 126U, 280U, 1U, true);
+    c1_canvas_text(frame, 8U, 133U, footer, 1U, true);
+    c1_canvas_text(frame, 8U, 145U, "ARROWS: SELECT  OK: OPEN  BACK: HOME", 1U, true);
+    if (status->network_count > 0U) {
         snprintf(range,
                  sizeof(range),
                  "%u-%u/%u",
@@ -359,13 +463,11 @@ static void render_extended_symbols(uint8_t *frame, const c1_ui_state *state)
 {
     uint32_t index;
 
-    c1_canvas_text(frame, 84U, 81U, "KEYCAP: SHIFT + LETTER", 1U, true);
-    c1_canvas_text(frame, 84U, 95U, "EXTRA: ARROWS + OK", 1U, true);
     for (index = 0U; index < C1_UI_EXTENDED_SYMBOL_COUNT; ++index) {
         uint32_t column = index % 6U;
         uint32_t row = index / 6U;
         uint32_t x = 8U + column * 46U;
-        uint32_t y = 108U + row * 22U;
+        uint32_t y = 96U + row * 21U;
         bool selected = state->symbol_selection == index;
         char label[2] = {c1_ui_extended_symbol(index), '\0'};
         uint32_t text_width = c1_canvas_text_width(label, 1U);
@@ -374,7 +476,6 @@ static void render_extended_symbols(uint8_t *frame, const c1_ui_state *state)
             c1_canvas_fill_rect(frame, x, y, 42U, 19U, true);
             c1_canvas_text(frame, x + (42U - text_width) / 2U, y + 6U, label, 1U, false);
         } else {
-            c1_canvas_stroke_rect(frame, x, y, 42U, 19U, 1U, true);
             c1_canvas_text(frame, x + (42U - text_width) / 2U, y + 6U, label, 1U, true);
         }
     }
@@ -383,44 +484,45 @@ static void render_extended_symbols(uint8_t *frame, const c1_ui_state *state)
 static void render_input_controls(uint8_t *frame, const c1_ui_state *state)
 {
     const char *layer = keyboard_layer_label(state->keyboard_layer);
-    uint32_t layer_width = c1_canvas_text_width(layer, 2U);
-
-    c1_canvas_stroke_rect(frame, 8U, 79U, 68U, 29U, 2U, true);
-    c1_canvas_text(frame, 42U - layer_width / 2U, 88U, layer, 2U, true);
+    char hint[64];
+    snprintf(hint, sizeof(hint), "%s  SHIFT: CHANGE MODE   TAB: %s", layer,
+             state->secret_visible ? "HIDE" : "SHOW");
+    c1_canvas_text(frame, 8U, 87U, hint, 1U, true);
     if (state->keyboard_layer == C1_UI_KEYBOARD_SYMBOLS) {
         render_extended_symbols(frame, state);
+        c1_canvas_text(frame, 8U, 145U, "OK: SYMBOL  ENTER: CONNECT  BACK: CANCEL", 1U, true);
         return;
     }
-    c1_canvas_text(frame, 88U, 82U, "TYPE ON PHYSICAL KEYBOARD", 1U, true);
-    c1_canvas_text(frame, 88U, 99U, "SHIFT  CHANGE LAYER", 1U, true);
-    c1_canvas_text(frame, 18U, 130U, "DELETE  ERASE", 1U, true);
-    c1_canvas_text(frame, 111U, 130U, "SPACE  BLANK", 1U, true);
-    c1_canvas_text(frame, 204U, 130U, "ENTER  SUBMIT", 1U, true);
+    c1_canvas_fill_rect(frame, 8U, 103U, 280U, 23U, true);
+    c1_canvas_text(frame, (C1_DISPLAY_WIDTH - c1_canvas_text_width("CONNECT", 2U)) / 2U,
+                   110U, "CONNECT", 2U, false);
+    c1_canvas_text(frame, 8U, 134U, "TYPE PASSWORD; DELETE TO CORRECT", 1U, true);
+    c1_canvas_text(frame, 8U, 145U, "OK / ENTER: CONNECT   BACK: CANCEL", 1U, true);
 }
 
 static void render_password(uint8_t *frame, const c1_ui_state *state)
 {
     char visible_secret[35];
-    char network[52];
     char range[32];
     size_t visible_length = state->secret_length < sizeof(visible_secret) - 1U
                                 ? state->secret_length
                                 : sizeof(visible_secret) - 1U;
     size_t first_visible = state->secret_length - visible_length;
 
-    memcpy(visible_secret, state->secret + first_visible, visible_length);
+    if (state->secret_visible) {
+        memcpy(visible_secret, state->secret + first_visible, visible_length);
+    } else {
+        memset(visible_secret, '*', visible_length);
+    }
     visible_secret[visible_length] = '\0';
-    render_title(frame, "WI-FI PASSWORD");
-    c1_canvas_text(frame,
-                   C1_DISPLAY_WIDTH - c1_canvas_text_width("ENTER CONNECT", 1U) - 8U,
-                   22U,
-                   "ENTER CONNECT",
-                   1U,
-                   true);
-    snprintf(network, sizeof(network), "NETWORK  %.42s", state->selected_ssid);
-    c1_canvas_text(frame, 8U, 38U, network, 1U, true);
-    c1_canvas_stroke_rect(frame, 8U, 47U, 280U, 21U, 1U, true);
-    c1_canvas_text(frame, 12U, 52U, visible_secret, 2U, true);
+    render_title(frame, "PASSWORD");
+    const char *visibility = state->secret_visible ? "VISIBLE" : "HIDDEN";
+    c1_canvas_text(frame, C1_DISPLAY_WIDTH - c1_canvas_text_width(visibility, 1U) - 8U,
+                   22U, visibility, 1U, true);
+    c1_canvas_text(frame, 8U, 39U, "NETWORK", 1U, true);
+    render_wifi_name(frame, 48, 33, state->selected_ssid, 240, true);
+    c1_canvas_stroke_rect(frame, 8U, 51U, 280U, 21U, 1U, true);
+    c1_canvas_text(frame, 12U, 56U, visible_secret, 2U, true);
     if (first_visible > 0U) {
         snprintf(range,
                  sizeof(range),
@@ -431,7 +533,8 @@ static void render_password(uint8_t *frame, const c1_ui_state *state)
     } else {
         snprintf(range, sizeof(range), "LENGTH %u", (unsigned int)state->secret_length);
     }
-    c1_canvas_text(frame, 8U, 71U, range, 1U, true);
+    c1_canvas_text(frame, 8U, 75U,
+                   state->wifi_notice[0] != '\0' ? state->wifi_notice : range, 1U, true);
     render_input_controls(frame, state);
 }
 

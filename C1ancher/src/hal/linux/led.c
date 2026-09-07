@@ -10,6 +10,7 @@
 
 #define C1_LED_FIRST_NUMBER 2U
 #define C1_LED_STEP_INTERVAL_MS 180
+#define C1_LED_PULSE_DURATION_MS (C1_LED_STEP_INTERVAL_MS * C1_LED_CHASER_COUNT)
 #define C1_LED_BRIGHTNESS 255U
 #define C1_LED_FILE_VALUE_MAX 512U
 
@@ -214,19 +215,55 @@ bool c1_linux_led_chaser_start(c1_linux_led_chaser *chaser,
     }
     chaser->active = true;
     chaser->step = 0U;
+    chaser->next_step_at = -1;
+    chaser->pulse_until = -1;
+    chaser->animating = false;
+    return true;
+}
+
+void c1_linux_led_chaser_quiet(c1_linux_led_chaser *chaser)
+{
+    unsigned int index;
+
+    if (chaser == NULL || !chaser->active) {
+        return;
+    }
+    for (index = 0U; index < C1_LED_CHASER_COUNT; ++index) {
+        (void)set_led(chaser, index, 0U);
+    }
+    chaser->next_step_at = -1;
+    chaser->pulse_until = -1;
+    chaser->animating = false;
+}
+
+void c1_linux_led_chaser_pulse(c1_linux_led_chaser *chaser, int64_t now)
+{
+    if (chaser == NULL || !chaser->active || now < 0) {
+        return;
+    }
+    c1_linux_led_chaser_quiet(chaser);
+    chaser->step = 0U;
     if (!set_led(chaser, chaser->step, C1_LED_BRIGHTNESS)) {
         c1_linux_led_chaser_stop(chaser);
-        return false;
+        return;
     }
     chaser->next_step_at = now + C1_LED_STEP_INTERVAL_MS;
-    return true;
+    chaser->pulse_until = now + C1_LED_PULSE_DURATION_MS;
+    chaser->animating = true;
 }
 
 void c1_linux_led_chaser_tick(c1_linux_led_chaser *chaser, int64_t now)
 {
     unsigned int next;
 
-    if (chaser == NULL || !chaser->active || now < chaser->next_step_at) {
+    if (chaser == NULL || !chaser->active || !chaser->animating) {
+        return;
+    }
+    if (now >= chaser->pulse_until) {
+        c1_linux_led_chaser_quiet(chaser);
+        return;
+    }
+    if (now < chaser->next_step_at) {
         return;
     }
     next = (chaser->step + 1U) % C1_LED_CHASER_COUNT;
@@ -242,7 +279,7 @@ int c1_linux_led_chaser_timeout(const c1_linux_led_chaser *chaser, int64_t now)
 {
     int64_t remaining;
 
-    if (chaser == NULL || !chaser->active) {
+    if (chaser == NULL || !chaser->active || !chaser->animating) {
         return -1;
     }
     remaining = chaser->next_step_at - now;

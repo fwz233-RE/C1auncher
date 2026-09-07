@@ -11,9 +11,9 @@
 
 #define TUI_WIDTH 49
 #define TUI_HEIGHT 19
-#define TUI_ROWS 12U
+#define TUI_ROWS 11U
 
-_Static_assert(TUI_HEIGHT == TUI_ROWS + 7U, "TUI layout must fill the 19-row terminal exactly");
+_Static_assert(TUI_HEIGHT == TUI_ROWS + 8U, "TUI layout must fill the 19-row terminal exactly");
 
 static struct termios saved_terminal;
 static int terminal_saved;
@@ -54,7 +54,7 @@ static int terminal_raw(void)
     terminal_saved = 1;
     raw = saved_terminal;
     raw.c_iflag &= (tcflag_t)~(ICRNL | IXON);
-    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | IEXTEN);
+    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | IEXTEN | ISIG);
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) {
@@ -112,6 +112,7 @@ struct tui_state {
     size_t selected[2];
     size_t offset[2];
     unsigned int tab;
+    struct c1pkg_prefix prefix;
     char status[C1PKG_ERROR_MAX];
 };
 
@@ -139,6 +140,49 @@ static void clamp_selection(struct tui_state *state)
             *offset = *selected - TUI_ROWS + 1U;
         }
     }
+}
+
+static int tui_prefix_rank(const struct tui_state *state, size_t i)
+{
+    const char *id, *name;
+    if (state->tab == 0U) {
+        const struct c1pkg_package *package;
+        id = state->installed.items[i].id;
+        package = c1pkg_repo_find(&state->index, id);
+        name = package != NULL ? package->name : id;
+    } else {
+        id = state->downloads.items[i].id;
+        name = state->downloads.items[i].name;
+    }
+    return c1pkg_prefix_match_rank(&state->prefix, name, id);
+}
+
+static int search_tui(struct tui_state *state, int key, uint64_t now_ms)
+{
+    size_t i;
+    int best_rank = 0;
+    if (!c1pkg_prefix_input(&state->prefix, key, now_ms)) return 0;
+    for (i = 0U; i < item_count(state); ++i) {
+        int rank = tui_prefix_rank(state, i);
+        if (rank > best_rank) {
+            best_rank = rank;
+            state->selected[state->tab] = i;
+        }
+    }
+    clamp_selection(state);
+    return 1;
+}
+
+static int tui_prefix_unmatched(const struct tui_state *state)
+{
+    return state->prefix.text[0] != '\0' &&
+           (item_count(state) == 0U || tui_prefix_rank(state, state->selected[state->tab]) == 0);
+}
+
+static void expire_tui_prefix(struct tui_state *state, uint64_t now_ms)
+{
+    if (c1pkg_prefix_expire(&state->prefix, now_ms))
+        snprintf(state->status, sizeof(state->status), "Search timed out; cleared. Selection unchanged.");
 }
 
 static const char *download_mark(enum c1pkg_download_status status)
@@ -187,10 +231,40 @@ static void render(const struct tui_state *state)
         }
     }
     border();
-    frame_line(" =current U=update X=removed r=refresh q=quit");
-    frame_line(" %.46s", state->status);
+    if (count > 0U) {
+        const char *author = "Unknown";
+        if (state->tab == 1U) {
+            author = state->downloads.items[state->selected[1]].author;
+        } else {
+            const struct c1pkg_package *package = c1pkg_repo_find(&state->index,
+                state->installed.items[state->selected[0]].id);
+            if (package != NULL) author = package->author;
+        }
+        frame_line(" By: %.40s", author);
+    } else {
+        frame_line("");
+    }
+    frame_line(tui_prefix_unmatched(state) ? " No match: edit or clear search before Enter" :
+               state->tab == 0U ? " Enter:open Space:refresh+update Esc:quit" :
+                                  " Enter:manage Space:refresh+update Esc:quit");
+    if (state->prefix.text[0] != '\0') frame_line(" %s: %.36s",
+        tui_prefix_unmatched(state) ? "No match" : "Find", state->prefix.text);
+    else frame_line(" %.46s", state->status);
     final_border();
     (void)fflush(stdout);
+}
+
+static int operation_progress(const char *message, void *context)
+{
+    struct tui_state *state = context;
+    int key;
+    if (message != NULL) {
+        (void)snprintf(state->status, sizeof(state->status), "%s", message);
+        render(state);
+    }
+    key = c1pkg_input_read(STDIN_FILENO, 0);
+    return key == C1PKG_KEY_BACK || key == C1PKG_KEY_QUIT || key == C1PKG_KEY_EOF ||
+           key == C1PKG_KEY_ERASE || key == 'q' || key == 'Q';
 }
 
 static int rebuild_downloads(struct tui_state *state)
@@ -209,21 +283,27 @@ static int reload_installed(struct tui_state *state)
 {
     char error[C1PKG_ERROR_MAX] = "";
     if (c1pkg_store_list(&state->installed, error, sizeof(error)) != 0) {
-        (void)snprintf(state->status, sizeof(state->status), "ERROR: %.220s", error);
+        (void)rebuild_downloads(state);
+        (void)snprintf(state->status, sizeof(state->status), "STORAGE: %.220s", error);
         return -1;
     }
     return rebuild_downloads(state);
 }
 
-static void refresh(struct tui_state *state, const struct c1pkg_config *config)
+static void refresh(struct tui_state *state, const struct c1pkg_config *config, int update_installed)
 {
     char error[C1PKG_ERROR_MAX] = "";
     struct c1pkg_index fresh;
+    int verified = 0;
+
+    c1pkg_prefix_clear(&state->prefix);
+    c1pkg_set_progress(operation_progress, state);
 
     (void)snprintf(state->status, sizeof(state->status), "Refreshing signed repository...");
     render(state);
     if (c1pkg_repo_refresh(config, &fresh, error, sizeof(error)) == 0) {
         state->index = fresh;
+        verified = 1;
         (void)snprintf(state->status, sizeof(state->status), "Verified %lu package(s)",
                        (unsigned long)state->index.count);
     } else if (state->index.count == 0U &&
@@ -234,7 +314,53 @@ static void refresh(struct tui_state *state, const struct c1pkg_config *config)
     } else {
         (void)snprintf(state->status, sizeof(state->status), "REFRESH FAILED: %.210s", error);
     }
-    (void)reload_installed(state);
+    if (reload_installed(state) == 0 && verified != 0 && update_installed != 0) {
+        size_t i;
+        size_t updated = 0U, failed = 0U, skipped = 0U;
+        int stopped = 0;
+        char first_failure[C1PKG_ID_MAX + 1U] = "";
+        /* Iterate the snapshot; only strictly newer, already-installed apps qualify. */
+        for (i = 0U; i < state->downloads.count; ++i) {
+            const struct c1pkg_download_item *item = &state->downloads.items[i];
+            if (item->status != C1PKG_DOWNLOAD_UPDATE_AVAILABLE) continue;
+            (void)snprintf(state->status, sizeof(state->status), "Updating %.32s...", item->id);
+            render(state);
+            error[0] = '\0';
+            {
+                int outcome = c1pkg_store_install(config, &state->index.packages[item->package_index],
+                                                  error, sizeof(error));
+                if (outcome == C1PKG_INSTALL_SKIPPED) { ++skipped; continue; }
+                if (outcome != C1PKG_INSTALL_OK) {
+                    ++failed;
+                    if (first_failure[0] == '\0') (void)strcpy(first_failure, item->id);
+                    if (outcome == C1PKG_INSTALL_CANCELLED || outcome == C1PKG_INSTALL_STORAGE_ERROR) {
+                        stopped = outcome;
+                        break;
+                    }
+                    continue;
+                }
+                if (error[0] == '\0') ++updated;
+            }
+        }
+        if (failed == 0U && skipped == 0U) {
+            (void)snprintf(state->status, sizeof(state->status), "Refresh complete: %lu app(s) updated",
+                           (unsigned long)updated);
+        } else {
+            /* Counts and stop reason fit in the visible 46-column status row. */
+            (void)snprintf(state->status, sizeof(state->status),
+                "%s U:%lu F:%lu S:%lu %.12s",
+                stopped == C1PKG_INSTALL_CANCELLED ? "Cancelled" :
+                stopped == C1PKG_INSTALL_STORAGE_ERROR ? "Storage stop" : "Done",
+                (unsigned long)updated, (unsigned long)failed, (unsigned long)skipped, first_failure);
+        }
+        {
+            char summary[C1PKG_ERROR_MAX];
+            (void)strcpy(summary, state->status);
+            (void)reload_installed(state);
+            (void)strcpy(state->status, summary);
+        }
+    }
+    c1pkg_set_progress(NULL, NULL);
     clamp_selection(state);
 }
 
@@ -253,66 +379,21 @@ static void launch_selected_app(const char *id)
 }
 
 enum input_key {
-    KEY_NONE,
-    KEY_UP,
-    KEY_DOWN,
-    KEY_LEFT,
-    KEY_RIGHT,
-    KEY_ENTER,
-    KEY_PREVIOUS_LIST,
-    KEY_NEXT_LIST,
-    KEY_REFRESH,
-    KEY_QUIT
+    KEY_NONE = C1PKG_KEY_NONE, KEY_UP = C1PKG_KEY_UP, KEY_DOWN = C1PKG_KEY_DOWN,
+    KEY_LEFT = C1PKG_KEY_LEFT, KEY_RIGHT = C1PKG_KEY_RIGHT,
+    KEY_ENTER = C1PKG_KEY_ENTER, KEY_REFRESH = C1PKG_KEY_REFRESH,
+    KEY_QUIT = C1PKG_KEY_BACK
 };
 
-static enum input_key read_key(void)
+static int read_key(void)
 {
-    unsigned char bytes[8];
-    struct pollfd input;
-    ssize_t amount;
+    return c1pkg_input_read(STDIN_FILENO, 200);
+}
 
-    input.fd = STDIN_FILENO;
-    input.events = POLLIN;
-    input.revents = 0;
-    if (poll(&input, 1U, -1) <= 0) {
-        return errno == EINTR ? KEY_NONE : KEY_QUIT;
-    }
-    amount = read(STDIN_FILENO, bytes, sizeof(bytes));
-    if (amount <= 0) {
-        return KEY_NONE;
-    }
-    if (bytes[0] == 27U &&
-        (amount < 3 ||
-         (amount == 3 && bytes[1] == (unsigned char)'[' &&
-          (bytes[2] == (unsigned char)'5' || bytes[2] == (unsigned char)'6')))) {
-        struct pollfd continuation;
-        continuation.fd = STDIN_FILENO;
-        continuation.events = POLLIN;
-        continuation.revents = 0;
-        if (poll(&continuation, 1U, 40) > 0) {
-            ssize_t more = read(STDIN_FILENO, bytes + amount, sizeof(bytes) - (size_t)amount);
-            if (more > 0) {
-                amount += more;
-            }
-        }
-    }
-    if (bytes[0] == 27U) {
-        if (amount >= 4 && bytes[1] == (unsigned char)'[' && bytes[3] == (unsigned char)'~') {
-            if (bytes[2] == (unsigned char)'5') return KEY_PREVIOUS_LIST;
-            if (bytes[2] == (unsigned char)'6') return KEY_NEXT_LIST;
-        }
-        if (amount >= 3 && bytes[1] == (unsigned char)'[') {
-            if (bytes[2] == (unsigned char)'A') return KEY_UP;
-            if (bytes[2] == (unsigned char)'B') return KEY_DOWN;
-            if (bytes[2] == (unsigned char)'C') return KEY_RIGHT;
-            if (bytes[2] == (unsigned char)'D') return KEY_LEFT;
-        }
-        return KEY_QUIT;
-    }
-    if (bytes[0] == (unsigned char)'q') return KEY_QUIT;
-    if (bytes[0] == (unsigned char)'r') return KEY_REFRESH;
-    if (bytes[0] == (unsigned char)'\r' || bytes[0] == (unsigned char)'\n') return KEY_ENTER;
-    return KEY_NONE;
+static int cancel_key(int key)
+{
+    return key == KEY_QUIT || key == C1PKG_KEY_EOF || key == C1PKG_KEY_QUIT ||
+           key == C1PKG_KEY_ERASE || key == 'q' || key == 'Q';
 }
 
 enum manage_action {
@@ -379,7 +460,7 @@ static void render_manage_dialog(const struct c1pkg_download_item *item,
     } else {
         frame_line(" Available: (removed)");
     }
-    frame_line("");
+    frame_line(" By: %.40s", item->author);
     frame_line(" %s", download_state_text(item->status));
     frame_line("");
     for (row = 0U; row < 3U; ++row) {
@@ -404,7 +485,7 @@ static int confirm_uninstall(const struct c1pkg_download_item *item)
     size_t selection = 1U;
 
     for (;;) {
-        enum input_key key;
+        int key;
 
         (void)fputs("\033[H", stdout);
         border();
@@ -428,7 +509,7 @@ static int confirm_uninstall(const struct c1pkg_download_item *item)
         final_border();
         (void)fflush(stdout);
         key = read_key();
-        if (key == KEY_QUIT) {
+        if (cancel_key(key)) {
             return 0;
         }
         if (key == KEY_UP || key == KEY_DOWN) {
@@ -446,6 +527,7 @@ static void install_download(struct tui_state *state,
 {
     char error[C1PKG_ERROR_MAX] = "";
     const struct c1pkg_package *package;
+    int outcome;
 
     if (item->package_index >= state->index.count) {
         (void)snprintf(state->status, sizeof(state->status),
@@ -456,11 +538,19 @@ static void install_download(struct tui_state *state,
     (void)snprintf(state->status, sizeof(state->status), "%s and verifying %.32s...",
                    updating != 0 ? "Updating" : "Installing", item->id);
     render(state);
-    if (c1pkg_store_install(config, package, error, sizeof(error)) != 0) {
-        (void)snprintf(state->status, sizeof(state->status), "%s FAILED: %.216s",
-                       updating != 0 ? "UPDATE" : "INSTALL", error);
+    c1pkg_set_progress(operation_progress, state);
+    outcome = c1pkg_store_install(config, package, error, sizeof(error));
+    if (outcome != C1PKG_INSTALL_OK) {
+        c1pkg_set_progress(NULL, NULL);
+        if (outcome == C1PKG_INSTALL_SKIPPED) {
+            (void)snprintf(state->status, sizeof(state->status), "SKIPPED: %.240s", error);
+        } else {
+            (void)snprintf(state->status, sizeof(state->status), "%s FAILED: %.216s",
+                           updating != 0 ? "UPDATE" : "INSTALL", error);
+        }
         return;
     }
+    c1pkg_set_progress(NULL, NULL);
     (void)snprintf(state->status, sizeof(state->status), "%s %.32s %.48s",
                    updating != 0 ? "Updated" : "Installed", item->id, package->version);
     (void)reload_installed(state);
@@ -490,12 +580,12 @@ static void manage_download(struct tui_state *state,
     size_t selection = 0U;
 
     for (;;) {
-        enum input_key key;
+        int key;
         size_t count = manage_action_count(&item);
 
         render_manage_dialog(&item, selection);
         key = read_key();
-        if (key == KEY_QUIT) {
+        if (cancel_key(key)) {
             return;
         }
         if (key == KEY_UP && selection > 0U) {
@@ -524,6 +614,11 @@ static int perform_action(struct tui_state *state, const struct c1pkg_config *co
 {
     size_t count = item_count(state);
 
+    if (tui_prefix_unmatched(state)) {
+        snprintf(state->status, sizeof(state->status), "No match: edit or clear search before Enter");
+        return 0;
+    }
+    c1pkg_prefix_clear(&state->prefix);
     if (count == 0U) {
         (void)snprintf(state->status, sizeof(state->status), "No item selected");
         return 0;
@@ -545,6 +640,38 @@ static int perform_action(struct tui_state *state, const struct c1pkg_config *co
     return 0;
 }
 
+static int tui_list_key(struct tui_state *state, const struct c1pkg_config *config,
+                        int key, uint64_t now_ms)
+{
+    size_t count;
+    if (key == C1PKG_KEY_EOF || key == C1PKG_KEY_QUIT) return 1;
+    if (search_tui(state, key, now_ms)) return 0;
+    if (key == KEY_QUIT && state->prefix.text[0] != '\0') {
+        c1pkg_prefix_clear(&state->prefix);
+        return 0;
+    }
+    if (key == KEY_NONE) return 0;
+    /* Validate Enter before clearing the prefix, including at the timeout
+     * boundary when the cleared state has not yet been painted. */
+    if (key == KEY_ENTER) return perform_action(state, config);
+    c1pkg_prefix_clear(&state->prefix);
+    count = item_count(state);
+    if (key == KEY_QUIT) return 1;
+    if (key == KEY_LEFT || key == KEY_RIGHT) {
+        state->tab = key == KEY_LEFT ? 0U : 1U;
+        clamp_selection(state);
+    } else if (key == KEY_UP && count > 0U) {
+        if (state->selected[state->tab] > 0U) --state->selected[state->tab];
+        clamp_selection(state);
+    } else if (key == KEY_DOWN && count > 0U) {
+        if (state->selected[state->tab] + 1U < count) ++state->selected[state->tab];
+        clamp_selection(state);
+    } else if (key == KEY_REFRESH) {
+        refresh(state, config, 1);
+    }
+    return 0;
+}
+
 int c1pkg_tui(const struct c1pkg_config *config)
 {
     struct tui_state state;
@@ -558,36 +685,13 @@ int c1pkg_tui(const struct c1pkg_config *config)
     }
     (void)atexit(terminal_restore);
     (void)reload_installed(&state);
-    refresh(&state, config);
+    refresh(&state, config, 0);
     while (done == 0) {
-        enum input_key key;
-        size_t count;
+        int key;
+        expire_tui_prefix(&state, c1pkg_input_now_ms());
         render(&state);
         key = read_key();
-        count = item_count(&state);
-        if (key == KEY_QUIT) {
-            done = 1;
-        } else if (key == KEY_PREVIOUS_LIST || key == KEY_NEXT_LIST) {
-            state.tab = key == KEY_PREVIOUS_LIST ? 0U : 1U;
-            clamp_selection(&state);
-        } else if (key == KEY_LEFT || key == KEY_RIGHT) {
-            state.tab = key == KEY_LEFT ? 0U : 1U;
-            clamp_selection(&state);
-        } else if (key == KEY_UP && count > 0U) {
-            if (state.selected[state.tab] > 0U) {
-                --state.selected[state.tab];
-            }
-            clamp_selection(&state);
-        } else if (key == KEY_DOWN && count > 0U) {
-            if (state.selected[state.tab] + 1U < count) {
-                ++state.selected[state.tab];
-            }
-            clamp_selection(&state);
-        } else if (key == KEY_REFRESH) {
-            refresh(&state, config);
-        } else if (key == KEY_ENTER && perform_action(&state, config) != 0) {
-            done = 1;
-        }
+        done = tui_list_key(&state, config, key, c1pkg_input_now_ms());
     }
     terminal_restore();
     return 0;

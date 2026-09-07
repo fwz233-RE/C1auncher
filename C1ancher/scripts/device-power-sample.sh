@@ -84,27 +84,53 @@ c1_collect_ctxt() {
     if [ -n "$c1_ctxt" ]; then printf '%s' "$c1_ctxt"; else printf '%s' unavailable; fi
 }
 
-c1_collect_process() {
-    c1_process_pids=$(pidof C1ancher 2>/dev/null)
-    if [ -z "$c1_process_pids" ]; then
-        for c1_process_comm in /proc/[0-9]*/comm; do
-            [ -r "$c1_process_comm" ] || continue
-            c1_process_name=$(head -n 1 "$c1_process_comm" 2>/dev/null)
-            [ "$c1_process_name" = C1ancher ] || continue
-            c1_process_dir=${c1_process_comm%/comm}
-            c1_process_pids="$c1_process_pids ${c1_process_dir##*/}"
-        done
-    fi
+c1_collect_processes() {
     c1_emit_first=1
     c1_process_found=0
-    for c1_process_pid in $c1_process_pids; do
-        [ -r "/proc/$c1_process_pid/stat" ] || continue
-        c1_process_stat=$(awk '{ printf "pid=%s,comm=%s,state=%s,utime=%s,stime=%s,cutime=%s,cstime=%s,priority=%s,nice=%s,threads=%s,starttime=%s,processor=%s", $1,$2,$3,$14,$15,$16,$17,$18,$19,$20,$22,$39 }' "/proc/$c1_process_pid/stat" 2>/dev/null)
+    for c1_process_comm in /proc/[0-9]*/comm; do
+        [ -r "$c1_process_comm" ] || continue
+        c1_process_name=$(head -n 1 "$c1_process_comm" 2>/dev/null)
+        case "$c1_process_name" in
+            C1ancher|app_daemon|adbd|wpa_supplicant|udhcpc|umtprd|sh|c1pkg) ;;
+            *) continue ;;
+        esac
+        c1_process_dir=${c1_process_comm%/comm}
+        c1_process_pid=${c1_process_dir##*/}
+        [ -r "$c1_process_dir/stat" ] || continue
+        c1_process_stat=$(awk -v name="$c1_process_name" '{ printf "name=%s,pid=%s,state=%s,utime=%s,stime=%s,cutime=%s,cstime=%s,nice=%s,threads=%s,starttime=%s,processor=%s", name,$1,$3,$14,$15,$16,$17,$19,$20,$22,$39 }' "$c1_process_dir/stat" 2>/dev/null)
         [ -n "$c1_process_stat" ] || continue
         c1_process_found=1
         c1_emit_item "$c1_process_stat"
     done
     [ "$c1_process_found" -eq 1 ] || printf '%s' unavailable
+}
+
+c1_collect_leds() {
+    c1_emit_first=1
+    c1_led_found=0
+    for c1_led_dir in /sys/class/leds/*; do
+        [ -d "$c1_led_dir" ] || continue
+        c1_led_found=1
+        c1_led_name=${c1_led_dir##*/}
+        c1_emit_item "name=$c1_led_name,brightness=$(c1_read_value "$c1_led_dir/brightness"),max=$(c1_read_value "$c1_led_dir/max_brightness"),trigger=$(c1_read_value "$c1_led_dir/trigger")"
+    done
+    [ "$c1_led_found" -eq 1 ] || printf '%s' unavailable
+}
+
+c1_collect_cpu_power() {
+    c1_emit_first=1
+    c1_cpu_power_found=0
+    for c1_cpu_policy in /sys/devices/system/cpu/cpufreq/policy* /sys/devices/system/cpu/cpu*/cpufreq; do
+        [ -d "$c1_cpu_policy" ] || continue
+        c1_cpu_power_found=1
+        c1_emit_item "$c1_cpu_policy.cur=$(c1_read_value "$c1_cpu_policy/scaling_cur_freq"),min=$(c1_read_value "$c1_cpu_policy/scaling_min_freq"),max=$(c1_read_value "$c1_cpu_policy/scaling_max_freq"),governor=$(c1_read_value "$c1_cpu_policy/scaling_governor")"
+    done
+    for c1_idle_state in /sys/devices/system/cpu/cpu*/cpuidle/state*; do
+        [ -d "$c1_idle_state" ] || continue
+        c1_cpu_power_found=1
+        c1_emit_item "$c1_idle_state.name=$(c1_read_value "$c1_idle_state/name"),usage=$(c1_read_value "$c1_idle_state/usage"),time=$(c1_read_value "$c1_idle_state/time"),disable=$(c1_read_value "$c1_idle_state/disable")"
+    done
+    [ "$c1_cpu_power_found" -eq 1 ] || printf '%s' unavailable
 }
 
 c1_add_wifi_iface() {
@@ -138,6 +164,8 @@ c1_collect_wifi() {
         c1_wifi_address=$(c1_read_value "$c1_wifi_base/address")
         c1_wifi_rx=$(c1_read_value "$c1_wifi_base/statistics/rx_packets")
         c1_wifi_tx=$(c1_read_value "$c1_wifi_base/statistics/tx_packets")
+        c1_wifi_rx_bytes=$(c1_read_value "$c1_wifi_base/statistics/rx_bytes")
+        c1_wifi_tx_bytes=$(c1_read_value "$c1_wifi_base/statistics/tx_bytes")
         c1_wifi_wireless=unavailable
         if [ -r /proc/net/wireless ]; then
             c1_wifi_line=$(awk -v name="$c1_wifi_iface" '$1 == name ":" { print; exit }' /proc/net/wireless 2>/dev/null)
@@ -151,7 +179,7 @@ c1_collect_wifi() {
             c1_wifi_command=$(iwconfig "$c1_wifi_iface" 2>/dev/null)
             [ -z "$c1_wifi_command" ] || c1_wifi_link=$(c1_sanitize "$c1_wifi_command")
         fi
-        c1_emit_item "iface=$c1_wifi_iface,operstate=$c1_wifi_operstate,carrier=$c1_wifi_carrier,address=$c1_wifi_address,rx_packets=$c1_wifi_rx,tx_packets=$c1_wifi_tx,wireless=$c1_wifi_wireless,link=$c1_wifi_link"
+        c1_emit_item "iface=$c1_wifi_iface,operstate=$c1_wifi_operstate,carrier=$c1_wifi_carrier,address=$c1_wifi_address,rx_packets=$c1_wifi_rx,tx_packets=$c1_wifi_tx,rx_bytes=$c1_wifi_rx_bytes,tx_bytes=$c1_wifi_tx_bytes,wireless=$c1_wifi_wireless,link=$c1_wifi_link"
     done
     [ "$c1_wifi_found" -eq 1 ] || printf '%s' unavailable
 }
@@ -171,7 +199,20 @@ c1_collect_usb() {
         c1_usb_udc=$(c1_read_value "$c1_usb_gadget/UDC")
         c1_usb_state=unavailable
         [ "$c1_usb_udc" = unavailable ] || c1_usb_state=$(c1_read_value "/sys/class/udc/$c1_usb_udc/state")
-        c1_emit_item "gadget=$c1_usb_name,udc=$c1_usb_udc,state=$c1_usb_state"
+        c1_usb_functions=
+        for c1_usb_config in "$c1_usb_gadget"/configs/*; do
+            [ -d "$c1_usb_config" ] || continue
+            for c1_usb_function in "$c1_usb_config"/*; do
+                [ -L "$c1_usb_function" ] || continue
+                if [ -n "$c1_usb_functions" ]; then
+                    c1_usb_functions="$c1_usb_functions,${c1_usb_function##*/}"
+                else
+                    c1_usb_functions=${c1_usb_function##*/}
+                fi
+            done
+        done
+        [ -n "$c1_usb_functions" ] || c1_usb_functions=none
+        c1_emit_item "gadget=$c1_usb_name,udc=$c1_usb_udc,state=$c1_usb_state,functions=$c1_usb_functions"
     done
     for c1_usb_udc_dir in /sys/class/udc/*; do
         [ -d "$c1_usb_udc_dir" ] || continue
@@ -232,7 +273,7 @@ c1_collect_epaper() {
     [ "$c1_epaper_found" -eq 1 ] || printf '%s' unavailable
 }
 
-printf 'timestamp_epoch\ttimestamp_utc\telapsed_seconds\tsample\tpower_supply\tcpu_total\tctxt\tc1ancher_cpu\twifi\tusb_gadget\tpower_state\twakeup_count\tpower_stats\twakeup_sources\tepaper\n'
+printf 'timestamp_epoch\ttimestamp_utc\telapsed_seconds\tsample\tpower_supply\tcpu_total\tctxt\tprocesses\tcpu_power\tleds\twifi\tusb_gadget\tpower_state\tmem_sleep\twakeup_count\tpower_stats\twakeup_sources\tepaper\n'
 
 c1_started=$(date +%s 2>/dev/null)
 case "$c1_started" in ''|*[!0-9]*) echo 'date +%s is unavailable' >&2; exit 69 ;; esac
@@ -247,17 +288,20 @@ while :; do
     c1_power_supply=$(c1_collect_power_supply)
     c1_cpu=$(c1_collect_cpu)
     c1_ctxt=$(c1_collect_ctxt)
-    c1_process=$(c1_collect_process)
+    c1_processes=$(c1_collect_processes)
+    c1_cpu_power=$(c1_collect_cpu_power)
+    c1_leds=$(c1_collect_leds)
     c1_wifi=$(c1_collect_wifi)
     c1_usb=$(c1_collect_usb)
     c1_power_state=$(c1_read_value /sys/power/state)
+    c1_mem_sleep=$(c1_read_value /sys/power/mem_sleep)
     c1_wakeup_count=$(c1_read_value /sys/power/wakeup_count)
     c1_power_stats=$(c1_collect_power_stats)
     c1_wakeup_sources=$(c1_collect_wakeup_sources)
     c1_epaper=$(c1_collect_epaper)
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$c1_now" "$c1_utc" "$c1_elapsed" "$c1_sample" "$c1_power_supply" "$c1_cpu" "$c1_ctxt" "$c1_process" "$c1_wifi" "$c1_usb" "$c1_power_state" "$c1_wakeup_count" "$c1_power_stats" "$c1_wakeup_sources" "$c1_epaper"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$c1_now" "$c1_utc" "$c1_elapsed" "$c1_sample" "$c1_power_supply" "$c1_cpu" "$c1_ctxt" "$c1_processes" "$c1_cpu_power" "$c1_leds" "$c1_wifi" "$c1_usb" "$c1_power_state" "$c1_mem_sleep" "$c1_wakeup_count" "$c1_power_stats" "$c1_wakeup_sources" "$c1_epaper"
 
     [ "$c1_elapsed" -ge "$c1_duration" ] && break
     sleep "$c1_interval" || exit 70

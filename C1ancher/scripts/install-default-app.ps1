@@ -4,17 +4,34 @@ param(
     [string]$Action = 'Install',
     [switch]$Reboot,
     [switch]$EnableAutoSuspend,
+    [switch]$DisableAutoSuspend,
     [ValidateRange(30, 600)]
     [int]$ReconnectTimeoutSeconds = 300,
+    [string]$CoreEnrollmentBundle,
+    [string]$RepositoryProfile,
     [string]$AdbPath = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
 )
 
 $ErrorActionPreference = 'Stop'
+if ($EnableAutoSuspend -and $DisableAutoSuspend) {
+    throw 'EnableAutoSuspend and DisableAutoSuspend are mutually exclusive.'
+}
+if ($Action -eq 'RemoveOriginal' -and ($EnableAutoSuspend -or $DisableAutoSuspend)) {
+    throw 'Suspend preference options apply only to Install or Verify, not RemoveOriginal.'
+}
+$autoSuspendMode = if ($EnableAutoSuspend) { 'enabled' } elseif ($DisableAutoSuspend) { 'disabled' } else { 'default' }
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $appPath = Join-Path $projectRoot 'build\C1ancher'
 $launcherPath = Join-Path $projectRoot 'build\C1ancher-launcher'
 $pkgPath = Join-Path $projectRoot 'build\c1pkg'
 $repositoryPublicKeyPath = Join-Path $projectRoot 'config\app-repo\repository.ed25519.pub'
+if (-not [string]::IsNullOrWhiteSpace($RepositoryProfile)) {
+    $RepositoryProfile = [IO.Path]::GetFullPath($RepositoryProfile)
+    $repositoryPublicKeyPath = Join-Path $RepositoryProfile 'repository.ed25519.pub'
+    foreach ($profileMember in @('repository.url', 'core-repository.url', 'SHA256SUMS', 'device-repository-config.sh', 'c1-update-check.sh')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $RepositoryProfile $profileMember) -PathType Leaf)) { throw "Invalid repository profile: missing $profileMember" }
+    }
+}
 $neofetchRoot = Join-Path $projectRoot 'third_party\neofetch'
 $neofetchCommandPath = Join-Path $neofetchRoot 'neofetch'
 $neofetchUpstreamPath = Join-Path $neofetchRoot 'neofetch.upstream'
@@ -139,21 +156,31 @@ function Sync-DeviceClock {
     ) -join [Environment]::NewLine
 }
 
-function Assert-SuspendCapability {
-    $proof = Invoke-CheckedRemote "if [ -f /usr/data/c1/suspend-probe-passed ]; then cat /usr/data/c1/suspend-probe-passed; else echo missing; exit 1; fi"
-    if ($proof -notmatch '(?m)^result=passed$') {
-        throw "A successful suspend and ADB reconnect probe is required before automatic suspend can be enabled.`n$proof"
+function Get-SuspendCapability {
+    # Keep the predicate identical to the two device helpers. Historical probe
+    # evidence is not required or fabricated; physical USB resume is a release gate.
+    $command = @'
+auto_suspend_supported() {
+    [ -r /proc/cpuinfo ] &&
+    awk -F ':' '$1 ~ /^[ \t]*machine[ \t]*$/ {
+        value=$2; sub(/^[ \t]+/, "", value); sub(/[ \t]+$/, "", value)
+        count++; if (NF != 2 || value != "ingenic,halley6_v20") bad=1
+    } END { exit !(count == 1 && !bad) }' /proc/cpuinfo &&
+    [ -d /sys/devices/platform/mpenbatt ] &&
+    [ -r /sys/devices/platform/gpio_keys/power/wakeup ] &&
+    [ "$(cat /sys/devices/platform/gpio_keys/power/wakeup)" = enabled ] &&
+    [ -r /sys/power/state ] && [ -w /sys/power/state ] &&
+    grep -Eq '(^|[[:space:]])mem([[:space:]]|$)' /sys/power/state
+}
+if auto_suspend_supported; then echo automatic_suspend_supported=yes; else echo automatic_suspend_supported=no; fi
+'@
+    return Invoke-CheckedRemote ($command.Replace("`r`n", "`n"))
+}
+
+function Assert-SuspendCapability([string]$Probe) {
+    if ($Probe -notmatch '(?m)^automatic_suspend_supported=yes\r?$') {
+        throw "Automatic suspend requires supported C1-Slim hardware, enabled gpio_keys wakeup, and writable mem suspend.`n$Probe"
     }
-    $probe = Invoke-CheckedRemote "state=unavailable; [ -r /sys/power/state ] && state=`$(cat /sys/power/state); writable=no; [ -w /sys/power/state ] && writable=yes; wake_sources=0; for node in /sys/devices/*/power/wakeup /sys/devices/*/*/power/wakeup /sys/devices/*/*/*/power/wakeup /sys/devices/*/*/*/*/power/wakeup; do [ -r `$node ] || continue; [ \"`$(cat `$node 2>/dev/null)\" = enabled ] && wake_sources=`$((wake_sources + 1)); done; input_wake_sources=0; for node in /sys/class/input/event*/device/power/wakeup; do [ -r `$node ] || continue; [ \"`$(cat `$node 2>/dev/null)\" = enabled ] && input_wake_sources=`$((input_wake_sources + 1)); done; echo power_state=`$state; echo state_writable=`$writable; echo enabled_wake_sources=`$wake_sources; echo enabled_input_wake_sources=`$input_wake_sources"
-    if ($probe -notmatch '(?m)^power_state=.*\bmem\b' -or
-        $probe -notmatch '(?m)^state_writable=yes$') {
-        throw "Automatic suspend capability probe failed.`n$probe"
-    }
-    $inputWakeMatch = [regex]::Match($probe, '(?m)^enabled_input_wake_sources=(\d+)$')
-    if (-not $inputWakeMatch.Success -or [int]$inputWakeMatch.Groups[1].Value -lt 1) {
-        throw "No enabled input-device wake source was found; automatic suspend remains disabled.`n$probe"
-    }
-    return ($proof + [Environment]::NewLine + $probe)
 }
 
 function Assert-ApplicationState([ValidateSet('Original', 'C1', 'C1OrLegacy')] [string]$Expected) {
@@ -251,11 +278,20 @@ $script:Adb = Resolve-Adb
 
 try {
     $script:Serial = Get-OnlyDevice
+    if ($Action -eq 'Install' -and [string]::IsNullOrWhiteSpace($RepositoryProfile)) {
+        Invoke-CheckedRemote 'test -s /usr/data/c1/pkg/repository.url' | Out-Null
+        # Fresh devices must receive an explicit common profile; never silently
+        # install a package manager that still depends on the retired server.
+    }
     $baseline = Assert-SystemState
+    if ($Action -eq 'Install') {
+        Invoke-CheckedRemote "if test -e /usr/data/c1/pkg/repository.ed25519.pub; then test ! -L /usr/data/c1/pkg/repository.ed25519.pub && test `"`$(sha256sum /usr/data/c1/pkg/repository.ed25519.pub | cut -d ' ' -f 1)`" = '$repositoryPublicKeyHash'; fi" | Out-Null
+    }
+    $suspendCapability = Get-SuspendCapability
+    Write-Evidence 'suspend-capability.txt' ("automatic_suspend_mode=$autoSuspendMode" + [Environment]::NewLine + $suspendCapability + [Environment]::NewLine)
+    if ($EnableAutoSuspend) { Assert-SuspendCapability $suspendCapability }
     $clockSync = if ($Action -eq 'Install') { Sync-DeviceClock } else { 'clock_sync=not_requested' }
     Write-Evidence 'clock-sync.txt' ($clockSync + [Environment]::NewLine)
-    $suspendCapability = if ($EnableAutoSuspend) { Assert-SuspendCapability } else { 'automatic_suspend=disabled_by_default' }
-    Write-Evidence 'suspend-capability.txt' ($suspendCapability + [Environment]::NewLine)
     $currentHash = (Invoke-Remote 'sha256sum /etc/app_daemon').Output.Split()[0].ToLowerInvariant()
     if ($currentHash -notin @($expectedOriginalHash, $expectedPreviousShimHash, $shimHash)) { throw "Unexpected device app_daemon hash: $currentHash" }
     $expectedBefore = if ($currentHash -eq $expectedOriginalHash) { 'Original' } else { 'C1OrLegacy' }
@@ -300,7 +336,6 @@ try {
     Invoke-CheckedRemote "sh -n $remoteScript" | Out-Null
     Invoke-CheckedRemote "sh -n $remoteShim" | Out-Null
     $actionName = if ($Action -eq 'RemoveOriginal') { 'remove-original' } else { $Action.ToLowerInvariant() }
-    $autoSuspendMode = if ($EnableAutoSuspend) { 'enabled' } else { 'disabled' }
     $deviceHashArguments = "$expectedOriginalHash $shimHash $appHash $launcherHash $pkgHash $repositoryPublicKeyHash $neofetchCommandHash $neofetchUpstreamHash $neofetchConfigHash $neofetchLicenseHash $neofetchLogoHash $expectedPreviousShimHash $autoSuspendMode"
     $operation = Invoke-CheckedRemote "$remoteScript $actionName $deviceHashArguments"
     Write-Evidence 'operation.log' $operation
@@ -309,6 +344,23 @@ try {
         $verification = Invoke-CheckedRemote "$remoteScript verify $deviceHashArguments"
         Write-Evidence 'verification-before-reboot.log' $verification
         Assert-ApplicationState 'C1' | Out-Null
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($CoreEnrollmentBundle) -and $Action -in @('Install', 'Verify')) {
+        $enrollmentAction = if ($Action -eq 'Install') { 'Install' } else { 'Verify' }
+        $enrollmentArguments = @{
+            Action = $enrollmentAction
+            AdbPath = $script:Adb
+            TimeoutSeconds = $ReconnectTimeoutSeconds
+        }
+        if ($enrollmentAction -eq 'Install') { $enrollmentArguments.BundleDirectory = $CoreEnrollmentBundle }
+        & (Join-Path $PSScriptRoot 'install-core-enrollment.ps1') @enrollmentArguments
+        if (-not $?) { throw 'Core enrollment failed.' }
+    }
+
+    if ($Action -eq 'Install' -and -not [string]::IsNullOrWhiteSpace($RepositoryProfile)) {
+        & (Join-Path $PSScriptRoot 'install-repository-profile.ps1') -ProfileDirectory $RepositoryProfile -Serial $script:Serial -AdbPath $script:Adb
+        if (-not $?) { throw 'Repository provisioning or network verification failed.' }
     }
 
     if ($Reboot) {

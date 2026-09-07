@@ -2,7 +2,9 @@
 #define _XOPEN_SOURCE 600
 
 #include "services/terminal.h"
+#include "platform/liveness.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -54,6 +56,10 @@ static void close_master(c1_terminal_session *session)
         close(session->master_fd);
         session->master_fd = -1;
     }
+    if (session->control_fd >= 0) {
+        close(session->control_fd);
+        session->control_fd = -1;
+    }
     session->pending_offset = 0U;
     session->pending_length = 0U;
 }
@@ -94,6 +100,8 @@ void c1_terminal_init(c1_terminal_session *session)
     memset(session, 0, sizeof(*session));
     session->master_fd = -1;
     session->child_pid = -1;
+    session->shell_pid = -1;
+    session->control_fd = -1;
     session->state = C1_TERMINAL_STOPPED;
 }
 
@@ -122,7 +130,8 @@ static int open_pty_master(char *slave_name, size_t capacity)
 static void child_exec(int master,
                        const char *slave_name,
                        unsigned int columns,
-                       unsigned int rows)
+                       unsigned int rows,
+                       const char *path, char *const argv[])
 {
     int slave;
     struct winsize window;
@@ -158,20 +167,95 @@ static void child_exec(int master,
     if (access("/usr/data", X_OK) == 0 && chdir("/usr/data") != 0 && chdir("/") != 0) {
         _exit(126);
     }
+    if (path != NULL) {
+        execv(path, argv);
+        _exit(127);
+    }
     execl("/bin/bash", "bash", "--noprofile", "--norc", "-i", (char *)NULL);
     (void)setenv("SHELL", "/bin/sh", 1);
     execl("/bin/sh", "sh", "-i", (char *)NULL);
     _exit(127);
 }
 
-c1_status c1_terminal_start(c1_terminal_session *session,
-                            unsigned int columns,
-                            unsigned int rows)
+static void session_child_changed(int signal_number)
+{
+    (void)signal_number;
+}
+
+static void supervise_terminal(int master, const char *slave_name,
+                               unsigned int columns, unsigned int rows,
+                               const char *path, char *const argv[],
+                               int control, int report)
+{
+    pid_t shell;
+    int status = 0;
+    bool exited = false;
+    sigset_t blocked, original;
+    struct sigaction action;
+    reset_signals();
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = session_child_changed;
+    action.sa_flags = SA_NOCLDSTOP;
+    sigemptyset(&action.sa_mask);
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    if (sigaction(SIGCHLD, &action, NULL) != 0 ||
+        sigprocmask(SIG_BLOCK, &blocked, &original) != 0) _exit(126);
+    c1_liveness_close();
+    {
+        DIR *fds = opendir("/proc/self/fd");
+        struct dirent *entry;
+        if (fds == NULL) _exit(126);
+        while ((entry = readdir(fds)) != NULL) {
+            char *end;
+            long fd = strtol(entry->d_name, &end, 10);
+            if (*end == '\0' && fd > STDERR_FILENO && fd != master &&
+                fd != control && fd != report && fd != dirfd(fds))
+                (void)close((int)fd);
+        }
+        (void)closedir(fds);
+    }
+    if (c1_descendants_adopt() != 0) _exit(126);
+    shell = fork();
+    if (shell < 0) _exit(126);
+    if (shell == 0) {
+        close(control);
+        close(report);
+        child_exec(master, slave_name, columns, rows, path, argv);
+    }
+    if (write(report, &shell, sizeof(shell)) != (ssize_t)sizeof(shell)) {
+        (void)c1_descendants_cleanup(C1_TERMINAL_STOP_GRACE_MS);
+        _exit(126);
+    }
+    close(report);
+    for (;;) {
+        struct pollfd command = {control, POLLIN, 0};
+        pid_t result = waitpid(shell, &status, WNOHANG);
+        if (result == shell) { exited = true; break; }
+        if (result < 0 && errno != EINTR) break;
+        {
+            int event = ppoll(&command, 1U, NULL, &original);
+            if (event > 0 || (event < 0 && errno != EINTR)) break;
+        }
+    }
+    /* Cleanup does not depend on shell survival or a foreground group leader.
+     * The subreaper owns every PID it signals, including detached grandchildren. */
+    (void)c1_descendants_cleanup(C1_TERMINAL_STOP_GRACE_MS);
+    close(master);
+    close(control);
+    _exit(exited && WIFEXITED(status) ? WEXITSTATUS(status) :
+          exited && WIFSIGNALED(status) ? 128 + WTERMSIG(status) : 0);
+}
+
+static c1_status start_session(c1_terminal_session *session,
+                               unsigned int columns, unsigned int rows,
+                               const char *path, char *const argv[])
 {
     char slave_name[64];
     int master;
     pid_t child;
     int flags;
+    int control[2], report[2];
 
     if (session == NULL || columns == 0U || rows == 0U || columns > UINT16_MAX ||
         rows > UINT16_MAX) {
@@ -181,23 +265,52 @@ c1_status c1_terminal_start(c1_terminal_session *session,
         return C1_STATUS_OK;
     }
     c1_terminal_stop(session);
+    if (session->child_pid > 0) return C1_STATUS_UNAVAILABLE;
     master = open_pty_master(slave_name, sizeof(slave_name));
     if (master < 0) {
         session->state = C1_TERMINAL_FAILED;
         return C1_STATUS_IO_ERROR;
     }
+    if (pipe2(control, O_CLOEXEC) != 0) {
+        close(master);
+        return C1_STATUS_IO_ERROR;
+    }
+    if (pipe2(report, O_CLOEXEC) != 0) {
+        close(master); close(control[0]); close(control[1]);
+        return C1_STATUS_IO_ERROR;
+    }
     child = fork();
     if (child < 0) {
-        close(master);
+        close(master); close(control[0]); close(control[1]);
+        close(report[0]); close(report[1]);
         session->state = C1_TERMINAL_FAILED;
         return C1_STATUS_IO_ERROR;
     }
     if (child == 0) {
-        child_exec(master, slave_name, columns, rows);
+        close(control[1]); close(report[0]);
+        supervise_terminal(master, slave_name, columns, rows, path, argv,
+                           control[0], report[1]);
     }
+    close(control[0]); close(report[1]);
+    {
+        ssize_t count;
+        do { count = read(report[0], &session->shell_pid, sizeof(session->shell_pid)); }
+        while (count < 0 && errno == EINTR);
+        close(report[0]);
+        if (count != (ssize_t)sizeof(session->shell_pid)) {
+            close(master); close(control[1]);
+            (void)kill(child, SIGKILL);
+            while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+            return C1_STATUS_IO_ERROR;
+        }
+    }
+    session->control_fd = control[1];
+    session->direct_exec = path != NULL;
     flags = fcntl(master, F_GETFL, 0);
     if (flags < 0 || fcntl(master, F_SETFL, flags | O_NONBLOCK) != 0) {
         close(master);
+        close(session->control_fd);
+        session->control_fd = -1;
         kill(child, SIGKILL);
         while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {
         }
@@ -212,6 +325,23 @@ c1_status c1_terminal_start(c1_terminal_session *session,
     session->pending_length = 0U;
     session->suspended = false;
     return C1_STATUS_OK;
+}
+
+c1_status c1_terminal_start(c1_terminal_session *session,
+                            unsigned int columns, unsigned int rows)
+{
+    return start_session(session, columns, rows, NULL, NULL);
+}
+
+c1_status c1_terminal_start_exec(c1_terminal_session *session,
+                                 unsigned int columns, unsigned int rows,
+                                 const char *path, char *const argv[])
+{
+    if (path == NULL || path[0] != '/' || argv == NULL || argv[0] == NULL)
+        return C1_STATUS_INVALID_ARGUMENT;
+    if (session == NULL || c1_terminal_is_running(session))
+        return C1_STATUS_INVALID_ARGUMENT;
+    return start_session(session, columns, rows, path, argv);
 }
 
 int c1_terminal_fd(const c1_terminal_session *session)
@@ -246,7 +376,7 @@ bool c1_terminal_shell_is_foreground(c1_terminal_session *session)
         return false;
     }
     foreground = tcgetpgrp(session->master_fd);
-    return foreground > 0 && foreground == session->child_pid;
+    return !session->direct_exec && foreground > 0 && foreground == session->shell_pid;
 }
 
 c1_terminal_state c1_terminal_get_state(c1_terminal_session *session)
@@ -383,42 +513,25 @@ c1_status c1_terminal_resume(c1_terminal_session *session, bool was_running)
 
 void c1_terminal_stop(c1_terminal_session *session)
 {
-    int64_t deadline;
-    pid_t foreground;
-
-    if (session == NULL) {
-        return;
-    }
-    reap_child(session, false);
-    if (session->child_pid <= 0) {
-        close_master(session);
-        if (session->state == C1_TERMINAL_RUNNING) {
-            session->state = C1_TERMINAL_STOPPED;
-        }
-        return;
-    }
-    foreground = session->master_fd >= 0 ? tcgetpgrp(session->master_fd) : -1;
-    if (foreground > 0) {
-        (void)kill(-foreground, SIGHUP);
-        (void)kill(-foreground, SIGCONT);
-    }
-    (void)kill(session->child_pid, SIGHUP);
+    int64_t now, deadline;
+    if (session == NULL) return;
+    /* Closing the control pipe asks the per-session subreaper to clean every
+     * descendant, even when the interactive shell already exited. */
     close_master(session);
-    deadline = monotonic_milliseconds() + C1_TERMINAL_STOP_GRACE_MS;
-    while (session->child_pid > 0 && monotonic_milliseconds() < deadline) {
+    now = monotonic_milliseconds();
+    deadline = now < 0 ? -1 : now + C1_TERMINAL_STOP_GRACE_MS + 1000;
+    while (session->child_pid > 0) {
         struct timespec pause = {0, 10000000L};
-
         reap_child(session, false);
-        if (session->child_pid > 0) {
-            (void)nanosleep(&pause, NULL);
+        if (session->child_pid <= 0) break;
+        now = monotonic_milliseconds();
+        if (deadline < 0 || now < 0 || now >= deadline) {
+            /* This is our unreaped child: the PID cannot have been reused. */
+            (void)kill(session->child_pid, SIGKILL);
+            reap_child(session, false);
+            break;
         }
-    }
-    if (session->child_pid > 0) {
-        if (foreground > 0) {
-            (void)kill(-foreground, SIGKILL);
-        }
-        (void)kill(session->child_pid, SIGKILL);
-        reap_child(session, true);
+        (void)nanosleep(&pause, NULL);
     }
     session->state = C1_TERMINAL_STOPPED;
     session->exit_code = 0;

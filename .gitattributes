@@ -1,0 +1,21 @@
+# Normalize source checkout line endings across Windows and Linux.
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.go text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.mk text eol=lf
+Makefile text eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.raw binary
+*.ttf binary
+*.otf binary
+*.gz binary
+*.zip binary
+*.pub binary

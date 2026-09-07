@@ -1,0 +1,24 @@
+#!/bin/sh
+# Optional Buildroot rootfs-overlay init hook. Starts checks, never installs apps.
+pidfile=/run/c1-update-check.pid
+script=/usr/data/c1/bin/c1-update-check
+running() {
+    [ -s "$pidfile" ] || return 1
+    pid=$(cat "$pidfile")
+    case "$pid" in ''|*[!0-9]*) return 1;; esac
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    tr '\000' '\n' < "/proc/$pid/cmdline" | grep -Fxq "$script"
+}
+case "${1:-}" in
+    start)
+        [ -x "$script" ] || exit 0
+        running && exit 0
+        /bin/busybox start-stop-daemon -S -b -m -p "$pidfile" -x /bin/sh -- "$script"
+        ;;
+    stop)
+        if running; then kill "$pid"; fi
+        rm -f "$pidfile"
+        ;;
+    restart) "$0" stop; "$0" start;;
+    *) echo "Usage: $0 start|stop|restart" >&2; exit 2;;
+esac

@@ -14,7 +14,7 @@ launcher=$bin_dir/app_daemon
 enabled=/usr/data/c1/enabled
 original_removed=/usr/data/c1/original-software-removed
 auto_suspend_disabled=/usr/data/c1/disable-auto-suspend
-suspend_probe_passed=/usr/data/c1/suspend-probe-passed
+core_enrolled=/usr/data/c1/update/enrolled.v1
 factory_app_dir=/usr/bin/d261
 factory_init_script=/etc/init.d/S80app
 staged_shim=/dev/shm/C1ancher-daemon.shim
@@ -305,40 +305,96 @@ write_manifest() {
     sync
 }
 
+# Keep this hardware policy aligned with the runtime and EXE device helper.
+auto_suspend_supported() {
+    [ -r /proc/cpuinfo ] &&
+    awk -F ':' '$1 ~ /^[ \t]*machine[ \t]*$/ {
+        value=$2; sub(/^[ \t]+/, "", value); sub(/[ \t]+$/, "", value)
+        count++; if (NF != 2 || value != "ingenic,halley6_v20") bad=1
+    } END { exit !(count == 1 && !bad) }' /proc/cpuinfo &&
+    [ -d /sys/devices/platform/mpenbatt ] &&
+    [ -r /sys/devices/platform/gpio_keys/power/wakeup ] &&
+    [ "$(cat /sys/devices/platform/gpio_keys/power/wakeup)" = enabled ] &&
+    [ -r /sys/power/state ] && [ -w /sys/power/state ] &&
+    grep -Eq '(^|[[:space:]])mem([[:space:]]|$)' /sys/power/state
+}
+
+validate_auto_suspend_path() {
+    checked=$auto_suspend_disabled
+    while [ "$checked" != / ]; do
+        [ ! -L "$checked" ] || { echo "unsafe automatic suspend path: $checked" >&2; return 1; }
+        checked=${checked%/*}; [ -n "$checked" ] || checked=/
+    done
+    if [ -e "$auto_suspend_disabled" ]; then
+        [ -f "$auto_suspend_disabled" ] && [ "$(stat -c %h "$auto_suspend_disabled")" = 1 ] || {
+            echo 'automatic suspend marker must be a single-link regular file' >&2
+            return 1
+        }
+    fi
+}
+
+validate_auto_suspend_request() {
+    validate_auto_suspend_path || return 1
+    case "$1" in
+        enabled)
+            auto_suspend_supported || {
+                echo 'automatic suspend requires supported C1-Slim hardware, enabled gpio_keys wakeup, and writable mem suspend' >&2
+                return 1
+            } ;;
+        default|disabled) ;;
+        *) echo "invalid automatic suspend mode: $1" >&2; return 1 ;;
+    esac
+}
+
 configure_auto_suspend() {
     mode=$1
+    validate_auto_suspend_request "$mode" || return 1
+    if [ "$mode" = default ]; then
+        # Unsupported hardware always fails closed, including updates/retries.
+        # On supported hardware preserve every existing disable preference.
+        if ! auto_suspend_supported; then
+            mode=disabled
+        elif [ -e "$auto_suspend_disabled" ] || [ -e "$enabled" ] || [ -e "$core_enrolled" ]; then
+            echo 'automatic_suspend=preserved'
+            return 0
+        else
+            mode=enabled
+        fi
+    fi
     case "$mode" in
-        enabled)
-            [ -f "$suspend_probe_passed" ] && grep -qx 'result=passed' "$suspend_probe_passed" || {
-                echo "automatic suspend requires a successful suspend/reconnect probe: $suspend_probe_passed" >&2
-                return 1
-            }
-            rm -f "$auto_suspend_disabled"
-            ;;
+        enabled) rm -f "$auto_suspend_disabled" ;;
         disabled)
-            temporary=$auto_suspend_disabled.new.$$
-            : > "$temporary"
-            chmod 600 "$temporary"
-            mv "$temporary" "$auto_suspend_disabled"
-            ;;
-        *)
-            echo "invalid automatic suspend mode: $mode" >&2
-            return 1
-            ;;
+            # Do not replace an existing user/legacy marker even on explicit disable.
+            if [ ! -e "$auto_suspend_disabled" ]; then
+                temporary=$auto_suspend_disabled.new.$$
+                (set -C; : > "$temporary") || return 1
+                chmod 600 "$temporary"
+                mv "$temporary" "$auto_suspend_disabled"
+            fi ;;
     esac
     sync
+    echo "automatic_suspend=$mode"
 }
 
 verify_auto_suspend() {
     mode=$1
+    validate_auto_suspend_request "$mode" || return 1
     case "$mode" in
-        enabled) [ ! -e "$auto_suspend_disabled" ] && [ -f "$suspend_probe_passed" ] && grep -qx 'result=passed' "$suspend_probe_passed" ;;
+        enabled) [ ! -e "$auto_suspend_disabled" ] ;;
         disabled) [ -f "$auto_suspend_disabled" ] ;;
+        default)
+            # Verification observes, never resolves a default by changing files.
+            [ -d /usr/data/c1 ] && {
+                [ -f "$auto_suspend_disabled" ] || auto_suspend_supported
+            } ;;
         *) return 1 ;;
     esac
 }
 
 install_default_app() {
+    # Reject an unsafe marker or unsupported explicit enable before any install
+    # mutation; configure_auto_suspend rechecks immediately before applying it.
+    validate_auto_suspend_request "${13:-default}" || return 1
     original_hash=$1
     shim_hash=$2
     app_hash=$3
@@ -505,19 +561,19 @@ neofetch_config_hash=${10:-}
 neofetch_license_hash=${11:-}
 neofetch_logo_hash=${12:-}
 previous_shim_hash=${13:-}
-auto_suspend_mode=${14:-}
+auto_suspend_mode=${14:-default}
 [ -n "$original_hash" ] && [ -n "$shim_hash" ] && [ -n "$app_hash" ] && [ -n "$launcher_hash" ] && [ -n "$pkg_hash" ] && [ -n "$public_key_hash" ] && [ -n "$neofetch_command_hash" ] && [ -n "$neofetch_upstream_hash" ] && [ -n "$neofetch_config_hash" ] && [ -n "$neofetch_license_hash" ] && [ -n "$neofetch_logo_hash" ] && [ -n "$previous_shim_hash" ] && [ -n "$auto_suspend_mode" ] || {
-    echo "usage: $0 {install|verify|remove-original} ORIGINAL_HASH SHIM_HASH APP_HASH LAUNCHER_HASH C1PKG_HASH REPOSITORY_PUBLIC_KEY_HASH NEOFETCH_COMMAND_HASH NEOFETCH_UPSTREAM_HASH NEOFETCH_CONFIG_HASH NEOFETCH_LICENSE_HASH NEOFETCH_LOGO_HASH PREVIOUS_SHIM_HASH {enabled|disabled}" >&2
+    echo "usage: $0 {install|verify|remove-original} ORIGINAL_HASH SHIM_HASH APP_HASH LAUNCHER_HASH C1PKG_HASH REPOSITORY_PUBLIC_KEY_HASH NEOFETCH_COMMAND_HASH NEOFETCH_UPSTREAM_HASH NEOFETCH_CONFIG_HASH NEOFETCH_LICENSE_HASH NEOFETCH_LOGO_HASH PREVIOUS_SHIM_HASH [default|enabled|disabled]" >&2
     exit 64
 }
-case "$auto_suspend_mode" in enabled|disabled) ;; *) echo "invalid automatic suspend mode: $auto_suspend_mode" >&2; exit 64 ;; esac
+case "$auto_suspend_mode" in default|enabled|disabled) ;; *) echo "invalid automatic suspend mode: $auto_suspend_mode" >&2; exit 64 ;; esac
 
 case "$action" in
     install) install_default_app "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$pkg_hash" "$public_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash" "$previous_shim_hash" "$auto_suspend_mode" ;;
     verify) verify_default_app "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" "$pkg_hash" "$public_key_hash" "$neofetch_command_hash" "$neofetch_upstream_hash" "$neofetch_config_hash" "$neofetch_license_hash" "$neofetch_logo_hash" "$auto_suspend_mode" ;;
     remove-original) remove_original_software "$original_hash" "$shim_hash" "$app_hash" "$launcher_hash" ;;
     *)
-        echo "usage: $0 {install|verify|remove-original} ORIGINAL_HASH SHIM_HASH APP_HASH LAUNCHER_HASH C1PKG_HASH REPOSITORY_PUBLIC_KEY_HASH NEOFETCH_COMMAND_HASH NEOFETCH_UPSTREAM_HASH NEOFETCH_CONFIG_HASH NEOFETCH_LICENSE_HASH NEOFETCH_LOGO_HASH PREVIOUS_SHIM_HASH {enabled|disabled}" >&2
+        echo "usage: $0 {install|verify|remove-original} ORIGINAL_HASH SHIM_HASH APP_HASH LAUNCHER_HASH C1PKG_HASH REPOSITORY_PUBLIC_KEY_HASH NEOFETCH_COMMAND_HASH NEOFETCH_UPSTREAM_HASH NEOFETCH_CONFIG_HASH NEOFETCH_LICENSE_HASH NEOFETCH_LOGO_HASH PREVIOUS_SHIM_HASH [default|enabled|disabled]" >&2
         exit 64
         ;;
 esac

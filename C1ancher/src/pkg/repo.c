@@ -1,7 +1,13 @@
 #include "pkg.h"
+#include "text.h"
+#include "storage_layout.h"
 #include "ed25519.h"
+#include "platform/repository_endpoint.h"
 
-#include <ctype.h>
+#include <time.h>
+#include <poll.h>
+#include <fcntl.h>
+#include <strings.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,25 +49,427 @@ static int make_url(char *url, size_t url_size, const char *base, const char *su
     return count >= 0 && (size_t)count < url_size ? 0 : -1;
 }
 
+int c1pkg_repo_read_url(const char *path, char *url, size_t url_size,
+                        char *error, size_t error_size)
+{
+    unsigned char *data = NULL;
+    size_t size = 0U;
+    if (url_size == 0U) return -1;
+    url[0] = '\0';
+    if (access(path, F_OK) != 0 && errno == ENOENT) return 0;
+    if (c1pkg_read_file(path, &data, &size, 1026U, error, error_size) != 0) return -1;
+    if (size > 0U && data[size - 1U] == '\n') --size;
+    if (size > 0U && data[size - 1U] == '\r') --size;
+    data[size] = '\0';
+    if (size >= url_size || strlen((char *)data) != size || !valid_url_base((char *)data)) {
+        free(data);
+        c1pkg_set_error(error, error_size, "invalid repository.url; configure repository URL");
+        return -1;
+    }
+    memcpy(url, data, size + 1U);
+    free(data);
+    return 0;
+}
+
+/* The package manager serializes transport calls. Keep a process-wide cooldown
+ * across metadata, packages, subsequent user actions, and the fixed IP alias.
+ * This is deliberately conservative for custom repositories too. No RPM quota
+ * is inferred: the server limits concurrent downloads and shared bandwidth. */
+#define C1PKG_AUTO_WAIT_MAX 3600U
+static uint64_t transport_not_before;
+
+static uint64_t monotonic_milliseconds(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0U;
+    return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
+}
+
+static void remember_cooldown(uint64_t seconds)
+{
+    uint64_t now = monotonic_milliseconds();
+    uint64_t until = seconds > (UINT64_MAX - now) / 1000U ? UINT64_MAX : now + seconds * 1000U;
+    if (until > transport_not_before) transport_not_before = until;
+}
+
+static int wait_for_cooldown(char *error, size_t error_size)
+{
+    uint64_t last_seconds = UINT64_MAX;
+    for (;;) {
+        uint64_t now = monotonic_milliseconds(), remaining, seconds;
+        char message[160];
+        if (now >= transport_not_before) return 0;
+        remaining = transport_not_before - now;
+        seconds = remaining / 1000U + (remaining % 1000U != 0U);
+        /* Refuse excessive waits instead of shortening the server's minimum.
+         * Keep the deadline so a later action cannot retry early either. */
+        if (seconds > C1PKG_AUTO_WAIT_MAX) {
+            c1pkg_set_error(error, error_size, "服务器要求等待 %llu 秒，超过自动等待上限，请稍后重试",
+                            (unsigned long long)seconds);
+            errno = EAGAIN;
+            return -1;
+        }
+        (void)snprintf(message, sizeof(message), "等待 %llu 秒后自动继续",
+                       (unsigned long long)seconds);
+        if (c1pkg_progress(seconds != last_seconds ? message : NULL) != 0) {
+            c1pkg_set_error(error, error_size, "操作已取消");
+            errno = ECANCELED;
+            return -1;
+        }
+        last_seconds = seconds;
+        if (poll(NULL, 0U, remaining < 100U ? (int)remaining : 100) < 0 && errno != EINTR) {
+            c1pkg_set_error(error, error_size, "等待失败：%s", strerror(errno));
+            return -1;
+        }
+    }
+}
+
+static int retry_wait(uint64_t seconds, char *error, size_t error_size)
+{
+    remember_cooldown(seconds);
+    return wait_for_cooldown(error, error_size);
+}
+
+/* Parse HTTP dates without timegm/strptime, locale, or 32-bit time_t overflow.
+ * Accept IMF-fixdate and the two obsolete HTTP date forms (RFC 9110). */
+static int http_date(const char *text, int64_t *timestamp)
+{
+    char weekday[10], month[4], zone[4], extra;
+    int day, year, hour, minute, second, m;
+    int64_t y, era, yoe, days;
+    static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    static const int lengths[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    if (sscanf(text, "%3[A-Za-z], %2d %3[A-Za-z] %4d %2d:%2d:%2d %3[A-Za-z]%c",
+               weekday, &day, month, &year, &hour, &minute, &second, zone, &extra) == 8) {
+        if (strcmp(zone, "GMT") != 0) return 0;
+    } else if (sscanf(text, "%9[A-Za-z], %2d-%3[A-Za-z]-%2d %2d:%2d:%2d %3[A-Za-z]%c",
+                      weekday, &day, month, &year, &hour, &minute, &second, zone, &extra) == 8) {
+        time_t now = time(NULL);
+        struct tm current;
+        if (year < 0 || strcmp(zone, "GMT") != 0 || gmtime_r(&now, &current) == NULL) return 0;
+        year += ((current.tm_year + 1900) / 100) * 100;
+        if (year > current.tm_year + 1950) year -= 100;
+    } else if (sscanf(text, "%3[A-Za-z] %3[A-Za-z] %2d %2d:%2d:%2d %4d%c",
+                      weekday, month, &day, &hour, &minute, &second, &year, &extra) != 7) {
+        return 0;
+    }
+    for (m = 0; m < 12 && strncmp(month, months + m * 3, 3U) != 0; ++m) {}
+    if (m == 12 || year < 1601 || day < 1 ||
+        day > lengths[m] + (m == 1 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) ||
+        hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) return 0;
+    y = year - (m < 2);
+    era = y / 400;
+    yoe = y - era * 400;
+    days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 +
+           (153 * (m + (m > 1 ? -2 : 10)) + 2) / 5 + day - 1 - 719468;
+    *timestamp = days * 86400 + hour * 3600 + minute * 60 + second;
+    return 1;
+}
+
+static int retry_after_seconds(const char *text, int64_t reference, uint64_t *seconds)
+{
+    const char *cursor = text;
+    uint64_t value = 0U;
+    int64_t date;
+    if (*cursor >= '0' && *cursor <= '9') {
+        for (; *cursor >= '0' && *cursor <= '9'; ++cursor) {
+            unsigned int digit = (unsigned int)(*cursor - '0');
+            value = value > (UINT64_MAX - digit) / 10U ? UINT64_MAX : value * 10U + digit;
+        }
+        if (*cursor != '\0') return 0;
+        *seconds = value;
+        return 1;
+    }
+    if (!http_date(text, &date)) return 0;
+    *seconds = date > reference ? (uint64_t)(date - reference) : 0U;
+    return 1;
+}
+
+/* Last response only: redirect and proxy CONNECT headers must not leak into
+ * the final result. Duplicate Retry-After values use the longest valid delay.
+ * Date provides the server clock reference when available (device RTCs may
+ * be wrong). Re-evaluate all values after Date, regardless of header order. */
+static int response_status(const char *path, uint64_t *seconds, int *has_retry_after)
+{
+    unsigned char *data = NULL;
+    size_t size = 0U;
+    char *line, *final = NULL;
+    size_t i;
+    int status = 0;
+    int64_t reference = (int64_t)time(NULL);
+    *seconds = 0U;
+    *has_retry_after = 0;
+    if (c1pkg_read_file(path, &data, &size, 65536U, NULL, 0U) != 0) return 0;
+    for (i = 0U; i < size; ++i) {
+        if (data[i] == '\r' || data[i] == '\n') data[i] = '\0';
+    }
+    for (line = (char *)data; line < (char *)data + size; line += strlen(line) + 1U) {
+        char *end = line + strlen(line);
+        while (end > line && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+        if (strncmp(line, "HTTP/", 5U) == 0) {
+            char *space = strchr(line, ' ');
+            status = space != NULL ? atoi(space + 1) : 0;
+            final = line;
+            reference = (int64_t)time(NULL);
+        } else if (strncasecmp(line, "Date:", 5U) == 0) {
+            char *value = line + 5U;
+            int64_t date;
+            while (*value == ' ' || *value == '\t') ++value;
+            if (http_date(value, &date)) reference = date;
+        }
+    }
+    if (final != NULL) {
+        char *end = (char *)data + size;
+        for (line = final; line < end; ++line) {
+            uint64_t delay;
+            char *value;
+            if (line != final && line[-1] != '\0') continue;
+            if (strncasecmp(line, "Retry-After:", 12U) != 0) continue;
+            value = line + 12U;
+            while (*value == ' ' || *value == '\t') ++value;
+            if (retry_after_seconds(value, reference, &delay)) {
+                if (delay > *seconds) *seconds = delay;
+                *has_retry_after = 1;
+            }
+        }
+    }
+    free(data);
+    return status;
+}
+
+static int transient_status(int status)
+{
+    return status == 408 || status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
+}
+
+static int transient_exit(int exit_code)
+{
+    return exit_code == 5 || exit_code == 6 || exit_code == 7 || exit_code == 18 ||
+           exit_code == 28 || exit_code == 52 || exit_code == 55 || exit_code == 56;
+}
+
+/* Private to the package transport; keep the public package API unchanged. */
+int c1pkg_run_bounded(char *const argv[], int output, uint64_t limit,
+                      uint64_t *received, int *exit_code, char *error, size_t error_size);
+
+/* Accept a single, numeric Content-Range in the final response only. Encoding
+ * changes and multipart/duplicate ranges are deliberately not resumable. */
+static int response_range(const char *path, uint64_t offset, uint64_t received,
+                          uint64_t limit, uint64_t *total)
+{
+    unsigned char *data = NULL;
+    size_t size = 0U;
+    char *line, *save = NULL;
+    unsigned int ranges = 0U;
+    int valid = 0, encoded = 0;
+    if (c1pkg_read_file(path, &data, &size, 65536U, NULL, 0U) != 0) return 0;
+    for (line = strtok_r((char *)data, "\r\n", &save); line != NULL;
+         line = strtok_r(NULL, "\r\n", &save)) {
+        if (strncmp(line, "HTTP/", 5U) == 0) {
+            ranges = 0U; valid = 0; encoded = 0;
+        } else if (strncasecmp(line, "Content-Range:", 14U) == 0) {
+            unsigned long long first, last, length;
+            char extra;
+            char *value = line + 14U;
+            ++ranges;
+            while (*value == ' ' || *value == '\t') ++value;
+            /* Bound decimal fields before sscanf, which otherwise accepts signs
+             * and has implementation-defined overflow handling. */
+            if (strncmp(value, "bytes ", 6U) == 0) {
+                char *cursor = value + 6U;
+                unsigned int field;
+                int numbers = 1;
+                for (field = 0U; field < 3U; ++field) {
+                    uint64_t number = 0U;
+                    char *start = cursor;
+                    while (*cursor >= '0' && *cursor <= '9') {
+                        unsigned int digit = (unsigned int)(*cursor++ - '0');
+                        if (number > (UINT64_MAX - digit) / 10U) { numbers = 0; break; }
+                        number = number * 10U + digit;
+                    }
+                    if (!numbers || cursor == start ||
+                        (field == 0U && *cursor != '-') ||
+                        (field == 1U && *cursor != '/') ||
+                        (field == 2U && *cursor != '\0')) { numbers = 0; break; }
+                    if (field < 2U) ++cursor;
+                }
+                if (numbers && sscanf(value, "bytes %llu-%llu/%llu%c", &first, &last, &length, &extra) == 3 &&
+                    first == offset && last >= first && last < length && length <= limit &&
+                    received <= last - first + 1U) {
+                    *total = (uint64_t)length;
+                    valid = 1;
+                }
+            }
+        } else if (strncasecmp(line, "Content-Encoding:", 17U) == 0) {
+            char *value = line + 17U;
+            while (*value == ' ' || *value == '\t') ++value;
+            if (strcasecmp(value, "identity") != 0) encoded = 1;
+        }
+    }
+    free(data);
+    return valid && ranges == 1U && !encoded;
+}
+
+/* Four attempts per endpoint. Metadata gets 45 seconds of network time per
+ * attempt; packages get 600 seconds (including the server's 120-second queue).
+ * Cooldown is separate, so a valid Retry-After is never cut short by a network
+ * timeout. Resume is confined to this call's unpublished temporary file.
+ * -2: local I/O, cancellation, size violation; -3: server cooldown/retry limit.
+ * Neither may be hidden by switching to the same server's fixed IP alias. */
+static int fetch_endpoint(const char *url, const char *output, uint64_t limit,
+                          uint64_t metadata, char *error, size_t error_size)
+{
+    const char *curl = c1pkg_helper("/usr/bin/curl", "curl");
+    char headers[C1PKG_PATH_MAX];
+    char timeout[32] = "600", range[64];
+    char *arguments[] = {(char *)curl, "--disable", "--fail", "--location", "--proto", "=http,https",
+                         "--proto-redir", strncmp(url, "http://", 7U) == 0 ? "=http" : "=http,https",
+                         "--max-redirs", "3", "--connect-timeout", "15", "--max-time", timeout,
+                         "--speed-limit", "1024", "--speed-time", "180",
+                         "--dump-header", headers, "--silent", "--show-error",
+                         "--header", "Accept-Encoding: identity", "--output", "-",
+                         NULL, NULL, NULL, NULL};
+    const size_t tail = sizeof(arguments) / sizeof(arguments[0]) - 4U;
+    struct stat information;
+    uint64_t offset = 0U;
+    unsigned int attempt;
+    int result = -1, descriptor = -1, header_fd = -1, headers_created = 0, saved_errno = 0;
+    int length = snprintf(headers, sizeof(headers), "%s.headers.XXXXXX", output);
+    if (length < 0 || (size_t)length >= sizeof(headers)) {
+        c1pkg_set_error(error, error_size, "下载路径过长");
+        errno = ENAMETOOLONG;
+        return -2;
+    }
+    /* The caller supplies an installation temporary path, never a live package. */
+    descriptor = open(output, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+    if (descriptor < 0) goto io_failed;
+    if (fstat(descriptor, &information) != 0) goto io_failed;
+    if (!S_ISREG(information.st_mode) || information.st_nlink != 1) { errno = EINVAL; goto io_failed; }
+    if (ftruncate(descriptor, 0) != 0) goto io_failed;
+    header_fd = mkstemp(headers);
+    if (header_fd < 0) goto io_failed;
+    headers_created = 1;
+    (void)close(header_fd);
+    for (attempt = 0U; attempt < 4U; ++attempt) {
+        uint64_t seconds, received = 0U, total = 0U;
+        char stage[192];
+        const char *action = metadata != 0U ? "正在检查软件仓库" :
+                             offset != 0U ? "正在继续下载软件包" :
+                             "正在下载软件包";
+        int transfer, exit_code, status, transfer_errno, has_retry_after;
+        if (wait_for_cooldown(error, error_size) != 0) {
+            saved_errno = errno; result = saved_errno == EAGAIN ? -3 : -2; break;
+        }
+        (void)snprintf(timeout, sizeof(timeout), "%u", metadata != 0U ? 45U : 600U);
+        (void)snprintf(stage, sizeof(stage), "第 %u/4 次尝试：%s", attempt + 1U, action);
+        if (c1pkg_progress(stage) != 0) {
+            c1pkg_set_error(error, error_size, "操作已取消");
+            saved_errno = ECANCELED; result = -2; break;
+        }
+        if (offset != 0U) {
+            (void)snprintf(range, sizeof(range), "%llu-", (unsigned long long)offset);
+            arguments[tail] = "--range"; arguments[tail + 1U] = range;
+            arguments[tail + 2U] = (char *)url; arguments[tail + 3U] = NULL;
+        } else {
+            arguments[tail] = (char *)url; arguments[tail + 1U] = NULL;
+        }
+        /* Clear old headers even when exec fails before curl opens the file. */
+        header_fd = open(headers, O_WRONLY | O_TRUNC | O_CLOEXEC | O_NOFOLLOW);
+        if (header_fd < 0) goto io_failed;
+        (void)close(header_fd);
+        transfer = c1pkg_run_bounded(arguments, descriptor, limit - offset, &received,
+                                     &exit_code, error, error_size);
+        transfer_errno = errno;
+        status = response_status(headers, &seconds, &has_retry_after);
+        /* Every response can constrain the next request, including a successful
+         * index immediately followed by its signature. Headerless transient
+         * failures back off 5/10/20/30 seconds; other responses leave a modest
+         * one-second client pacing interval, not an assumed server quota. */
+        if (!has_retry_after) {
+            seconds = transient_status(status) || (transfer != 0 && transient_exit(exit_code)) ?
+                      (attempt < 3U ? 5U << attempt : 30U) : 1U;
+        }
+        if (seconds == 0U) seconds = 1U; /* Avoid tight loops for Retry-After: 0. */
+        remember_cooldown(seconds);
+        if (transfer == -2 && transfer_errno != EFBIG) {
+            saved_errno = transfer_errno; result = -2; break;
+        }
+        if (offset != 0U && (status == 200 || status == 416)) {
+            /* Ignored Range and stale offsets are restart signals, never append
+             * success. Discard every provisional byte before the fresh request. */
+            offset = 0U;
+            if (ftruncate(descriptor, 0) != 0 || lseek(descriptor, 0, SEEK_SET) < 0) goto io_failed;
+            c1pkg_set_error(error, error_size, "服务器不支持断点续传，已达到自动重试上限");
+            continue;
+        }
+        if (transfer == -2) { saved_errno = transfer_errno; result = -2; break; }
+        if (transient_status(status) || (status == 0 && transfer != 0 && transient_exit(exit_code))) {
+            if (ftruncate(descriptor, (off_t)offset) != 0 || lseek(descriptor, (off_t)offset, SEEK_SET) < 0) goto io_failed;
+            if (attempt == 3U) {
+                c1pkg_set_error(error, error_size, "服务器或网络暂不可用，已达到自动重试上限，请稍后重试");
+                if (status == 429 || status == 503 || has_retry_after) {
+                    saved_errno = EAGAIN; result = -3;
+                }
+                break;
+            }
+            continue;
+        }
+        if ((offset == 0U && status != 200) ||
+            (offset != 0U && (status != 206 || !response_range(headers, offset, received, limit, &total)))) {
+            c1pkg_set_error(error, error_size, "仓库 HTTP 响应或下载范围无效：%d", status);
+            break;
+        }
+        offset += received;
+        if (transfer == 0 && (status == 200 || offset == total)) {
+            if (fsync(descriptor) != 0) goto io_failed;
+            if (error != NULL && error_size != 0U) error[0] = '\0';
+            result = 0; break;
+        }
+        /* Only transient transport errors are retried. Metadata always starts
+         * afresh; packages retain only a validated prefix from this invocation. */
+        if ((transfer != 0 && !transient_exit(exit_code)) || offset >= limit) break;
+        c1pkg_set_error(error, error_size, "下载中断，已达到自动重试上限，请稍后重试");
+        if (metadata != 0U) {
+            offset = 0U;
+            if (ftruncate(descriptor, 0) != 0 || lseek(descriptor, 0, SEEK_SET) < 0) goto io_failed;
+        }
+    }
+    goto done;
+io_failed:
+    saved_errno = errno;
+    result = -2;
+    c1pkg_set_error(error, error_size, "下载文件读写失败：%s", strerror(saved_errno));
+done:
+    if (descriptor >= 0 && close(descriptor) != 0 && result == 0) {
+        saved_errno = errno; result = -2;
+        c1pkg_set_error(error, error_size, "关闭下载文件失败：%s", strerror(saved_errno));
+    }
+    if (headers_created) (void)unlink(headers);
+    if (result != 0 && descriptor >= 0) (void)unlink(output);
+    errno = saved_errno;
+    return result;
+}
+
 int c1pkg_fetch(const char *url, const char *output, uint64_t limit,
                 char *error, size_t error_size)
 {
-    const char *curl = c1pkg_helper("/usr/bin/curl", "curl");
-    char *arguments[] = {(char *)curl, "--fail", "--location", "--proto", "=http,https",
-                         "--max-redirs", "3", "--connect-timeout", "15", "--max-time", "180",
-                         "--silent", "--show-error", "--output", "-", (char *)url, NULL};
-    struct stat information;
-
-    if (c1pkg_run(arguments, output, limit, error, error_size) != 0) {
+    char fallback[1400];
+    int result;
+    if (!valid_url_base(url)) {
+        c1pkg_set_error(error, error_size, "仓库下载地址无效");
         return -1;
     }
-    if (stat(output, &information) != 0 || information.st_size < 0 ||
-        (uint64_t)information.st_size > limit) {
-        c1pkg_set_error(error, error_size, "download exceeded size limit");
-        (void)unlink(output);
+    result = fetch_endpoint(url, output, limit, 0U, error, error_size);
+    if (result == 0) return 0;
+    if (result == -2 || result == -3) return -1;
+    if (c1pkg_progress(NULL) != 0) {
+        c1pkg_set_error(error, error_size, "操作已取消");
+        errno = ECANCELED;
         return -1;
     }
-    return 0;
+    if (!c1_repository_fallback_url(url, fallback, sizeof(fallback))) return -1;
+    result = fetch_endpoint(fallback, output, limit, 0U, error, error_size);
+    return result == 0 ? 0 : -1;
 }
 
 static int verify_key(const char *key, unsigned char public_key[32],
@@ -144,19 +552,7 @@ static int parse_u64(const char *text, uint64_t *value)
 
 static int valid_name(const char *name)
 {
-    size_t i;
-    size_t length = strlen(name);
-
-    if (length == 0U || length > C1PKG_NAME_MAX || name[0] == ' ' || name[length - 1U] == ' ') {
-        return 0;
-    }
-    for (i = 0U; i < length; ++i) {
-        unsigned char character = (unsigned char)name[i];
-        if (character < 0x20U || character > 0x7eU || character == (unsigned char)'\t') {
-            return 0;
-        }
-    }
-    return 1;
+    return c1pkg_valid_label(name);
 }
 
 static int valid_sha256(const char *digest)
@@ -175,10 +571,10 @@ static int valid_sha256(const char *digest)
     return 1;
 }
 
-static int parse_package_line(char *line, struct c1pkg_package *package,
+static int parse_package_line(char *line, struct c1pkg_package *package, int format,
                               char *error, size_t error_size)
 {
-    char *fields[8];
+    char *fields[9];
     size_t field = 0U;
     char *cursor;
 
@@ -193,7 +589,9 @@ static int parse_package_line(char *line, struct c1pkg_package *package,
             fields[field++] = cursor + 1;
         }
     }
-    if (field != 8U || strcmp(fields[0], "P") != 0 || !c1pkg_safe_id(fields[1]) ||
+    if (field != (format == 2 ? 9U : 8U) ||
+        (format == 2 && !valid_name(fields[8])) ||
+        strcmp(fields[0], "P") != 0 || !c1pkg_safe_id(fields[1]) ||
         !c1pkg_safe_version(fields[2]) || !valid_name(fields[3]) ||
         !c1pkg_safe_relpath(fields[4]) || !valid_sha256(fields[5]) ||
         parse_u64(fields[6], &package->size) != 0 || package->size == 0U ||
@@ -204,25 +602,29 @@ static int parse_package_line(char *line, struct c1pkg_package *package,
     (void)strcpy(package->id, fields[1]);
     (void)strcpy(package->version, fields[2]);
     (void)strcpy(package->name, fields[3]);
+    (void)strcpy(package->author, format == 2 ? fields[8] : "Unknown");
     (void)strcpy(package->archive, fields[4]);
     (void)strcpy(package->sha256, fields[5]);
     (void)strcpy(package->entry, fields[7]);
     return 0;
 }
 
-static int parse_index_file(const char *path, struct c1pkg_index *index,
+static int parse_index_data(const unsigned char *input, size_t size, struct c1pkg_index *index,
                             char *error, size_t error_size)
 {
     unsigned char *data = NULL;
-    size_t size = 0U;
     size_t offset = 0U;
     size_t line_number = 0U;
+    int format = 1;
 
     index->sequence = 0U;
     index->count = 0U;
-    if (c1pkg_read_file(path, &data, &size, C1PKG_INDEX_MAX, error, error_size) != 0) {
+    if (input == NULL || size > C1PKG_INDEX_MAX || (data = malloc(size + 1U)) == NULL) {
+        c1pkg_set_error(error, error_size, "invalid index size or out of memory");
         return -1;
     }
+    memcpy(data, input, size);
+    data[size] = 0U;
     if (size == 0U || data[size - 1U] != (unsigned char)'\n') {
         c1pkg_set_error(error, error_size, "index must end with LF");
         free(data);
@@ -248,7 +650,9 @@ static int parse_index_file(const char *path, struct c1pkg_index *index,
         line = (char *)(data + offset);
         ++line_number;
         if (line_number == 1U) {
-            if (strcmp(line, C1PKG_INDEX_HEADER) != 0) {
+            if (strcmp(line, "C1PKG-INDEX 2") == 0) {
+                format = 2;
+            } else if (strcmp(line, C1PKG_INDEX_HEADER) != 0) {
                 c1pkg_set_error(error, error_size, "unsupported index header");
                 free(data);
                 return -1;
@@ -268,7 +672,7 @@ static int parse_index_file(const char *path, struct c1pkg_index *index,
                 return -1;
             }
             package = &index->packages[index->count];
-            if (parse_package_line(line, package, error, error_size) != 0 ||
+            if (parse_package_line(line, package, format, error, error_size) != 0 ||
                 (index->count > 0U && strcmp(index->packages[index->count - 1U].id,
                                              package->id) >= 0)) {
                 if (error != NULL && error[0] == '\0') {
@@ -282,7 +686,39 @@ static int parse_index_file(const char *path, struct c1pkg_index *index,
         offset = end + 1U;
     }
     free(data);
+    if (line_number < 2U || index->sequence == 0U) {
+        c1pkg_set_error(error, error_size, "missing repository sequence");
+        return -1;
+    }
     return 0;
+}
+
+int c1pkg_repo_parse(const unsigned char *data, size_t size, struct c1pkg_index *index,
+                     char *error, size_t error_size)
+{
+    struct c1pkg_index *candidate = calloc(1U, sizeof(*candidate));
+    int result;
+    if (index == NULL || candidate == NULL) {
+        free(candidate);
+        c1pkg_set_error(error, error_size, "missing index or out of memory");
+        return -1;
+    }
+    result = parse_index_data(data, size, candidate, error, error_size);
+    if (result == 0) *index = *candidate;
+    free(candidate);
+    return result;
+}
+
+static int parse_index_file(const char *path, struct c1pkg_index *index,
+                            char *error, size_t error_size)
+{
+    unsigned char *data = NULL;
+    size_t size = 0U;
+    int result;
+    if (c1pkg_read_file(path, &data, &size, C1PKG_INDEX_MAX, error, error_size) != 0) return -1;
+    result = c1pkg_repo_parse(data, size, index, error, error_size);
+    free(data);
+    return result;
 }
 
 const struct c1pkg_package *c1pkg_repo_find(const struct c1pkg_index *index,
@@ -312,7 +748,7 @@ static int load_highest_sequence(uint64_t *sequence, char *error, size_t error_s
         return 0;
     }
     if (c1pkg_read_file(path, &data, &size, 32U, error, error_size) != 0 ||
-        size < 2U || data[size - 1U] != (unsigned char)'\n') {
+        size < 2U || memchr(data, '\0', size) != NULL || data[size - 1U] != (unsigned char)'\n') {
         free(data);
         c1pkg_set_error(error, error_size, "stored repository sequence is invalid");
         return -1;
@@ -350,83 +786,174 @@ static int store_highest_sequence(uint64_t sequence, char *error, size_t error_s
         (void)unlink(temporary);
         return -1;
     }
-    return 0;
+    return c1pkg_sync_directory(C1PKG_STATE_ROOT, error, error_size);
 }
 
 int c1pkg_repo_load_cached(const struct c1pkg_config *config, struct c1pkg_index *index,
                            char *error, size_t error_size)
 {
-    char path[C1PKG_PATH_MAX];
-    char signature[C1PKG_PATH_MAX];
-    if (c1pkg_join(path, sizeof(path), C1PKG_STATE_ROOT, "cache/index.v1") != 0 ||
-        c1pkg_join(signature, sizeof(signature), C1PKG_STATE_ROOT,
-                   "cache/index.v1.sig") != 0) {
-        c1pkg_set_error(error, error_size, "cache path is too long");
-        return -1;
+    unsigned char *data = NULL;
+    unsigned char key[32];
+    size_t size = 0U;
+    uint64_t highest = 0U;
+    struct c1pkg_index *candidate = calloc(1U, sizeof(*candidate));
+    int result = -1;
+    if (candidate == NULL || config == NULL || index == NULL) goto done;
+    if (access(C1PKG_STATE_ROOT "/cache/verified.v1", F_OK) != 0 && errno == ENOENT) {
+        /* Migrate legacy caches only after re-verification and rollback checking. */
+        if (verify_signature(config->public_key, C1PKG_STATE_ROOT "/cache/index.v1.sig",
+                              C1PKG_STATE_ROOT "/cache/index.v1", error, error_size) != 0 ||
+            parse_index_file(C1PKG_STATE_ROOT "/cache/index.v1", candidate,
+                              error, error_size) != 0) goto done;
+    } else {
+        if (verify_key(config->public_key, key, error, error_size) != 0 ||
+            c1pkg_read_file(C1PKG_STATE_ROOT "/cache/verified.v1", &data, &size,
+                            C1PKG_INDEX_MAX + 64U, error, error_size) != 0) goto done;
+        if (size <= 64U || ed25519_verify(data, data + 64U, size - 64U, key) != 1) {
+            c1pkg_set_error(error, error_size, "cached repository signature rejected");
+            goto done;
+        }
+        if (c1pkg_repo_parse(data + 64U, size - 64U, candidate, error, error_size) != 0) goto done;
     }
-    if (verify_signature(config->public_key, signature, path, error, error_size) != 0) {
-        return -1;
+    if (load_highest_sequence(&highest, error, error_size) != 0) goto done;
+    if (candidate->sequence < highest) {
+        c1pkg_set_error(error, error_size, "cached repository rollback rejected");
+        goto done;
     }
-    return parse_index_file(path, index, error, error_size);
+    *index = *candidate;
+    result = 0;
+done:
+    free(data);
+    free(candidate);
+    return result;
 }
 
 int c1pkg_repo_refresh(const struct c1pkg_config *config, struct c1pkg_index *index,
                        char *error, size_t error_size)
 {
-    char cache[C1PKG_PATH_MAX];
-    char index_tmp[C1PKG_PATH_MAX];
-    char signature_tmp[C1PKG_PATH_MAX];
-    char index_final[C1PKG_PATH_MAX];
-    char signature_final[C1PKG_PATH_MAX];
-    char url[1400];
+    const char *cache = C1PKG_STATE_ROOT "/cache";
+    const char *index_tmp = C1PKG_STATE_ROOT "/cache/index.tmp";
+    const char *signature_tmp = C1PKG_STATE_ROOT "/cache/signature.tmp";
+    const char *bundle_tmp = C1PKG_STATE_ROOT "/cache/verified.tmp";
+    unsigned char *data = NULL;
+    unsigned char *signature = NULL;
+    unsigned char *bundle = NULL;
+    size_t size = 0U, signature_size = 0U;
+    char url[1400], normalized[1400], fallback[1400];
+    const char *bases[2];
+    unsigned char trusted_key[32];
+    unsigned int endpoint, endpoint_count = 1U;
+    int verified = 0;
     uint64_t highest_sequence = 0U;
+    struct c1pkg_index *candidate = NULL;
+    struct flock operation;
+    int lock = -1;
+    unsigned int attempt;
     int result = -1;
 
-    if (config == NULL || !valid_url_base(config->repo_base) ||
-        c1pkg_store_init(error, error_size) != 0 ||
-        c1pkg_join(cache, sizeof(cache), C1PKG_STATE_ROOT, "cache") != 0 ||
-        c1pkg_mkdir_p(cache, 0700, error, error_size) != 0) {
-        if (error != NULL && error[0] == '\0') {
-            c1pkg_set_error(error, error_size, "invalid repository base URL");
+    if (config == NULL || !valid_url_base(config->repo_base)) {
+        c1pkg_set_error(error, error_size, "Configure repository.url or --repo URL");
+        return -1;
+    }
+    if (index == NULL || c1pkg_storage_state_init(error, error_size) != 0 ||
+        c1pkg_mkdir_p(cache, 0700, error, error_size) != 0) return -1;
+    lock = open(C1PKG_STATE_ROOT "/repo.lock", O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    memset(&operation, 0, sizeof(operation));
+    operation.l_type = F_WRLCK;
+    operation.l_whence = SEEK_SET;
+    if (lock < 0 || fcntl(lock, F_SETLK, &operation) != 0) {
+        if (lock >= 0) (void)close(lock);
+        c1pkg_set_error(error, error_size, "another repository refresh is in progress");
+        return -1;
+    }
+    candidate = calloc(1U, sizeof(*candidate));
+    if (candidate == NULL) {
+        c1pkg_set_error(error, error_size, "out of memory");
+        goto done;
+    }
+    if (verify_key(config->public_key, trusted_key, error, error_size) != 0 ||
+        load_highest_sequence(&highest_sequence, error, error_size) != 0) goto done;
+    bases[0] = config->repo_base;
+    if (make_url(normalized, sizeof(normalized), config->repo_base, "") == 0 &&
+        c1_repository_fallback_url(normalized, fallback, sizeof(fallback))) {
+        bases[endpoint_count++] = fallback;
+    }
+    for (endpoint = 0U; endpoint < endpoint_count && !verified; ++endpoint) {
+        /* Never combine an index from one origin with another origin's signature.
+         * Retry publication races, then try the fixed alternate with a fresh pair.
+         * Network timeouts apply per transfer, never to server cooldown waits. */
+        for (attempt = 0U; attempt < 3U; ++attempt) {
+            (void)unlink(index_tmp);
+            (void)unlink(signature_tmp);
+            if (c1pkg_progress(NULL) != 0) {
+                c1pkg_set_error(error, error_size, "操作已取消");
+                errno = ECANCELED;
+                goto done;
+            }
+            if (error != NULL && error_size != 0U) error[0] = '\0';
+            {
+                int fetched;
+                if (make_url(url, sizeof(url), bases[endpoint], "index.v1") != 0) break;
+                fetched = fetch_endpoint(url, index_tmp, C1PKG_INDEX_MAX, 1U, error, error_size);
+                if (fetched == -2 || fetched == -3) goto done;
+                if (fetched != 0 || make_url(url, sizeof(url), bases[endpoint], "index.v1.sig") != 0) break;
+                fetched = fetch_endpoint(url, signature_tmp, 64U, 1U, error, error_size);
+                if (fetched == -2 || fetched == -3) goto done;
+                if (fetched != 0) break;
+            }
+            if (verify_signature(config->public_key, signature_tmp, index_tmp, error, error_size) == 0 &&
+                parse_index_file(index_tmp, candidate, error, error_size) == 0) {
+                if (candidate->sequence >= highest_sequence) {
+                    verified = 1;
+                    break;
+                }
+                c1pkg_set_error(error, error_size, "repository rollback rejected: sequence %llu is below %llu",
+                                (unsigned long long)candidate->sequence,
+                                (unsigned long long)highest_sequence);
+                break;
+            }
+            if (attempt == 2U) break;
+            if (retry_wait(1U, error, error_size) != 0) goto done;
         }
-        return -1;
+        if (c1pkg_progress(NULL) != 0) {
+            c1pkg_set_error(error, error_size, "操作已取消");
+            errno = ECANCELED;
+            goto done;
+        }
     }
-    if (snprintf(index_tmp, sizeof(index_tmp), "%s/index.%ld.tmp", cache, (long)getpid()) < 0 ||
-        snprintf(signature_tmp, sizeof(signature_tmp), "%s/index.%ld.sig.tmp", cache,
-                 (long)getpid()) < 0 ||
-        c1pkg_join(index_final, sizeof(index_final), cache, "index.v1") != 0 ||
-        c1pkg_join(signature_final, sizeof(signature_final), cache, "index.v1.sig") != 0) {
-        c1pkg_set_error(error, error_size, "cache path is too long");
-        return -1;
-    }
-    (void)unlink(index_tmp);
-    (void)unlink(signature_tmp);
-    if (make_url(url, sizeof(url), config->repo_base, "index.v1") != 0 ||
-        c1pkg_fetch(url, index_tmp, C1PKG_INDEX_MAX, error, error_size) != 0 ||
-        make_url(url, sizeof(url), config->repo_base, "index.v1.sig") != 0 ||
-        c1pkg_fetch(url, signature_tmp, 65536U, error, error_size) != 0 ||
-        verify_signature(config->public_key, signature_tmp, index_tmp, error, error_size) != 0 ||
-        parse_index_file(index_tmp, index, error, error_size) != 0 ||
-        load_highest_sequence(&highest_sequence, error, error_size) != 0) {
-        goto done;
-    }
-    if (index->sequence < highest_sequence) {
-        c1pkg_set_error(error, error_size,
-                        "repository rollback rejected: sequence %llu is below %llu",
-                        (unsigned long long)index->sequence,
-                        (unsigned long long)highest_sequence);
-        goto done;
-    }
-    if (rename(signature_tmp, signature_final) != 0 || rename(index_tmp, index_final) != 0 ||
-        (index->sequence > highest_sequence &&
-         store_highest_sequence(index->sequence, error, error_size) != 0)) {
+    if (!verified) goto done;
+    if (c1pkg_read_file(index_tmp, &data, &size, C1PKG_INDEX_MAX, error, error_size) != 0 ||
+        c1pkg_read_file(signature_tmp, &signature, &signature_size, 64U, error, error_size) != 0 ||
+        signature_size != 64U || (bundle = malloc(size + 64U)) == NULL) goto done;
+    memcpy(bundle, signature, 64U);
+    memcpy(bundle + 64U, data, size);
+    (void)unlink(bundle_tmp);
+    if (c1pkg_write_file(bundle_tmp, bundle, size + 64U, 0600, error, error_size) != 0 ||
+        (candidate->sequence > highest_sequence &&
+         store_highest_sequence(candidate->sequence, error, error_size) != 0)) goto done;
+    /* A single atomic file contains signature + signed bytes. Persist the rollback
+     * floor first: after interrupted commits an older cache fails closed. */
+    if (rename(bundle_tmp, C1PKG_STATE_ROOT "/cache/verified.v1") != 0) {
         c1pkg_set_error(error, error_size, "commit verified index: %s", strerror(errno));
         goto done;
     }
+    if (c1pkg_sync_directory(cache, error, error_size) != 0) goto done;
+    *index = *candidate;
+    if (error != NULL && error_size != 0U) error[0] = '\0';
     result = 0;
 done:
-    (void)unlink(index_tmp);
-    (void)unlink(signature_tmp);
+    {
+        int saved_errno = errno;
+        (void)unlink(index_tmp);
+        (void)unlink(signature_tmp);
+        (void)unlink(bundle_tmp);
+        free(candidate);
+        free(data);
+        free(signature);
+        free(bundle);
+        (void)close(lock);
+        errno = saved_errno;
+    }
     return result;
 }
 
@@ -441,7 +968,7 @@ int c1pkg_verify_sha256(const char *path, const char *expected,
     int result = -1;
 
     if (!valid_sha256(expected) ||
-        snprintf(output, sizeof(output), "%s/staging/digest.%ld", C1PKG_STATE_ROOT,
+        snprintf(output, sizeof(output), "%s.digest.%ld", path,
                  (long)getpid()) < 0) {
         c1pkg_set_error(error, error_size, "invalid expected SHA-256");
         return -1;
@@ -449,7 +976,11 @@ int c1pkg_verify_sha256(const char *path, const char *expected,
     (void)unlink(output);
     if (c1pkg_run(arguments, output, 4096U, error, error_size) != 0 ||
         c1pkg_read_file(output, &data, &size, 4096U, error, error_size) != 0) {
-        c1pkg_set_error(error, error_size, "SHA-256 verification unavailable (sha256sum required)");
+        if (c1pkg_progress(NULL) != 0) {
+            c1pkg_set_error(error, error_size, "Cancelled");
+        } else {
+            c1pkg_set_error(error, error_size, "SHA-256 verification unavailable (sha256sum required)");
+        }
         goto done;
     }
     if (size < 66U || memcmp(data, expected, 64U) != 0 || data[64] != (unsigned char)' ') {

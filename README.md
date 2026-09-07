@@ -1,0 +1,46 @@
+# C1ancher：C1-Slim 设备端与应用开发
+
+这里集中维护 C1-Slim / MP-D261 的设备端核心和普通应用源码，目的是让开发者能阅读实现、编译自己的程序，并通过发布工具把应用上传到现有软件仓库。
+
+**开发普通应用不需要搭建服务器，也不需要服务器源码、SSH 密码或签名私钥。**
+
+## 从这里开始
+
+1. 阅读 [设备应用开发入门](docs/app-development.md)。
+2. 从 [最小 C 应用](examples/hello/README.md) 开始，或参考下面的完整应用。
+3. 从 [开发者工具 Release](https://github.com/fwz233-RE/C1ancher/releases/tag/developer-kit-20260907) 下载 `C1Slim-Publisher-20260907.zip`，解压后保留整个目录。
+4. 按 [打包与发布说明](docs/publishing.md) 上传应用。用户在设备 APP 列表刷新后自行下载安装。
+
+## 源码目录
+
+- [`C1ancher/`](C1ancher/README.md)：主界面、启动器、应用包管理、保活守护、核心更新、安装器和测试。
+- [`App/hello/`](App/hello/README.md)：Go 屏幕与按键示例；[`App/c1device/`](App/c1device/README.md) 提供共用设备接口。
+- [`App/book-reader/`](App/book-reader/README.md)：阅读器。
+- [`App/music-player/`](App/music-player/README.md)：音乐播放器。
+- [`App/pic/`](App/pic/README.md)：图片浏览器。
+- [`Pinao/`](Pinao/README.md)：钢琴应用；保留原目录拼写。
+- [`ChiChuGames/`](ChiChuGames/README.md)：游戏应用。
+- [`examples/hello/`](examples/hello/README.md)：不依赖其他项目的终端应用示例。
+- [`tools/publisher/`](tools/publisher/README.md)：发布工具下载、完整性校验和使用说明。
+
+所有内容沿用同一个 GitHub 仓库。旧版本提交和标签保留；核心源码现在位于 `C1ancher/`，旧文档中的仓库根构建命令需先进入该目录。
+
+## 目标设备与构建
+
+设备屏幕为 296×152 黑白电子纸，使用实体键盘。设备程序的目标为 Linux、MIPS 小端、ELF32、o32、MIPS32/MIPS32r2、双精度硬浮点、静态链接。电脑上的 Windows EXE、APK 或 x86 Linux 程序不能作为设备应用上传。
+
+核心组件使用 C 和 MIPS 交叉工具链；普通应用也有 Go 示例。具体依赖和命令见 [开发入门](docs/app-development.md) 以及各应用 README。
+
+本次源码汇总不是新的整机固件发布，也不代表所有本地改动都经过新的实机验收。自动化验证范围见 [验证记录](docs/open-source-validation.md)。
+
+## 公开范围与安全
+
+- 本仓库提供设备端源码和开发者文档，不包含 `C1ancher-server` 服务端实现。
+- 发布工具作为 Release 附件分发；程序、公开服务器地址和验签公钥一起提供。
+- 系统备份、原厂固件、个人书籍/音乐/图片、运行日志、令牌和私钥不属于源码分发范围。
+- 开放发布是匿名发布，新应用 ID 并非首发者独占；已有受保护应用和系统核心不能匿名覆盖。
+- HTTP 上传不加密，签名不代表恶意代码审核，设备应用目前没有沙箱隔离。详细限制见 [发布说明](docs/publishing.md)。
+
+## 许可证
+
+设备端和普通应用自研源码沿用现有 [GNU GPL v3](C1ancher/LICENSE)，覆盖范围见根 [LICENSE](LICENSE)。各组件有独立许可时遵循其声明；第三方库、字体、图片和其他素材不因放入本仓库而变更许可证。汇总见 [第三方与组件许可说明](THIRD_PARTY_NOTICES.md)。

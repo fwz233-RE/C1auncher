@@ -1,0 +1,7 @@
+# Device shell scripts must stay usable after Windows checkouts.
+*.sh text eol=lf
+third_party/neofetch/neofetch text eol=lf
+third_party/neofetch/neofetch.upstream text eol=lf
+third_party/neofetch/c1-config.conf text eol=lf
+# Preserve upstream license bytes, including their original line endings.
+third_party/pkg_font/LICENSE.txt -text
