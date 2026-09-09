@@ -22,6 +22,9 @@
 - [`App/book-reader/`](App/book-reader/README.md)：阅读器。
 - [`App/music-player/`](App/music-player/README.md)：音乐播放器。
 - [`App/pic/`](App/pic/README.md)：图片浏览器。
+- [`App/pelican/`](App/pelican/README.md)：骑自行车的鹈鹕动画。
+- [`App/badapple/`](App/badapple/README.md)：内置动画、安装即用的 Bad Apple 单色帧播放器及电脑端素材预处理工具（当前无声）。
+- [`App/refresh-test/`](App/refresh-test/README.md)：屏幕刷新测试，全键盘调速、可拍摄帧编号及提交时序日志。
 - [`Pinao/`](Pinao/README.md)：钢琴应用；保留原目录拼写。
 - [`ChiChuGames/`](ChiChuGames/README.md)：游戏应用。
 - [`examples/hello/`](examples/hello/README.md)：不依赖其他项目的终端应用示例。

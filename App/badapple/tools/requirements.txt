@@ -1,0 +1,2 @@
+# Offline frame preparation only; the device needs no video decoder.
+Pillow>=10.4.0,<13

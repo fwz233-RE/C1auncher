@@ -203,12 +203,16 @@ func TestStepRToggleAndSpaceStop(t *testing.T) {
 	}
 	press(m, 19, now)
 	out := press(m, 57, now)
-	if m.Recording || m.Playing || m.StepMode || m.Step != -1 || len(out) != 1 || out[0].Kind != "loop-off" {
-		t.Fatal("space during automatic playback should stop and disarm")
+	if !m.Recording || m.Playing || !m.StepMode || m.Step != 1 || len(out) != 1 || out[0].Kind != "loop-off" {
+		t.Fatal("space during automatic recording should pause without disarming")
+	}
+	press(m, 19, now)
+	if m.Recording || m.Playing || !m.StepMode {
+		t.Fatal("R should end paused recording")
 	}
 	press(m, 57, now)
-	if !m.Playing || m.Recording || m.Step != 0 {
-		t.Fatal("restart after stop")
+	if !m.Playing || m.Recording || m.Step != 1 {
+		t.Fatal("space should restart playback after recording ended")
 	}
 }
 
@@ -281,13 +285,13 @@ func TestStepLimitClearAndStop(t *testing.T) {
 	if m.noteCount() != 8 || m.Notice != "STEP FULL" {
 		t.Fatal("manual cell limit")
 	}
-	press(m, 111, now)
-	if m.noteCount() != 8 {
-		t.Fatal("single delete erased cell")
+	out := press(m, 111, now)
+	if m.noteCount() != 0 || len(out) != 1 || out[0].Kind != "loop-off" {
+		t.Fatal("first Delete did not clear selected cell")
 	}
-	press(m, 111, now.Add(time.Second))
-	if m.noteCount() != 0 || m.Step != 15 || !m.StepMode || !m.Recording {
-		t.Fatal("clear changed mode/cursor")
+	out = press(m, 111, now.Add(time.Second))
+	if m.noteCount() != 0 || m.Song.pageCount() != 1 || m.Step != -1 || m.StepMode || m.Recording || m.Notice != "PROJECT CLEARED - 1 PAGE" {
+		t.Fatal("second Delete did not clear the project")
 	}
 	m.stop() // Also used when starting WAV export.
 	if m.Playing || m.Recording || m.StepMode || m.Step != -1 {

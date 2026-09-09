@@ -100,6 +100,7 @@ func renderView(v viewState) frame {
 	f.text(7, 4, "PINAO", 2, false)
 	f.text(83, 4, "POCKET MUSIC STUDIO", 1, false)
 	f.text(83, 13, "FWZ233  /  "+toneNames[v.Tone], 1, false)
+	f.pageIndicator(v.Page, v.PageCount)
 	f.text(7, 28, fmt.Sprintf("%03d BPM", v.BPM), 1, true)
 	state := "LIVE"
 	if v.Playing {
@@ -121,7 +122,16 @@ func renderView(v viewState) frame {
 	f.text(205, 28, fmt.Sprintf("OCT%d V%02d", v.Octave, v.Volume), 1, true)
 	if v.Help {
 		f.box(0, 24, width, height-24, false)
-		lines := []string{"PLAY: A W S E D F T G Y H U J K", "CVBN: KICK / SNARE / HAT / CLAP", "Q: TONE  Z/X: OCTAVE  R: RECORD", "LEFT/RIGHT: STEP   SPACE: LOOP", "UP/DOWN: BPM   VOL KEYS: VOLUME", "ENTER: SAVE   P: EXPORT WAV", "DEL X2: CLEAR   HOME/BACK: EXIT", "8 BEATS / 16 STEPS   L: CLOSE HELP"}
+		lines := []string{
+			"PLAY: A W S E D F T G Y H U J K",
+			"CVBN: KICK/SNARE/HAT/CLAP  Q: TONE",
+			"Z/X: OCTAVE  R: RECORD  SPACE: LOOP",
+			"LEFT/RIGHT: STEP  UP/DOWN: BPM",
+			"I/O: TAP PAGE / HOLD INSERT",
+			"VOL KEYS: VOLUME  ENTER: SAVE  P: WAV",
+			"DEL X2: CLEAR  HOME/BACK: EXIT",
+			"8 BEATS/16 STEPS  L: CLOSE HELP",
+		}
 		for i, s := range lines {
 			f.text(7, 29+i*15, s, 1, true)
 		}
@@ -194,6 +204,32 @@ func renderView(v viewState) frame {
 	f.text(7, 142, v.Footer, 1, true)
 	return f
 }
+
+// pageIndicator only draws in the unused header area x=217..287, y=3..19.
+// Fixed neighbor slots keep the current page centered, including at either end.
+func (f *frame) pageIndicator(page, count int) {
+	count = max(1, min(64, count)) // A zero-value view still has one page.
+	page = max(0, min(count-1, page))
+	drawTab := func(x, y, w, h, number int, current bool) {
+		f.box(x, y, w, h, false)
+		if !current {
+			// A one-pixel white outline with a black interior.
+			f.box(x+1, y+1, w-2, h-2, true)
+		}
+		label := fmt.Sprintf("%d", number)
+		textWidth := len(label)*6 - 1
+		f.text(x+(w-textWidth)/2, y+(h-7)/2, label, 1, current)
+	}
+	if page > 0 {
+		drawTab(217, 6, 19, 11, page, false)
+	}
+	// The selected tab is taller and wider, with a white fill and black digits.
+	drawTab(241, 3, 23, 17, page+1, true)
+	if page+1 < count {
+		drawTab(269, 6, 19, 11, page+2, false)
+	}
+}
+
 func writePNG(w io.Writer, f frame, scale int) error {
 	if scale < 1 || scale > 8 {
 		return fmt.Errorf("invalid scale")

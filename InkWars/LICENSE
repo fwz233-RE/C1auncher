@@ -1,0 +1,11 @@
+Ink Wars first-party source and the reused ChiChuGames platform graphics code
+are licensed under GNU GPL version 3 only (SPDX-License-Identifier: GPL-3.0-only).
+The full text is included in licenses/GPL-3.0.txt.
+
+Ink Wars Bitmap is a renamed subset of C1 Package Bitmap / GNU Unifont 16.0.04.
+The font data is distributed under SIL OFL 1.1; see licenses/bitmap-font-OFL.txt.
+The reused 5x7 ASCII font has the notice in licenses/Adafruit-GFX-BSD.txt.
+
+The maps, terrain icons, unit symbols and commander designs in this project are
+original. No Nintendo ROM, sprite, music, map or dialogue assets are included.
+Advance Wars is mentioned only to describe a gameplay/interface reference.

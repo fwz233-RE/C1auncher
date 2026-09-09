@@ -1,0 +1,7 @@
+/build/
+*.sav
+*.pbm
+core
+core.*
+qemu_*.core
+__pycache__/

@@ -142,7 +142,7 @@ func TestRefreshBackgroundTracksLoopAndFeedbackExpiry(t *testing.T) {
 	r := newRefreshScheduler(render(m, now), now)
 	calls := 0
 	submit := func(frame) { calls++ }
-	for i := 1; i <= 130; i++ {
+	for i := 1; i <= 200; i++ {
 		at := now.Add(time.Duration(i) * 10 * time.Millisecond)
 		m.tick(at)
 		r.update(m, at, false, submit)
