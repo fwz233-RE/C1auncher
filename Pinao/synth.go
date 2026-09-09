@@ -41,6 +41,8 @@ type synthVoice struct {
 	phase          [4]uint32
 	step           [4]uint32
 	gain           [4]float32
+	harmonic       [4]float32
+	harmonicDecay  [4]float32
 	velocity       float32
 	envelope       float32
 	attack         int
@@ -145,9 +147,22 @@ func (s *Synth) NoteOn(id int, midi int, timbre int, velocity float64) {
 	v.sustain = 0.28
 	v.decay = float32(math.Exp(-1 / (0.65 * sampleRate)))
 	v.transientDecay = float32(math.Exp(-1 / (0.45 * sampleRate)))
-	ratios := [4]float64{1, 2, 3, 4}
-	v.gain = [4]float32{0.72, 0.18, 0.07, 0.03}
+	v.noise = 0x9e3779b9
+	ratios := [4]float64{1.0, 2.01, 3.99, 5.02}
+	v.gain = [4]float32{0.66, 0.21, 0.085, 0.045}
+	v.harmonic = [4]float32{1, 1, 1, 1}
+	v.harmonicDecay = [4]float32{v.decay, v.decay, v.decay, v.decay}
 	switch timbre {
+	case 0:
+		// Piano: a slightly inharmonic, detuned partial stack with a short
+		// hammer transient. Higher partials decay faster than the fundamental.
+		v.transientDecay = float32(math.Exp(-1 / (0.045 * sampleRate)))
+		v.harmonicDecay = [4]float32{
+			float32(math.Exp(-1 / (1.20 * sampleRate))),
+			float32(math.Exp(-1 / (0.72 * sampleRate))),
+			float32(math.Exp(-1 / (0.38 * sampleRate))),
+			float32(math.Exp(-1 / (0.20 * sampleRate))),
+		}
 	case 1:
 		ratios = [4]float64{1, 2.01, 3.98, 5.43}
 		v.gain = [4]float32{0.68, 0.20, 0.09, 0.03}
@@ -233,12 +248,23 @@ func (v *synthVoice) oscillator() float32 {
 	if !v.drum {
 		var value float32
 		for i := range v.phase {
-			gain := v.gain[i]
+			gain := v.gain[i] * v.harmonic[i]
 			if i > 0 && v.timbre != 2 {
 				gain *= v.transient
 			}
 			value += gain * sine(v.phase[i])
 			v.phase[i] += v.step[i]
+			v.harmonic[i] *= v.harmonicDecay[i]
+		}
+		// A very short, deterministic hammer component adds the woody attack
+		// without requiring a sample bank or an extra oscillator.
+		if v.timbre == 0 && v.age < sampleRate/100 {
+			x := v.noise
+			x ^= x << 13
+			x ^= x >> 17
+			x ^= x << 5
+			v.noise = x
+			value += 0.12 * float32(x>>8) / 8388608 * (1 - float32(v.age)/(sampleRate/100))
 		}
 		v.transient *= v.transientDecay
 		return value
