@@ -215,6 +215,9 @@ func (s *Synth) Drum(id int, kind int) {
 		v.attack = sampleRate / 500
 		v.duration = sampleRate / 2
 		v.decay = float32(math.Exp(-1 / (0.09 * sampleRate)))
+		// Keep the bass body, but add an audible beater on small speakers.
+		// Its noise transient decays independently, rather than becoming a hat.
+		v.transientDecay = float32(math.Exp(-1 / (0.012 * sampleRate)))
 	case 1:
 		v.step[0] = uint32(180 * (uint64(1) << 32) / sampleRate)
 	case 2:
@@ -251,9 +254,16 @@ func (v *synthVoice) oscillator() float32 {
 	v.previousNoise = noise
 	switch v.timbre {
 	case 0:
-		value := sine(v.phase[0])
+		// The original 150->45 Hz sine can be barely audible on a small
+		// speaker. A 1050->420 Hz body and a brief noise attack preserve a
+		// percussive identity without changing master volume or other drums.
+		// Weights sum to one, preserving the existing eight-voice headroom.
+		onset := min(float32(v.age)/float32(v.attack), float32(1))
+		value := 0.30*sine(v.phase[0]) + 0.55*sine(v.phase[1]) + 0.15*high*v.transient*onset
 		v.phase[0] += uint32((45 + v.pitch) * phaseScale)
+		v.phase[1] += uint32((420 + 6*v.pitch) * phaseScale)
 		v.pitch *= v.pitchDecay
+		v.transient *= v.transientDecay
 		return value
 	case 1:
 		value := 0.72*high + 0.28*sine(v.phase[0])
