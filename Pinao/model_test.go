@@ -63,8 +63,12 @@ func TestLoopOverdubAndStop(t *testing.T) {
 		t.Fatal("same step twice")
 	}
 	m.handle(keyEvent{Code: 57, Down: true}, now)
-	if m.Recording || m.Playing {
-		t.Fatal("stop")
+	if !m.Recording || m.Playing || !m.StepMode {
+		t.Fatal("space should pause playback while keeping recording armed")
+	}
+	m.handle(keyEvent{Code: 19, Down: true}, now)
+	if m.Recording || m.Playing || !m.StepMode {
+		t.Fatal("R should end recording without restarting playback")
 	}
 }
 func TestClearRequiresSecondPress(t *testing.T) {

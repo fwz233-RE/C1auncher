@@ -14,26 +14,29 @@ type Hit struct {
 	Drum int `json:"drum"`
 }
 type Song struct {
-	Format  int          `json:"format"`
-	BPM     int          `json:"bpm"`
-	Octave  int          `json:"octave"`
-	Tone    int          `json:"tone"`
-	Volume  int          `json:"volume"`
-	Pattern [steps][]Hit `json:"pattern"`
+	Format  int            `json:"format"`
+	BPM     int            `json:"bpm"`
+	Octave  int            `json:"octave"`
+	Tone    int            `json:"tone"`
+	Volume  int            `json:"volume"`
+	Pattern [steps][]Hit   `json:"pattern"`         // First page; kept for format-1 compatibility.
+	Pages   [][steps][]Hit `json:"pages,omitempty"` // Additional pages, in playback order.
 }
 
 func defaultSong() Song { return Song{Format: 1, BPM: 110, Octave: 4, Volume: 45} }
 func (s Song) validate() error {
-	if s.Format != 1 || s.BPM < 60 || s.BPM > 180 || s.Octave < 3 || s.Octave > 6 || s.Tone < 0 || s.Tone > 2 || s.Volume < 0 || s.Volume > 100 {
+	if (s.Format != 1 && s.Format != 2) || (s.Format == 1 && len(s.Pages) != 0) || s.pageCount() > maxPages || s.BPM < 60 || s.BPM > 180 || s.Octave < 3 || s.Octave > 6 || s.Tone < 0 || s.Tone > 2 || s.Volume < 0 || s.Volume > 100 {
 		return fmt.Errorf("invalid song settings")
 	}
-	for _, notes := range s.Pattern {
-		if len(notes) > 8 {
-			return fmt.Errorf("too many notes in a step")
-		}
-		for _, h := range notes {
-			if h.Drum < 0 || h.Drum > 4 || h.Tone < 0 || h.Tone > 2 || (h.Drum == 0 && (h.MIDI < 36 || h.MIDI > 96)) {
-				return fmt.Errorf("invalid note")
+	for page := 0; page < s.pageCount(); page++ {
+		for _, notes := range *s.patternAt(page) {
+			if len(notes) > 8 {
+				return fmt.Errorf("too many notes in a step")
+			}
+			for _, h := range notes {
+				if h.Drum < 0 || h.Drum > 4 || h.Tone < 0 || h.Tone > 2 || (h.Drum == 0 && (h.MIDI < 36 || h.MIDI > 96)) {
+					return fmt.Errorf("invalid note")
+				}
 			}
 		}
 	}
@@ -58,6 +61,11 @@ type model struct {
 	Song                            Song
 	Playing, Recording, Help, Dirty bool
 	StepMode                        bool // Manual cursor: clock stopped, recording may remain armed.
+	Page                            int  // Selected page; not persisted as musical content.
+	pageKey                         uint16
+	pageKeyAt                       time.Time
+	pageKeyFired                    bool
+	pageSavePending                 bool
 	Step                            int
 	StartStep                       int // Pattern position at Started; not persisted in Song.
 	Started                         time.Time
@@ -70,6 +78,7 @@ type model struct {
 	Notice        string
 	NoticeUntil   time.Time
 	ClearUntil    time.Time
+	ClearPage     int // A destructive confirmation never carries to another page.
 	Changed       time.Time
 	commandBuffer [9]soundCommand
 	sparkBuffer   [32]spark
@@ -93,14 +102,20 @@ func (m *model) message(s string, now time.Time) {
 	m.Notice = s
 	m.NoticeUntil = now.Add(2 * time.Second)
 }
-func (m *model) changed(now time.Time)       { m.Dirty = true; m.Changed = now }
+func (m *model) changed(now time.Time) {
+	m.Dirty = true
+	m.Changed = now
+	// Any edit invalidates a pending destructive-confirmation sequence.
+	m.ClearUntil = time.Time{}
+	m.ClearPage = -1
+}
 func (m *model) stepDuration() time.Duration { return time.Minute / time.Duration(m.Song.BPM*2) }
 func (m *model) start(now time.Time)         { m.startFrom(now, 0) }
 func (m *model) startFrom(now time.Time, step int) {
 	m.Playing, m.StepMode = true, false
 	m.Started, m.LastTick = now, -1
-	m.StartStep = (step%steps + steps) % steps
-	m.Step = m.StartStep
+	m.StartStep = m.Page*steps + (step%steps+steps)%steps
+	m.Step = m.StartStep % steps
 }
 func (m *model) stop() {
 	m.Playing, m.Recording, m.StepMode = false, false, false
@@ -110,13 +125,13 @@ func (m *model) clockTick(now time.Time) int64 {
 	return int64(max(time.Duration(0), now.Sub(m.Started)) / m.stepDuration())
 }
 func (m *model) clockStep(now time.Time) int {
-	return (m.StartStep + int(m.clockTick(now)%steps)) % steps
+	return m.clockPosition(now) % steps
 }
 func (m *model) selectStep(delta int, now time.Time) {
 	if m.Playing {
 		// Input is handled before tick in the main loop. Use the current clock
 		// position rather than a potentially stale last-rendered step.
-		m.Step = m.clockStep(now)
+		m.syncPosition(now)
 	}
 	if m.Step < 0 {
 		m.Step = 0 // First navigation from idle selects the first cell.
@@ -135,7 +150,8 @@ func (m *model) setBPM(bpm int, now time.Time) {
 		oldDuration := m.stepDuration()
 		elapsed := max(time.Duration(0), now.Sub(m.Started))
 		played := m.clockTick(now) <= m.LastTick
-		step := m.clockStep(now)
+		m.syncPosition(now)
+		step := m.Step
 		m.Song.BPM = bpm
 		phase := (elapsed % oldDuration) * m.stepDuration() / oldDuration
 		m.startFrom(now.Add(-phase), step)
@@ -152,14 +168,18 @@ func (m *model) record(h Hit, now time.Time) {
 		return
 	}
 	idx := m.Step
+	page := m.Page
 	if !m.StepMode {
 		tick := int64((max(time.Duration(0), now.Sub(m.Started)) + m.stepDuration()/2) / m.stepDuration())
-		idx = (m.StartStep + int(tick%steps)) % steps
+		total := m.Song.pageCount() * steps
+		position := (m.StartStep + int(tick%int64(total))) % total
+		page, idx = position/steps, position%steps
 	}
 	if idx < 0 || idx >= steps {
 		return
 	}
-	notes := m.Song.Pattern[idx]
+	pattern := m.Song.patternAt(page)
+	notes := pattern[idx]
 	for _, old := range notes {
 		if old == h {
 			return
@@ -169,7 +189,7 @@ func (m *model) record(h Hit, now time.Time) {
 		m.message("STEP FULL", now)
 		return
 	}
-	m.Song.Pattern[idx] = append(notes, h)
+	pattern[idx] = append(notes, h)
 	m.changed(now)
 }
 func (m *model) addSpark(k int, drum bool, now time.Time) {
@@ -183,14 +203,25 @@ func (m *model) addSpark(k int, drum bool, now time.Time) {
 // handle returns commands plus an action (save/exit). Repeats are filtered at input.
 func (m *model) handle(e keyEvent, now time.Time) ([]soundCommand, string) {
 	if e.Reset {
+		m.cancelPageGesture()
 		clear(m.Held)
 		m.Feedback = [13]time.Time{}
 		m.Sparks = m.Sparks[:0]
 		return []soundCommand{{Kind: "off-all"}}, ""
 	}
 	if systemPowerKey(e.Code) {
+		m.cancelPageGesture()
 		return nil, ""
 	}
+	if e.Code == 23 || e.Code == 24 {
+		if m.Help {
+			return nil, ""
+		}
+		return m.handlePageKey(e, now), ""
+	}
+	if e.Down && m.pageKey != 0 {
+		m.pageKeyFired = true
+	} // Chords never create pages.
 	if !e.Down {
 		if _, ok := m.Held[e.Code]; ok {
 			delete(m.Held, e.Code)
@@ -205,6 +236,7 @@ func (m *model) handle(e keyEvent, now time.Time) ([]soundCommand, string) {
 		return nil, "exit"
 	}
 	if e.Code == 38 || e.Code == 53 {
+		m.cancelPageGesture()
 		m.Help = !m.Help
 		return nil, ""
 	}
@@ -235,10 +267,15 @@ func (m *model) handle(e keyEvent, now time.Time) ([]soundCommand, string) {
 		return []soundCommand{{Kind: "drum", ID: 200 + drum, Drum: drum}}, ""
 	}
 	switch e.Code {
-	case 57: // Manual -> auto keeps both the current cell and recording state.
+	case 57: // Space pauses auto-recording without disarming it; R ends recording.
 		if m.StepMode {
 			m.startFrom(now, m.Step)
+		} else if m.Playing && m.Recording {
+			m.syncPosition(now)
+			m.Playing, m.StepMode = false, true
+			return []soundCommand{{Kind: "loop-off"}}, ""
 		} else if m.Playing {
+			m.syncPosition(now)
 			m.stop()
 			return []soundCommand{{Kind: "loop-off"}}, ""
 		} else {
@@ -306,15 +343,54 @@ func (m *model) handle(e keyEvent, now time.Time) ([]soundCommand, string) {
 	case 28, 352:
 		return nil, "save"
 	case 14, 111:
-		if now.Before(m.ClearUntil) {
-			m.Song.Pattern = [steps][]Hit{}
-			m.ClearUntil = time.Time{}
-			m.changed(now)
-			m.message("LOOP CLEARED", now)
+		if m.Playing {
+			m.syncPosition(now)
+		}
+		// In step mode the first Delete removes the selected cell. A second
+		// Delete in the confirmation window resets the whole project, matching
+		// the global clear action while still allowing precise single-cell undo.
+		if m.StepMode && m.Step >= 0 && m.Step < steps {
+			if now.Before(m.ClearUntil) && m.ClearPage == m.Page {
+				m.Song.Pattern = [steps][]Hit{}
+				m.Song.Pages = nil
+				m.Song.Format = 1
+				m.Page, m.Step = 0, -1
+				m.stop()
+				m.ClearUntil = time.Time{}
+				m.ClearPage = -1
+				m.changed(now)
+				m.pageSavePending = true
+				m.message("PROJECT CLEARED - 1 PAGE", now)
+				return []soundCommand{{Kind: "loop-off"}}, ""
+			}
+			cell := &m.currentPattern()[m.Step]
+			if len(*cell) == 0 {
+				m.message("CELL ALREADY EMPTY", now)
+			} else {
+				*cell = nil
+				m.changed(now)
+				m.message("CELL CLEARED - DEL AGAIN: CLEAR ALL", now)
+			}
+			m.ClearPage = m.Page
+			m.ClearUntil = now.Add(2 * time.Second)
 			return []soundCommand{{Kind: "loop-off"}}, ""
 		}
+		if now.Before(m.ClearUntil) && m.ClearPage == m.Page {
+			m.Song.Pattern = [steps][]Hit{}
+			m.Song.Pages = nil
+			m.Song.Format = 1
+			m.Page = 0
+			m.stop()
+			m.ClearUntil = time.Time{}
+			m.ClearPage = -1
+			m.changed(now)
+			m.pageSavePending = true
+			m.message("PROJECT CLEARED - 1 PAGE", now)
+			return []soundCommand{{Kind: "loop-off"}}, ""
+		}
+		m.ClearPage = m.Page
 		m.ClearUntil = now.Add(2 * time.Second)
-		m.message("DEL AGAIN: CLEAR LOOP", now)
+		m.message("DEL AGAIN: CLEAR ALL TO 1 PAGE", now)
 	}
 	return nil, ""
 }
@@ -327,6 +403,7 @@ func (m *model) keyLit(code uint16, now time.Time) bool {
 }
 
 func (m *model) tick(now time.Time) []soundCommand {
+	m.checkPageHold(now)
 	live := m.Sparks[:0]
 	for _, s := range m.Sparks {
 		if now.Sub(s.At) < keyFeedbackDuration {
@@ -343,10 +420,10 @@ func (m *model) tick(now time.Time) []soundCommand {
 	}
 	// On a stall resume at the current step; never play a burst of stale notes.
 	m.LastTick = tick
-	m.Step = (m.StartStep + int(tick%steps)) % steps
+	m.syncPosition(now)
 	commands := m.commandBuffer[:1]
 	commands[0] = soundCommand{Kind: "loop-off"}
-	for i, h := range m.Song.Pattern[m.Step] {
+	for i, h := range m.currentPattern()[m.Step] {
 		if h.Drum > 0 {
 			commands = append(commands, soundCommand{Kind: "drum", ID: 300 + i, Drum: h.Drum - 1})
 			m.addSpark(h.Drum-1, true, now)
@@ -359,8 +436,10 @@ func (m *model) tick(now time.Time) []soundCommand {
 }
 func (m *model) noteCount() int {
 	n := 0
-	for _, hits := range m.Song.Pattern {
-		n += len(hits)
+	for p := 0; p < m.Song.pageCount(); p++ {
+		for _, hits := range *m.Song.patternAt(p) {
+			n += len(hits)
+		}
 	}
 	return n
 }

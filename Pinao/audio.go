@@ -57,7 +57,8 @@ func exportWAVContext(ctx context.Context, path string, song Song) (err error) {
 			_ = os.Remove(path)
 		}
 	}()
-	loopFrames := int(int64(sampleRate) * 60 * steps / int64(song.BPM*2))
+	totalSteps := song.pageCount() * steps
+	loopFrames := int(int64(sampleRate) * 60 * int64(totalSteps) / int64(song.BPM*2))
 	frames := loopFrames + sampleRate
 	header := make([]byte, 44)
 	copy(header, "RIFF")
@@ -86,17 +87,17 @@ func exportWAVContext(ctx context.Context, path string, song Song) (err error) {
 		}
 		n := min(480, frames-offset)
 		idx := int(int64(offset) * int64(song.BPM*2) / (sampleRate * 60))
-		if idx >= steps {
-			if step != steps {
+		if idx >= totalSteps {
+			if step != totalSteps {
 				synth.AllOff()
-				step = steps
+				step = totalSteps
 			}
 		} else {
 			boundary := int((int64(idx+1)*sampleRate*60 + int64(song.BPM*2) - 1) / int64(song.BPM*2))
 			n = min(n, max(1, boundary-offset))
 			if idx != step {
 				applySound(synth, soundCommand{Kind: "loop-off"})
-				for i, h := range song.Pattern[idx] {
+				for i, h := range song.patternAt(idx / steps)[idx%steps] {
 					c := soundCommand{Kind: "on", ID: 300 + i, MIDI: h.MIDI, Tone: h.Tone}
 					if h.Drum > 0 {
 						c.Kind = "drum"

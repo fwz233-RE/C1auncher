@@ -180,6 +180,7 @@ func runDevice(ctx context.Context, song Song, path string, smoke bool) (result 
 		case now = <-timer.C:
 		}
 		if now.Sub(lastLoopTime) > 2*time.Second {
+			m.cancelPageGesture()
 			clear(m.Held)
 			m.Feedback = [13]time.Time{}
 			m.Sparks = m.Sparks[:0]
@@ -206,28 +207,33 @@ func runDevice(ctx context.Context, song Song, path string, smoke bool) (result 
 				if exportErr != nil {
 					m.message("CANNOT CREATE EXPORT FOLDER", now)
 				} else {
+					m.cancelPageGesture()
 					m.stop()
 					clear(m.Held)
 					if err = a.send(soundCommand{Kind: "off-all"}); err != nil {
 						return err
 					}
-					copy := m.Song
-					for i, hits := range m.Song.Pattern {
-						copy.Pattern[i] = append([]Hit(nil), hits...)
-					}
+					copy := m.Song.clone()
 					exporting = true
 					m.message("EXPORTING WAV - PLEASE WAIT", now)
 					go func() { exportDone <- exportWAVContext(ctx, exportName(dir, now), copy) }()
 				}
 			}
 		}
-		if !smoke && (action == "save" || (m.Dirty && now.Sub(m.Changed) > 2*time.Second && now.Sub(lastSaveAttempt) > 5*time.Second)) {
+		if !smoke && (action == "save" || m.pageSavePending || (m.Dirty && now.Sub(m.Changed) > 2*time.Second && now.Sub(lastSaveAttempt) > 5*time.Second)) {
+			pageSave := m.pageSavePending
 			lastSaveAttempt = now
 			if err = saveSong(path, m.Song); err != nil {
+				// Keep the pending flag set so a transient storage/backup error
+				// can be retried on the next loop or explicit save.
+				m.pageSavePending = pageSave
 				m.message("SAVE FAILED - CHECK STORAGE", now)
 			} else {
+				m.pageSavePending = false
 				m.Dirty = false
-				m.message("SAVED LOCALLY", now)
+				if !pageSave {
+					m.message("SAVED LOCALLY", now)
+				}
 			}
 		}
 		refresh.update(m, now, inputRefresh, screen.submit)

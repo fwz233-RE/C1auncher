@@ -18,7 +18,7 @@ const (
 	visualRecord
 	visualModeCount
 	staticRefreshInterval = 10 * time.Second
-	motionRefreshInterval = 300 * time.Millisecond
+	motionRefreshInterval = 700 * time.Millisecond
 )
 
 func (mode visualMode) next() visualMode { return (mode + 1) % visualModeCount }

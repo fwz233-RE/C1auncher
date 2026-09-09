@@ -9,6 +9,7 @@ type viewState struct {
 	Tone, BPM, Octave, Volume int
 	Playing, Recording, Help  bool
 	StepMode                  bool
+	Page, PageCount           int
 	Step                      int
 	Pattern, Keys, Notes      uint16
 	Drums                     uint8
@@ -16,14 +17,14 @@ type viewState struct {
 }
 
 func (m *model) view(now time.Time) viewState {
-	v := viewState{Tone: m.Song.Tone, Help: m.Help}
+	v := viewState{Tone: m.Song.Tone, Help: m.Help, Page: m.Page, PageCount: m.Song.pageCount()}
 	if m.Help {
 		return v // Hidden playback/feedback must not redraw the help screen.
 	}
 	v.BPM, v.Octave, v.Volume = m.Song.BPM, m.Song.Octave, m.Song.Volume
 	v.Playing, v.Recording, v.Step = m.Playing, m.Recording, m.Step
 	v.StepMode = m.StepMode
-	for i, hits := range m.Song.Pattern {
+	for i, hits := range *m.currentPattern() {
 		if len(hits) > 0 {
 			v.Pattern |= 1 << uint(i)
 		}
@@ -41,7 +42,7 @@ func (m *model) view(now time.Time) viewState {
 	if m.StepMode && m.Step >= 0 && m.Step < steps {
 		// In manual mode the note/drum strip describes this cell, not recent
 		// activity in the cell we just left. Keyboard highlights still audition taps.
-		for _, h := range m.Song.Pattern[m.Step] {
+		for _, h := range m.currentPattern()[m.Step] {
 			if h.Drum > 0 {
 				v.Drums |= 1 << uint(h.Drum-1)
 			} else {

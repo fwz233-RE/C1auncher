@@ -77,7 +77,7 @@ func TestProgressRefreshBudget(t *testing.T) {
 	if progressInterval(visualStatic) < 10*time.Second {
 		t.Fatal("static mode refreshes too often")
 	}
-	if motionRefreshInterval != 300*time.Millisecond {
+	if motionRefreshInterval != 700*time.Millisecond {
 		t.Fatal("motion cadence must stay at the bounded fast-refresh target")
 	}
 	if progressInterval(visualBars) != time.Second {
