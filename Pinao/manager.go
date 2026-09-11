@@ -94,4 +94,16 @@ func deleteManagedFile(path string) error {
 func archiveDisplayName(path string) string {
 	return strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 }
+
+func compactManagerName(name string, maxRunes int) string {
+	runes := []rune(name)
+	if len(runes) <= maxRunes {
+		return name
+	}
+	if maxRunes < 2 {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-1]) + "…"
+}
+
 func archiveStamp() string { return fmt.Sprintf("song-%s", time.Now().Format("20060102-150405")) }

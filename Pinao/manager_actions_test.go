@@ -17,6 +17,10 @@ func TestManagementActions(t *testing.T) {
 	}
 	m.ManagerIndex = 1
 	_, a = m.handle(keyEvent{Code: 28, Down: true}, time.Now())
+	if a != "manager-preview:/tmp/song.json" {
+		t.Fatalf("preview action %q", a)
+	}
+	_, a = m.handle(keyEvent{Code: 24, Down: true}, time.Now())
 	if a != "manager-open:/tmp/song.json" {
 		t.Fatalf("open action %q", a)
 	}

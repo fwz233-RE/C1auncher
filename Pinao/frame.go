@@ -97,30 +97,35 @@ func render(m *model, now time.Time) frame { return renderView(m.view(now)) }
 func renderView(v viewState) frame {
 	var f frame
 	if v.Management {
-		f.box(0, 0, width, height, false)
 		f.box(0, 0, width, 22, true)
-		f.text(7, 4, "MANAGE SONGS", 2, false)
-		f.text(7, 28, "UP/DOWN SELECT   ENTER OPEN", 1, true)
-		f.text(7, 40, "R NEW   Q SAVE AS   DEL WAV", 1, true)
+		f.text(7, 4, "PINAO", 2, false)
+		f.text(83, 4, "POCKET MUSIC STUDIO", 1, false)
+		f.text(83, 13, "FWZ233  /  MANAGER", 1, false)
+		f.text(7, 28, "MUSIC LIBRARY", 1, true)
+		f.text(178, 28, fmt.Sprintf("%02d/%02d", v.ManagerIndex+1, v.ManagerCount), 1, true)
 		if v.ManagerCount == 0 {
-			f.text(7, 62, "NO ARCHIVES OR EXPORTS", 1, true)
+			f.text(7, 52, "NO ARCHIVES OR EXPORTS", 1, true)
 		} else {
-			// The list is intentionally compact; the selected row is inverted.
-			for i := 0; i < min(v.ManagerCount, 6); i++ {
-				y := 59 + i*14
-				selected := i == v.ManagerIndex
+			for i := 0; i < len(v.ManagerNames); i++ {
+				item := v.ManagerOffset + i
+				if item >= v.ManagerCount {
+					break
+				}
+				y := 42 + i*14
+				selected := item == v.ManagerIndex
 				if selected {
 					f.box(5, y-2, 286, 13, true)
 				}
-				label := "ARCHIVE"
-				if selected && v.ManagerSelectedWAV {
-					label = "WAV"
+				label := "S"
+				if i < len(v.ManagerNames) && v.ManagerSelectedWAV && selected {
+					label = ">"
 				}
 				f.text(9, y, label, 1, !selected)
-				f.text(65, y, v.ManagerNames[i], 1, !selected)
+				f.text(24, y, v.ManagerNames[i], 1, !selected)
 			}
 		}
-		f.text(7, 142, "M / L CLOSE", 1, true)
+		f.text(7, 128, "UP/DOWN SELECT  ENTER PREVIEW  O OPEN", 1, true)
+		f.text(7, 142, "R NEW  Q SAVE AS  DEL DELETE  M/L CLOSE", 1, true)
 		return f
 	}
 	f.box(0, 0, width, 22, true)
