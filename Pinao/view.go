@@ -9,6 +9,11 @@ type viewState struct {
 	Tone, BPM, Octave, Volume int
 	Playing, Recording, Help  bool
 	StepMode                  bool
+	Management                bool
+	ManagerIndex              int
+	ManagerCount              int
+	ManagerSelectedWAV        bool
+	ManagerNames              [6]string
 	Page, PageCount           int
 	Step                      int
 	Ties                      uint16 // Bits mark continuations into each cell, including the previous page.
@@ -19,7 +24,16 @@ type viewState struct {
 }
 
 func (m *model) view(now time.Time) viewState {
-	v := viewState{Tone: m.Song.Tone, Help: m.Help, Page: m.Page, PageCount: m.Song.pageCount()}
+	v := viewState{Tone: m.Song.Tone, Help: m.Help, Page: m.Page, PageCount: m.Song.pageCount(), Management: m.Management, ManagerIndex: m.ManagerIndex, ManagerCount: len(m.ManagerItems)}
+	if m.Management {
+		if len(m.ManagerItems) > 0 {
+			v.ManagerSelectedWAV = m.ManagerItems[m.ManagerIndex].IsWAV
+		}
+		for i := 0; i < min(len(m.ManagerItems), len(v.ManagerNames)); i++ {
+			v.ManagerNames[i] = archiveDisplayName(m.ManagerItems[i].Path)
+		}
+		return v
+	}
 	if m.Help {
 		return v // Hidden playback/feedback must not redraw the help screen.
 	}

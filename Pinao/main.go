@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
@@ -117,6 +118,7 @@ func runDevice(ctx context.Context, song Song, path string, smoke bool) (result 
 	}
 	defer a.close()
 	m := newModel(song)
+	m.StoragePath = path
 	if smoke {
 		m.start(time.Now())
 	}
@@ -198,6 +200,54 @@ func runDevice(ctx context.Context, song Song, path string, smoke bool) (result 
 		}
 		if action == "exit" {
 			return nil
+		}
+		if len(action) > 15 && action[:15] == "manager-delete:" {
+			if err := deleteManagedFile(action[15:]); err != nil {
+				m.message("DELETE FAILED", now)
+			} else {
+				m.message("WAV DELETED", now)
+				m.ManagerItems, _ = listManagedFiles(path)
+				if m.ManagerIndex >= len(m.ManagerItems) {
+					m.ManagerIndex = max(0, len(m.ManagerItems)-1)
+				}
+			}
+		}
+		if len(action) > 13 && action[:13] == "manager-play:" {
+			if err := exec.Command("aplay", action[13:]).Start(); err != nil {
+				m.message("WAV PLAY FAILED", now)
+			} else {
+				m.message("PLAYING WAV", now)
+			}
+		}
+		if len(action) > 13 && action[:13] == "manager-open:" {
+			if next, e := loadSong(action[13:]); e != nil {
+				m.message("OPEN FAILED", now)
+			} else {
+				m.Song = next
+				m.StoragePath = action[13:]
+				m.Dirty = false
+				m.Page = 0
+				m.message("SONG OPENED", now)
+				path = m.StoragePath
+				_ = a.send(soundCommand{Kind: "volume", Volume: m.Song.Volume})
+			}
+		}
+		if action == "manager-create" || action == "manager-saveas" {
+			name := archiveStamp()
+			if action == "manager-saveas" {
+				name += "-copy"
+			}
+			if p, e := createArchive(path, name); e != nil {
+				m.message("CREATE FAILED", now)
+			} else {
+				if action == "manager-saveas" {
+					_ = saveSong(p, m.Song)
+					m.message("SAVED AS NEW SONG", now)
+				} else {
+					m.message("NEW SONG CREATED", now)
+				}
+				m.ManagerItems, _ = listManagedFiles(path)
+			}
 		}
 		if !smoke && action == "export" && !exporting {
 			if m.noteCount() == 0 {

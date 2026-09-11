@@ -68,6 +68,10 @@ type model struct {
 	Playing, Recording, Help, Dirty bool
 	StepMode                        bool // Manual cursor: clock stopped, recording may remain armed.
 	Page                            int  // Selected page; not persisted as musical content.
+	Management                      bool // Compact archive/export management screen.
+	ManagerItems                    []archiveEntry
+	ManagerIndex                    int
+	StoragePath                     string
 	pageKey                         uint16
 	pageKeyAt                       time.Time
 	pageKeyFired                    bool
@@ -242,6 +246,19 @@ func (m *model) handle(e keyEvent, now time.Time) ([]soundCommand, string) {
 	if systemPowerKey(e.Code) {
 		m.cancelPageGesture()
 		return nil, ""
+	}
+	if e.Code == 50 && e.Down { // M: management
+		m.Management = !m.Management
+		if m.Management {
+			m.ManagerItems, _ = listManagedFiles(m.StoragePath)
+			m.ManagerIndex = 0
+			m.stop()
+			return nil, ""
+		}
+		return nil, ""
+	}
+	if m.Management {
+		return m.handleManagement(e, now)
 	}
 	if e.Code == 23 || e.Code == 24 {
 		if m.Help {
