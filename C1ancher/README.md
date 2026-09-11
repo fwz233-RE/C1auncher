@@ -3,7 +3,7 @@
 C1-Slim / MP-D261 的自研用户空间界面，面向 296×152 黑白电子纸、实体键盘和 MIPS Buildroot 系统。
 
 - 当前源码版本：**2.0.0**。本目录属于设备端与应用开发总仓库，首次阅读请先看 [仓库首页](../README.md) 和 [普通应用开发入门](../docs/app-development.md)。
-- 历史 GitHub 发行版：[Releases](https://github.com/fwz233-RE/C1ancher/releases)。源码版本、GitHub 附件和设备服务器渠道是不同的发布状态，请以各版本说明为准。
+- 历史 GitHub 发行版：[Releases](https://github.com/fwz233-RE/C1auncher/releases)。源码版本、GitHub 附件和设备服务器渠道是不同的发布状态，请以各版本说明为准。
 - 目标 ABI：ELF32、MIPS32r2、小端、o32、hard-float double、完全静态链接
 
 本地新增的事务恢复、运行模式、主页心跳与核心可信恢复说明见 [生命周期修复](docs/lifecycle-fixes.md)。部署和物理断电/重启验收仍是独立步骤。

@@ -1,10 +1,10 @@
-# C1ancher：C1-Slim 设备端与应用开发
+# C1auncher：C1-Slim 设备端与应用开发
 
 这里集中维护 C1-Slim / MP-D261 的设备端核心和普通应用源码，目的是让开发者能阅读实现、编译自己的程序，并通过发布工具把应用上传到现有软件仓库。
 
 ## 下载与安装
 
-[最新 Release](https://github.com/fwz233-RE/C1ancher/releases/latest) 集中提供 **2.0.0 Windows 安装包**、普通应用发行包及开发者发布工具。各应用保留自己的版本号，下载说明见 [2.0.0 发行说明](docs/release-v2.0.0.md)。
+[最新 Release](https://github.com/fwz233-RE/C1auncher/releases/latest) 集中提供 **2.0.0 Windows 安装包**、普通应用发行包及开发者发布工具。各应用保留自己的版本号，下载说明见 [2.0.0 发行说明](docs/release-v2.0.0.md)。
 
 安装器应整包解压，保留 EXE 和配套 `payload/`；安装会修改设备启动配置，并在确认新核心正常运行后删除原厂学习软件，操作前请阅读随包用户指南并自行备份。已有 C1ancher 的设备可通过应用管理器下载安装普通应用。
 
@@ -12,7 +12,7 @@
 
 1. 阅读 [设备应用开发入门](docs/app-development.md)。
 2. 从 [最小 C 应用](examples/hello/README.md) 开始，或参考下面的完整应用。
-3. 从 [发布器 1.1.0](https://github.com/fwz233-RE/C1ancher/releases/tag/publisher-v1.1.0) 下载 `C1Slim-Publisher-1.1.0.zip`，解压后保留整个目录，双击 EXE 可自助注册作者和发布应用。
+3. 从 [发布器 1.1.0](https://github.com/fwz233-RE/C1auncher/releases/tag/publisher-v1.1.0) 下载 `C1Slim-Publisher-1.1.0.zip`，解压后保留整个目录，双击 EXE 可自助注册作者和发布应用。
 4. 按 [打包与发布说明](docs/publishing.md) 上传应用。用户在设备 APP 列表刷新后自行下载安装。
 
 ## 源码目录
