@@ -219,6 +219,9 @@ func runDevice(ctx context.Context, song Song, path string, smoke bool) (result 
 				m.message("PLAYING WAV", now)
 			}
 		}
+		if len(action) > 16 && action[:16] == "manager-preview:" {
+			m.message("PRESS O TO OPEN ARCHIVE", now)
+		}
 		if len(action) > 13 && action[:13] == "manager-open:" {
 			if next, e := loadSong(action[13:]); e != nil {
 				m.message("OPEN FAILED", now)

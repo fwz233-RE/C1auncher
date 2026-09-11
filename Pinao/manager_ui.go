@@ -7,21 +7,25 @@ func (m *model) handleManagement(e keyEvent, now time.Time) ([]soundCommand, str
 		return nil, ""
 	}
 	switch e.Code {
-	case 105:
+	case 103: // physical joystick up
 		if m.ManagerIndex > 0 {
 			m.ManagerIndex--
 		}
-	case 108:
+	case 108: // physical joystick down
 		if m.ManagerIndex+1 < len(m.ManagerItems) {
 			m.ManagerIndex++
 		}
-	case 28, 352:
+	case 28, 352: // preview: play WAV, show archive ready to open
 		if len(m.ManagerItems) > 0 {
 			x := m.ManagerItems[m.ManagerIndex]
 			if x.IsWAV {
 				return nil, "manager-play:" + x.Path
 			}
-			return nil, "manager-open:" + x.Path
+			return nil, "manager-preview:" + x.Path
+		}
+	case 24: // O is the explicit open button for archives
+		if len(m.ManagerItems) > 0 && !m.ManagerItems[m.ManagerIndex].IsWAV {
+			return nil, "manager-open:" + m.ManagerItems[m.ManagerIndex].Path
 		}
 	case 14, 111:
 		if len(m.ManagerItems) > 0 {

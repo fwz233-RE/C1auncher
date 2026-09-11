@@ -11,6 +11,7 @@ type viewState struct {
 	StepMode                  bool
 	Management                bool
 	ManagerIndex              int
+	ManagerOffset             int
 	ManagerCount              int
 	ManagerSelectedWAV        bool
 	ManagerNames              [6]string
@@ -29,8 +30,16 @@ func (m *model) view(now time.Time) viewState {
 		if len(m.ManagerItems) > 0 {
 			v.ManagerSelectedWAV = m.ManagerItems[m.ManagerIndex].IsWAV
 		}
-		for i := 0; i < min(len(m.ManagerItems), len(v.ManagerNames)); i++ {
-			v.ManagerNames[i] = archiveDisplayName(m.ManagerItems[i].Path)
+		start := m.ManagerIndex - len(v.ManagerNames)/2
+		if start < 0 {
+			start = 0
+		}
+		if maxStart := len(m.ManagerItems) - len(v.ManagerNames); start > maxStart && maxStart > 0 {
+			start = maxStart
+		}
+		v.ManagerOffset = start
+		for i := 0; i < len(v.ManagerNames) && start+i < len(m.ManagerItems); i++ {
+			v.ManagerNames[i] = compactManagerName(archiveDisplayName(m.ManagerItems[start+i].Path), 31)
 		}
 		return v
 	}
