@@ -96,6 +96,33 @@ func render(m *model, now time.Time) frame { return renderView(m.view(now)) }
 
 func renderView(v viewState) frame {
 	var f frame
+	if v.Management {
+		f.box(0, 0, width, height, false)
+		f.box(0, 0, width, 22, true)
+		f.text(7, 4, "MANAGE SONGS", 2, false)
+		f.text(7, 28, "UP/DOWN SELECT   ENTER OPEN", 1, true)
+		f.text(7, 40, "R NEW   Q SAVE AS   DEL WAV", 1, true)
+		if v.ManagerCount == 0 {
+			f.text(7, 62, "NO ARCHIVES OR EXPORTS", 1, true)
+		} else {
+			// The list is intentionally compact; the selected row is inverted.
+			for i := 0; i < min(v.ManagerCount, 6); i++ {
+				y := 59 + i*14
+				selected := i == v.ManagerIndex
+				if selected {
+					f.box(5, y-2, 286, 13, true)
+				}
+				label := "ARCHIVE"
+				if selected && v.ManagerSelectedWAV {
+					label = "WAV"
+				}
+				f.text(9, y, label, 1, !selected)
+				f.text(65, y, v.ManagerNames[i], 1, !selected)
+			}
+		}
+		f.text(7, 142, "M / L CLOSE", 1, true)
+		return f
+	}
 	f.box(0, 0, width, 22, true)
 	f.text(7, 4, "PINAO", 2, false)
 	f.text(83, 4, "POCKET MUSIC STUDIO", 1, false)
