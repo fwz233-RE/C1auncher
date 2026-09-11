@@ -13,6 +13,8 @@ func applySound(s *Synth, c soundCommand) {
 	switch c.Kind {
 	case "on":
 		s.NoteOn(c.ID, c.MIDI, c.Tone, 0.8)
+	case "hold":
+		s.Hold(c.ID, c.MIDI, c.Tone)
 	case "off":
 		s.NoteOff(c.ID)
 	case "off-all":
@@ -22,8 +24,11 @@ func applySound(s *Synth, c soundCommand) {
 	case "drum":
 		s.Drum(c.ID, c.Drum)
 	case "loop-off":
+		s.loopKeep = c.Keep
 		for i := 0; i < 8; i++ {
-			s.NoteOff(300 + i)
+			if c.Keep&(1<<uint(i)) == 0 {
+				s.NoteOff(300 + i)
+			}
 		}
 	}
 }
@@ -81,6 +86,8 @@ func exportWAVContext(ctx context.Context, path string, song Song) (err error) {
 	pcm := make([]int16, 480*2)
 	raw := make([]byte, len(pcm)*2)
 	step := -1
+	var transport loopTransport
+	var commands [9]soundCommand
 	for offset := 0; offset < frames; {
 		if err = ctx.Err(); err != nil {
 			return err
@@ -96,13 +103,7 @@ func exportWAVContext(ctx context.Context, path string, song Song) (err error) {
 			boundary := int((int64(idx+1)*sampleRate*60 + int64(song.BPM*2) - 1) / int64(song.BPM*2))
 			n = min(n, max(1, boundary-offset))
 			if idx != step {
-				applySound(synth, soundCommand{Kind: "loop-off"})
-				for i, h := range song.patternAt(idx / steps)[idx%steps] {
-					c := soundCommand{Kind: "on", ID: 300 + i, MIDI: h.MIDI, Tone: h.Tone}
-					if h.Drum > 0 {
-						c.Kind = "drum"
-						c.Drum = h.Drum - 1
-					}
+				for _, c := range transport.commands(commands[:0], song.cell(idx), idx, true) {
 					applySound(synth, c)
 				}
 				step = idx

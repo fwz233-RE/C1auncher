@@ -30,7 +30,7 @@ func preserveLegacySong(path string) error {
 	if err := json.Unmarshal(data, &header); err != nil {
 		return fmt.Errorf("existing song invalid; original preserved: %w", err)
 	}
-	if header.Format == 2 {
+	if header.Format == 2 || header.Format == 3 {
 		return nil
 	}
 	if header.Format != 1 {

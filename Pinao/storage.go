@@ -78,7 +78,11 @@ func saveSong(path string, s Song) error {
 	if len(data)+1 > maxSongBytes {
 		return fmt.Errorf("song exceeds size limit")
 	}
-	if s.Format == 2 {
+	if s.Format == 3 {
+		if err := preservePreTieSong(path); err != nil {
+			return err
+		}
+	} else if s.Format == 2 {
 		if err := preserveLegacySong(path); err != nil {
 			return err
 		}

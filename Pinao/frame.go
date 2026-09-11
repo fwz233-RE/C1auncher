@@ -130,7 +130,7 @@ func renderView(v viewState) frame {
 			"I/O: TAP PAGE / HOLD INSERT",
 			"VOL KEYS: VOLUME  ENTER: SAVE  P: WAV",
 			"DEL X2: CLEAR  HOME/BACK: EXIT",
-			"8 BEATS/16 STEPS  L: CLOSE HELP",
+			"HOLD NOTE + RIGHT: TIE  L: CLOSE",
 		}
 		for i, s := range lines {
 			f.text(7, 29+i*15, s, 1, true)
@@ -193,6 +193,12 @@ func renderView(v viewState) frame {
 		f.rect(x, 123, 13, 8)
 		if v.Pattern&(1<<uint(i)) != 0 {
 			f.box(x+3, 125, 7, 4, true)
+		}
+		if v.Ties&(1<<uint(i)) != 0 {
+			f.box(x-6, 126, 7, 2, true)
+		}
+		if i == steps-1 && v.TieOut {
+			f.box(x+12, 126, 6, 2, true)
 		}
 		if i == v.Step {
 			f.box(x, 133, 13, 2, true)

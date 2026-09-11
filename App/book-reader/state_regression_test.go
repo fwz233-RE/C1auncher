@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"c1device"
-	"golang.org/x/image/font/gofont/goregular"
 )
 
 func readingFixture(t *testing.T) *readerApp {
@@ -20,11 +19,7 @@ func readingFixture(t *testing.T) *readerApp {
 	if err != nil {
 		t.Fatal(err)
 	}
-	typeface, err := c1device.ParseTypeface(goregular.TTF)
-	if err != nil {
-		t.Fatal(err)
-	}
-	face, err := typeface.NewFace(readerBodyFontSize)
+	face, err := newReaderFace(true)
 	if err != nil {
 		t.Fatal(err)
 	}

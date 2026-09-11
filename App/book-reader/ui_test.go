@@ -9,29 +9,17 @@ import (
 	"testing"
 
 	"c1device"
-	"golang.org/x/image/font/gofont/goregular"
 )
 
 func readerUIFaces(t *testing.T, app *readerApp) {
 	t.Helper()
-	data := goregular.TTF
-	if path := os.Getenv("C1_TEST_FONT_PATH"); path != "" {
-		var err error
-		data, err = os.ReadFile(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	typeface, err := c1device.ParseTypeface(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	app.uiFace, err = typeface.NewFace(readerUIFontSize)
+	var err error
+	app.uiFace, err = newReaderFace(false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { app.uiFace.Close() })
-	app.bodyFace, err = typeface.NewFace(readerBodyFontSize)
+	app.bodyFace, err = newReaderFace(true)
 	if err != nil {
 		t.Fatal(err)
 	}

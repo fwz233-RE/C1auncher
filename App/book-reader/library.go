@@ -20,7 +20,8 @@ func ScanLibrary(root string) ([]Book, error) {
 		if err != nil {
 			return err
 		}
-		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".txt") {
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		if entry.IsDir() || (ext != ".txt" && ext != ".epub") {
 			return nil
 		}
 		books = append(books, Book{Path: path, Name: bookDisplayName(path, entry.Name())})

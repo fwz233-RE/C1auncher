@@ -608,7 +608,7 @@ func TestMultipageValidationChecksEveryPage(t *testing.T) {
 		edit func(*Song)
 	}{
 		{"format-zero", func(s *Song) { s.Format = 0 }},
-		{"future-format", func(s *Song) { s.Format = 3 }},
+		{"future-format", func(s *Song) { s.Format = 4 }},
 		{"format-one-with-pages", func(s *Song) { s.Format = 1 }},
 		{"65-pages", func(s *Song) { s.Pages = make([][steps][]Hit, 64) }},
 		{"last-page-pitch", func(s *Song) { s.Pages[62][15] = []Hit{{MIDI: 97}} }},

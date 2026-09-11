@@ -28,26 +28,24 @@ func main() {
 }
 
 func run() error {
-	fontPath := envOr("C1_FONT_PATH", filepath.Join("assets", "MiSans-Normal.ttf"))
 	booksDir := envOr("C1_BOOKS_DIR", defaultBooksDir)
 	if err := os.MkdirAll(booksDir, 0755); err != nil {
 		return fmt.Errorf("prepare Book directory: %w", err)
 	}
 	home := envOr("C1_BOOK_READER_HOME", "/usr/data/c1/book-reader")
-	fontData, err := os.ReadFile(fontPath)
-	if err != nil {
-		return fmt.Errorf("read font %s: %w", fontPath, err)
+	// Device root/home may be read-only. Keep converted EPUB/TXT content next
+	// to reader state, never beside the original book or in the app payload.
+	if os.Getenv("C1BOOK_READER_CACHE_DIR") == "" {
+		if err := os.Setenv("C1BOOK_READER_CACHE_DIR", filepath.Join(home, "documents")); err != nil {
+			return err
+		}
 	}
-	typeface, err := c1device.ParseTypeface(fontData)
-	if err != nil {
-		return err
-	}
-	uiFace, err := typeface.NewFace(readerUIFontSize)
+	uiFace, err := newReaderFace(false)
 	if err != nil {
 		return err
 	}
 	defer uiFace.Close()
-	bodyFace, err := typeface.NewFace(readerBodyFontSize)
+	bodyFace, err := newReaderFace(true)
 	if err != nil {
 		return err
 	}

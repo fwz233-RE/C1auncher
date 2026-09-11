@@ -136,7 +136,7 @@ func TestPageIndicatorHelp(t *testing.T) {
 		"I/O: TAP PAGE / HOLD INSERT",
 		"VOL KEYS: VOLUME  ENTER: SAVE  P: WAV",
 		"DEL X2: CLEAR  HOME/BACK: EXIT",
-		"8 BEATS/16 STEPS  L: CLOSE HELP",
+		"HOLD NOTE + RIGHT: TIE  L: CLOSE",
 	}
 	for i, line := range lines {
 		if 7+len(line)*6-1 > width || 29+i*15+7 > height {

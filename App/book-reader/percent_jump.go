@@ -33,6 +33,8 @@ func (app *readerApp) openPercentJump() {
 	offset := int64(0)
 	if app.view == viewChapters && app.chapterPick >= 0 && app.chapterPick < len(app.document.Chapters) {
 		offset = app.document.Chapters[app.chapterPick].Start
+	} else if app.view == viewBookmarks && app.bookmarkPick >= 0 && app.bookmarkPick < len(app.bookmarks) {
+		offset = app.bookmarks[app.bookmarkPick].Offset
 	} else if bookmark, ok := app.currentBookmark(); ok {
 		offset = bookmark.Offset
 	}
@@ -192,8 +194,8 @@ func (app *readerApp) handlePercentJump(event c1device.Event) {
 			return
 		}
 		if app.jumpToPercentUnits(percent) {
-			if app.percentOrigin == viewChapters {
-				app.readerOrigin = viewChapters
+			if app.percentOrigin == viewChapters || app.percentOrigin == viewBookmarks {
+				app.readerOrigin = app.percentOrigin
 			}
 			app.percentInput = ""
 			app.resumeOffset = 0

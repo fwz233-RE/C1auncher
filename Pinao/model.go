@@ -9,9 +9,10 @@ const steps = 16 // Eight beats, quantized to eighth notes.
 const keyFeedbackDuration = 1200 * time.Millisecond
 
 type Hit struct {
-	MIDI int `json:"midi"`
-	Tone int `json:"tone"`
-	Drum int `json:"drum"`
+	MIDI int  `json:"midi"`
+	Tone int  `json:"tone"`
+	Drum int  `json:"drum"`
+	Tie  bool `json:"tie,omitempty"` // Continue the same pitch/tone from the preceding cell (format 3).
 }
 type Song struct {
 	Format  int            `json:"format"`
@@ -25,15 +26,19 @@ type Song struct {
 
 func defaultSong() Song { return Song{Format: 1, BPM: 110, Octave: 4, Volume: 45} }
 func (s Song) validate() error {
-	if (s.Format != 1 && s.Format != 2) || (s.Format == 1 && len(s.Pages) != 0) || s.pageCount() > maxPages || s.BPM < 60 || s.BPM > 180 || s.Octave < 3 || s.Octave > 6 || s.Tone < 0 || s.Tone > 2 || s.Volume < 0 || s.Volume > 100 {
+	if (s.Format < 1 || s.Format > 3) || (s.Format == 1 && len(s.Pages) != 0) || s.pageCount() > maxPages || s.BPM < 60 || s.BPM > 180 || s.Octave < 3 || s.Octave > 6 || s.Tone < 0 || s.Tone > 2 || s.Volume < 0 || s.Volume > 100 {
 		return fmt.Errorf("invalid song settings")
 	}
 	for page := 0; page < s.pageCount(); page++ {
-		for _, notes := range *s.patternAt(page) {
+		for step, notes := range *s.patternAt(page) {
 			if len(notes) > 8 {
 				return fmt.Errorf("too many notes in a step")
 			}
 			for _, h := range notes {
+				pos := page*steps + step
+				if h.Tie && (s.Format != 3 || h.Drum != 0 || pos == 0 || noteIndex(s.cell(pos-1), h) < 0) {
+					return fmt.Errorf("invalid tie")
+				}
 				if h.Drum < 0 || h.Drum > 4 || h.Tone < 0 || h.Tone > 2 || (h.Drum == 0 && (h.MIDI < 36 || h.MIDI > 96)) {
 					return fmt.Errorf("invalid note")
 				}
@@ -49,6 +54,7 @@ type keyEvent struct {
 	Reset bool
 }
 type soundCommand struct {
+	Keep                         uint8 // Loop slots that continue without note-off/retrigger.
 	Kind                         string
 	ID, MIDI, Tone, Drum, Volume int
 }
@@ -80,6 +86,8 @@ type model struct {
 	ClearUntil    time.Time
 	ClearPage     int // A destructive confirmation never carries to another page.
 	Changed       time.Time
+	captures      [128]heldCapture
+	transport     loopTransport
 	commandBuffer [9]soundCommand
 	sparkBuffer   [32]spark
 }
@@ -112,12 +120,16 @@ func (m *model) changed(now time.Time) {
 func (m *model) stepDuration() time.Duration { return time.Minute / time.Duration(m.Song.BPM*2) }
 func (m *model) start(now time.Time)         { m.startFrom(now, 0) }
 func (m *model) startFrom(now time.Time, step int) {
+	m.cancelTies()
+	m.transport.valid = false
 	m.Playing, m.StepMode = true, false
 	m.Started, m.LastTick = now, -1
 	m.StartStep = m.Page*steps + (step%steps+steps)%steps
 	m.Step = m.StartStep % steps
 }
 func (m *model) stop() {
+	m.cancelTies()
+	m.transport.valid = false
 	m.Playing, m.Recording, m.StepMode = false, false, false
 	m.Step = -1
 }
@@ -128,6 +140,8 @@ func (m *model) clockStep(now time.Time) int {
 	return m.clockPosition(now) % steps
 }
 func (m *model) selectStep(delta int, now time.Time) {
+	manual := m.StepMode
+	from := m.Page*steps + m.Step
 	if m.Playing {
 		// Input is handled before tick in the main loop. Use the current clock
 		// position rather than a potentially stale last-rendered step.
@@ -139,6 +153,11 @@ func (m *model) selectStep(delta int, now time.Time) {
 		m.Step = (m.Step + delta + steps) % steps
 	}
 	m.Playing, m.StepMode = false, true
+	if manual {
+		m.extendHeld(from, now)
+	} else {
+		m.cancelTies()
+	}
 }
 func (m *model) setBPM(bpm int, now time.Time) {
 	if bpm == m.Song.BPM {
@@ -154,7 +173,12 @@ func (m *model) setBPM(bpm int, now time.Time) {
 		step := m.Step
 		m.Song.BPM = bpm
 		phase := (elapsed % oldDuration) * m.stepDuration() / oldDuration
+		previousTransport := m.transport
+		preserveTransport := int64(elapsed/oldDuration) <= m.LastTick+1
 		m.startFrom(now.Add(-phase), step)
+		if preserveTransport {
+			m.transport = previousTransport
+		}
 		if played {
 			m.LastTick = 0
 		}
@@ -180,8 +204,13 @@ func (m *model) record(h Hit, now time.Time) {
 	}
 	pattern := m.Song.patternAt(page)
 	notes := pattern[idx]
-	for _, old := range notes {
+	for i, old := range notes {
 		if old == h {
+			return
+		}
+		if sameNote(old, h) {
+			notes[i] = h // Pressing again explicitly rearticulates a tied note.
+			m.changed(now)
 			return
 		}
 	}
@@ -203,6 +232,7 @@ func (m *model) addSpark(k int, drum bool, now time.Time) {
 // handle returns commands plus an action (save/exit). Repeats are filtered at input.
 func (m *model) handle(e keyEvent, now time.Time) ([]soundCommand, string) {
 	if e.Reset {
+		m.cancelTies()
 		m.cancelPageGesture()
 		clear(m.Held)
 		m.Feedback = [13]time.Time{}
@@ -225,6 +255,9 @@ func (m *model) handle(e keyEvent, now time.Time) ([]soundCommand, string) {
 	if !e.Down {
 		if _, ok := m.Held[e.Code]; ok {
 			delete(m.Held, e.Code)
+			if e.Code < 128 {
+				m.captures[e.Code].Valid = false
+			}
 			if n, ok := keyNote(e.Code); ok {
 				m.Feedback[n] = now.Add(keyFeedbackDuration)
 			}
@@ -236,6 +269,7 @@ func (m *model) handle(e keyEvent, now time.Time) ([]soundCommand, string) {
 		return nil, "exit"
 	}
 	if e.Code == 38 || e.Code == 53 {
+		m.cancelTies()
 		m.cancelPageGesture()
 		m.Help = !m.Help
 		return nil, ""
@@ -251,7 +285,11 @@ func (m *model) handle(e keyEvent, now time.Time) ([]soundCommand, string) {
 		m.Held[e.Code] = midi
 		m.Feedback[n] = now.Add(keyFeedbackDuration)
 		m.addSpark(n, false, now)
-		m.record(Hit{MIDI: midi, Tone: m.Song.Tone}, now)
+		h := Hit{MIDI: midi, Tone: m.Song.Tone}
+		m.record(h, now)
+		if m.Recording && m.StepMode && m.Step >= 0 && noteIndex(m.currentPattern()[m.Step], h) >= 0 {
+			m.captures[e.Code] = heldCapture{Hit: h, Position: m.Page*steps + m.Step, Valid: true}
+		}
 		return []soundCommand{{Kind: "on", ID: int(e.Code), MIDI: midi, Tone: m.Song.Tone}}, ""
 	}
 	drum := -1
@@ -283,6 +321,7 @@ func (m *model) handle(e keyEvent, now time.Time) ([]soundCommand, string) {
 		}
 	case 19: // R starts automatic recording; a second press only disarms recording.
 		m.Recording = !m.Recording
+		m.cancelTies()
 		if m.Recording && !m.Playing {
 			if m.StepMode {
 				m.startFrom(now, m.Step)
@@ -314,9 +353,7 @@ func (m *model) handle(e keyEvent, now time.Time) ([]soundCommand, string) {
 			delta = -1
 		}
 		m.selectStep(delta, now)
-		if m.Recording {
-			m.message("STEP REC - PLAY NOTES INTO CELL", now)
-		} else {
+		if !m.Recording {
 			m.message("STEP VIEW - R: START RECORDING", now)
 		}
 		return []soundCommand{{Kind: "loop-off"}}, ""
@@ -343,6 +380,7 @@ func (m *model) handle(e keyEvent, now time.Time) ([]soundCommand, string) {
 	case 28, 352:
 		return nil, "save"
 	case 14, 111:
+		m.cancelTies()
 		if m.Playing {
 			m.syncPosition(now)
 		}
@@ -368,6 +406,7 @@ func (m *model) handle(e keyEvent, now time.Time) ([]soundCommand, string) {
 				m.message("CELL ALREADY EMPTY", now)
 			} else {
 				*cell = nil
+				m.Song.repairTies()
 				m.changed(now)
 				m.message("CELL CLEARED - DEL AGAIN: CLEAR ALL", now)
 			}
@@ -419,16 +458,14 @@ func (m *model) tick(now time.Time) []soundCommand {
 		return nil
 	}
 	// On a stall resume at the current step; never play a burst of stale notes.
+	contiguous := tick == m.LastTick+1
 	m.LastTick = tick
 	m.syncPosition(now)
-	commands := m.commandBuffer[:1]
-	commands[0] = soundCommand{Kind: "loop-off"}
-	for i, h := range m.currentPattern()[m.Step] {
+	commands := m.transport.commands(m.commandBuffer[:0], m.currentPattern()[m.Step], m.Page*steps+m.Step, contiguous)
+	for _, h := range m.currentPattern()[m.Step] {
 		if h.Drum > 0 {
-			commands = append(commands, soundCommand{Kind: "drum", ID: 300 + i, Drum: h.Drum - 1})
 			m.addSpark(h.Drum-1, true, now)
 		} else {
-			commands = append(commands, soundCommand{Kind: "on", ID: 300 + i, MIDI: h.MIDI, Tone: h.Tone})
 			m.addSpark(h.MIDI%12, false, now)
 		}
 	}
