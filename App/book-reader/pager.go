@@ -38,8 +38,10 @@ func Paginate(document *Document, chapter Chapter, start int64, face TextFace, w
 	if loadedEnd < chapter.End {
 		if cut := bytes.LastIndexByte(raw, '\n'); cut >= 0 {
 			raw = raw[:cut+1]
-			loadedEnd = start + int64(cut+1)
+		} else {
+			raw = completeTextWindow(raw, document.Encoding)
 		}
+		loadedEnd = start + int64(len(raw))
 	}
 	lines := make([]positionedLine, 0, bytes.Count(raw, []byte{'\n'})+1)
 	position := start
@@ -60,6 +62,15 @@ func Paginate(document *Document, chapter Chapter, start int64, face TextFace, w
 			continue
 		}
 		wrapped := face.Wrap(text, width)
+		var sourceOffsets []int
+		if document.Encoding == EncodingGB18030 {
+			original := bytes.TrimSuffix(bytes.TrimSuffix(part, []byte{'\n'}), []byte{'\r'})
+			encoded, _, encodeErr := transform.Bytes(simplifiedchinese.GB18030.NewEncoder(), []byte(text))
+			if encodeErr != nil || !bytes.Equal(encoded, original) {
+				sourceOffsets = gb18030SourceOffsets(original)
+			}
+		}
+		decodedOffset := 0
 		if len(wrapped) == 0 {
 			wrapped = []string{""}
 		}
@@ -74,6 +85,10 @@ func Paginate(document *Document, chapter Chapter, start int64, face TextFace, w
 					}
 				}
 				segmentEnd = segmentStart + int64(encodedLength)
+				decodedOffset += len(wrappedLine)
+				if sourceOffsets != nil && decodedOffset < len(sourceOffsets) {
+					segmentEnd = lineStart + int64(sourceOffsets[decodedOffset])
+				}
 				if segmentEnd > lineEnd {
 					segmentEnd = lineEnd
 				}

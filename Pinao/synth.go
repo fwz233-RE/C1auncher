@@ -32,6 +32,7 @@ func sine(phase uint32) float32 {
 
 type synthVoice struct {
 	active         bool
+	midi           int
 	id             int
 	serial         uint64
 	timbre         int
@@ -67,9 +68,10 @@ type synthVoice struct {
 // serialize control calls and Render. IDs identify notes, not MIDI pitches;
 // drums share the same ID space and the same eight slots.
 type Synth struct {
-	voices [voiceCount]synthVoice
-	serial uint64
-	volume float32
+	voices   [voiceCount]synthVoice
+	serial   uint64
+	volume   float32
+	loopKeep uint8 // Protect surviving continuations from sequencer voice recovery.
 }
 
 func NewSynth() *Synth {
@@ -104,12 +106,21 @@ func (s *Synth) allocate(id int) *synthVoice {
 		}
 	}
 	if index < 0 {
-		index = 0
-		for i := 1; i < voiceCount; i++ {
-			if s.voices[i].serial < s.voices[index].serial {
+		for i := range s.voices {
+			v := &s.voices[i]
+			// A sequencer recovery/new note may replace live or released voices,
+			// but must not cascade through other sustained notes in this batch.
+			// Live keys retain the original oldest-voice stealing behavior.
+			if id >= 300 && id < 308 && v.id >= 300 && v.id < 308 && s.loopKeep&(1<<uint(v.id-300)) != 0 {
+				continue
+			}
+			if index < 0 || v.serial < s.voices[index].serial {
 				index = i
 			}
 		}
+		if index < 0 {
+			index = 0
+		} // Defensive fallback for inconsistent external commands.
 	}
 	v := &s.voices[index]
 	tail := v.last
@@ -142,6 +153,7 @@ func (s *Synth) NoteOn(id int, midi int, timbre int, velocity float64) {
 	frequency := 440 * math.Exp2(float64(midi-69)/12)
 	v := s.allocate(id)
 	v.timbre = timbre
+	v.midi = midi
 	v.velocity = float32(velocity)
 	v.duration = maxHoldSamples
 	v.sustain = 0.28
@@ -193,6 +205,22 @@ func (v *synthVoice) release() {
 	v.releaseStep = v.envelope / releaseSamples
 }
 
+// Hold extends a sequenced note's timeout without restarting its oscillator or
+// envelope. If live playing stole the voice, re-create it rather than keeping a
+// wrong pitch alive. Manual keys still use the original eight-second guard.
+func (s *Synth) Hold(id, midi, tone int) {
+	for i := range s.voices {
+		v := &s.voices[i]
+		if v.active && !v.releasing && !v.drum && v.id == id && v.midi == midi && v.timbre == tone {
+			if v.duration-v.age < sampleRate*2 {
+				v.duration = v.age + sampleRate*2
+			}
+			return
+		}
+	}
+	s.NoteOn(id, midi, tone, 0.8)
+}
+
 func (s *Synth) NoteOff(id int) {
 	for i := range s.voices {
 		if s.voices[i].active && s.voices[i].id == id {
@@ -204,6 +232,7 @@ func (s *Synth) NoteOff(id int) {
 
 // AllOff releases all voices smoothly; call Render to drain the 25 ms release.
 func (s *Synth) AllOff() {
+	s.loopKeep = 0
 	for i := range s.voices {
 		s.voices[i].release()
 	}

@@ -171,7 +171,7 @@ func (app *readerApp) directoryHint() string {
 			forward = "→收起"
 		}
 	}
-	return "↑↓选择  " + back + "  " + forward + "  P书签"
+	return back + "  ↑上移  ↓下移  " + forward
 }
 
 func (app *readerApp) directoryCount() string {

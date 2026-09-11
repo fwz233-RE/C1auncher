@@ -118,6 +118,10 @@ func (canvas *Canvas) DrawTextThreshold(face *Face, x, top int, text string, thr
 	if text == "" {
 		return
 	}
+	if bitmap, ok := face.face.(*bitmapFace); ok {
+		canvas.drawBitmap(bitmap, x, top, text)
+		return
+	}
 	baseline := fixed.P(x, top+face.ascent)
 	glyphBounds, _ := font.BoundString(face.face, text)
 	bounds := image.Rect(

@@ -18,9 +18,6 @@ const (
 )
 
 const (
-	readerUIFontSize    = 15
-	readerBodyFontSize  = 17
-	readerBodyThreshold = 112
 	readerHeaderBottom  = 24
 	readerBodyTop       = 26
 	readerBodyBottom    = 128
@@ -29,37 +26,38 @@ const (
 	readerBodyHeight    = readerBodyBottom - readerBodyTop
 	readerListRowHeight = 22
 	readerListFooterTop = 130
-	chapterListHint     = "↑↓选择  ←返回  →阅读  P书签"
-	bookmarkListHint    = "↑↓选择  ←返回  →跳转  P删除"
+	chapterListHint     = "←返回  ↑上移  ↓下移  →阅读"
+	bookmarkListHint    = "←返回  ↑上移  ↓下移  →跳转"
 	readerFooterPrefix  = "←章节  ↑上页  ↓下页  "
 )
 
 type readerApp struct {
-	books           []Book
-	bookIndex       int
-	chapterIndex    int
-	chapterPick     int
-	bookmarkPick    int
-	view            viewMode
-	readerOrigin    viewMode
-	document        *Document
-	pages           []Page
-	pageIndex       int
-	windowStart     int64
-	windowEnd       int64
-	resumeOffset    int64
-	uiFace          *c1device.Face
-	bodyFace        *c1device.Face
-	store           ProgressStore
-	bookmarkStore   BookmarkStore
-	bookmarks       []Bookmark
-	dirty           bool
-	message         string
-	percentInput    string
-	percentValue    int
-	percentOrigin   viewMode
-	expandedVolumes map[int]bool
-	volumeBodyPick  bool
+	books             []Book
+	bookIndex         int
+	chapterIndex      int
+	chapterPick       int
+	bookmarkPick      int
+	view              viewMode
+	readerOrigin      viewMode
+	document          *Document
+	pages             []Page
+	chapterPagination *chapterPages
+	pageIndex         int
+	windowStart       int64
+	windowEnd         int64
+	resumeOffset      int64
+	uiFace            *c1device.Face
+	bodyFace          *c1device.Face
+	store             ProgressStore
+	bookmarkStore     BookmarkStore
+	bookmarks         []Bookmark
+	dirty             bool
+	message           string
+	percentInput      string
+	percentValue      int
+	percentOrigin     viewMode
+	expandedVolumes   map[int]bool
+	volumeBodyPick    bool
 }
 
 func newReaderApp(booksDir string, uiFace, bodyFace *c1device.Face, store ProgressStore, bookmarkStore BookmarkStore) (*readerApp, error) {
@@ -85,6 +83,16 @@ func (app *readerApp) handleEvent(event c1device.Event) (exit bool) {
 		case c1device.KeyUp, c1device.KeyDown, c1device.KeyVolumeUp, c1device.KeyVolumeDown:
 		default:
 			return false
+		}
+	}
+	// Use volume + for down and volume - for up, as requested for navigation.
+	// The numeric jump dialog retains +/- values.
+	if app.view != viewPercentJump {
+		switch event.Key {
+		case c1device.KeyVolumeUp:
+			event.Key = c1device.KeyDown
+		case c1device.KeyVolumeDown:
+			event.Key = c1device.KeyUp
 		}
 	}
 	app.message = ""
@@ -120,6 +128,10 @@ func (app *readerApp) handleEvent(event c1device.Event) (exit bool) {
 		}
 	case viewBookmarks:
 		switch event.Key {
+		case c1device.KeyRune:
+			if event.Rune == 'o' || event.Rune == 'O' {
+				app.openPercentJump()
+			}
 		case c1device.KeyUp:
 			app.bookmarkPick = moveSelection(app.bookmarkPick, -1, len(app.bookmarks))
 		case c1device.KeyDown:
@@ -147,9 +159,9 @@ func (app *readerApp) handleEvent(event c1device.Event) (exit bool) {
 			} else {
 				app.view = viewChapters
 			}
-		case c1device.KeyUp, c1device.KeyVolumeUp:
+		case c1device.KeyUp:
 			app.previousPage()
-		case c1device.KeyDown, c1device.KeyVolumeDown:
+		case c1device.KeyDown:
 			app.nextPage()
 		case c1device.KeyRight:
 			app.toggleBookmark()
@@ -208,13 +220,14 @@ func (app *readerApp) openSelectedBook() {
 	}
 	app.bookmarkPick = 0
 	app.pages = nil
+	app.chapterPagination = nil
 	app.pageIndex = 0
 	app.resumeOffset = 0
 	app.bookmarks = nil
 	if saved, ok, err := app.store.Load(document.Path); err == nil && ok {
-		if validPosition(document, saved.Chapter, saved.Offset) {
-			app.revealChapter(saved.Chapter)
-			app.chapterIndex = saved.Chapter
+		if chapter, valid := restoredChapter(document, saved.Chapter, saved.Offset); valid {
+			app.revealChapter(chapter)
+			app.chapterIndex = chapter
 			app.resumeOffset = saved.Offset
 		}
 	}
@@ -235,10 +248,28 @@ func validPosition(document *Document, chapterIndex int, offset int64) bool {
 	return offset >= chapter.Start && offset < chapter.End
 }
 
+// TXT heading recognition may split an old chapter, while its source bytes
+// remain identical. The fingerprint-checked byte offset is authoritative.
+func restoredChapter(document *Document, stored int, offset int64) (int, bool) {
+	if validPosition(document, stored, offset) {
+		return stored, true
+	}
+	if document == nil || document.dataPath != "" || stored < 0 || stored >= len(document.Chapters) || offset < 0 || offset >= document.Size {
+		return 0, false
+	}
+	for i, chapter := range document.Chapters {
+		if offset >= chapter.Start && offset < chapter.End {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
 func validBookmarks(document *Document, bookmarks []Bookmark) []Bookmark {
 	valid := make([]Bookmark, 0, len(bookmarks))
 	for _, bookmark := range bookmarks {
-		if validPosition(document, bookmark.Chapter, bookmark.Offset) {
+		if chapter, ok := restoredChapter(document, bookmark.Chapter, bookmark.Offset); ok {
+			bookmark.Chapter = chapter
 			valid = append(valid, bookmark)
 		}
 	}
@@ -267,20 +298,7 @@ func (app *readerApp) openChapter(chapterIndex int, offset int64) bool {
 	if !validPosition(app.document, chapterIndex, offset) {
 		offset = app.document.Chapters[chapterIndex].Start
 	}
-	chapter := app.document.Chapters[chapterIndex]
-	pages, end, err := Paginate(app.document, chapter, offset, app.bodyFace, readerTextWidth, readerBodyHeight)
-	if err != nil {
-		app.message = err.Error()
-		return false
-	}
-	// Commit chapter and pages together only after the read succeeds.
-	app.chapterIndex = chapterIndex
-	app.revealChapter(chapterIndex)
-	app.pages, app.pageIndex = pages, 0
-	app.windowStart, app.windowEnd = offset, end
-	app.view = viewReader
-	app.dirty = true
-	return true
+	return app.openCountedChapter(chapterIndex, offset, false)
 }
 
 func (app *readerApp) loadChapter(offset int64) {
@@ -309,36 +327,7 @@ func (app *readerApp) previousPage() {
 		app.dirty = true
 		return
 	}
-	chapter := app.document.Chapters[app.chapterIndex]
-	if app.windowStart > chapter.Start {
-		start := app.windowStart - maxChapterWindow
-		if start < chapter.Start {
-			start = chapter.Start
-		}
-		if aligned, alignErr := app.document.AlignLineStart(start, chapter.Start); alignErr == nil {
-			start = aligned
-		}
-		pages, end, err := Paginate(app.document, chapter, start, app.bodyFace, readerTextWidth, readerBodyHeight)
-		if err == nil && len(pages) > 0 {
-			app.pages, app.pageIndex = pages, len(pages)-1
-			app.windowStart, app.windowEnd = start, end
-			app.dirty = true
-		}
-		return
-	}
-	if previousIndex, ok := app.document.readableChapter(app.chapterIndex-1, -1); ok {
-		previous := app.document.Chapters[previousIndex]
-		start := previous.Start
-		if previous.End-previous.Start > maxChapterWindow {
-			start = previous.End - maxChapterWindow
-			if aligned, alignErr := app.document.AlignLineStart(start, previous.Start); alignErr == nil {
-				start = aligned
-			}
-		}
-		if app.openChapter(previousIndex, start) && len(app.pages) > 0 {
-			app.pageIndex = len(app.pages) - 1
-		}
-	}
+	app.previousChapterPage()
 }
 
 func (app *readerApp) jumpToPercent(percent int) bool {
@@ -523,18 +512,24 @@ func (app *readerApp) bookmarkLabels() []string {
 }
 
 func (app *readerApp) renderList(canvas *c1device.Canvas, title string, items []string, selected int, unit, hint string) {
-	const rowTop = readerHeaderBottom + 2
+	rowTop, headerBottom := readerHeaderBottom+2, readerHeaderBottom
 	count := fmt.Sprintf("%d %s", len(items), unit)
-	titleWidth := 210
 	if app.view == viewChapters {
 		count = app.directoryCount()
-		buttonLeft := 290 - app.uiFace.Measure(count) - 8 - 77
-		titleWidth = buttonLeft - 12
-		canvas.DrawTextInverted(app.uiFace, image.Rect(buttonLeft, 1, buttonLeft+77, 22), buttonLeft+5, 1, "O跳转")
+	}
+	titleWidth := 290 - app.uiFace.Measure(count) - 14
+	if app.view == viewChapters || app.view == viewBookmarks {
+		rowTop, headerBottom = 40, 40
+		canvas.DrawTextInverted(app.uiFace, image.Rect(6, 19, 82, 37), 12, 20, "O跳转")
+		shortcut := "P书签"
+		if app.view == viewBookmarks {
+			shortcut = "P删除"
+		}
+		canvas.DrawTextInverted(app.uiFace, image.Rect(88, 19, 164, 37), 94, 20, shortcut)
 	}
 	canvas.DrawText(app.uiFace, 6, 1, fitText(app.uiFace, title, titleWidth))
 	canvas.DrawTextRight(app.uiFace, 290, 1, count)
-	canvas.FillRect(image.Rect(4, readerHeaderBottom-2, 292, readerHeaderBottom))
+	canvas.FillRect(image.Rect(4, headerBottom-2, 292, headerBottom))
 	if len(items) == 0 {
 		emptyTitle, emptyHint := "暂无内容", "请连接设备后添加文件"
 		if title == "书签" {
@@ -573,7 +568,11 @@ func (app *readerApp) renderList(canvas *c1device.Canvas, title string, items []
 	if app.message != "" {
 		footer = fitText(app.uiFace, app.message, 280)
 	}
-	canvas.DrawInvertedTextBar(app.uiFace, image.Rect(0, readerListFooterTop, c1device.DisplayWidth, c1device.DisplayHeight), footer)
+	if app.message == "" && (app.view == viewChapters || app.view == viewBookmarks) {
+		app.drawNavigationFooter(canvas, hint)
+	} else {
+		canvas.DrawInvertedTextBar(app.uiFace, image.Rect(0, readerListFooterTop, c1device.DisplayWidth, c1device.DisplayHeight), footer)
+	}
 }
 
 func (app *readerApp) renderReader(canvas *c1device.Canvas) {
@@ -581,14 +580,19 @@ func (app *readerApp) renderReader(canvas *c1device.Canvas) {
 	if len(app.pages) > 0 && app.document.Size > 0 {
 		percent = float64(app.pages[app.pageIndex].Start) * 100 / float64(app.document.Size)
 	}
-	canvas.DrawText(app.uiFace, 6, 1, fitText(app.uiFace, app.document.contextualChapterTitle(app.chapterIndex), 216))
-	canvas.DrawTextRight(app.uiFace, 290, 1, fmt.Sprintf("%.2f%%", percent))
+	percentage := fmt.Sprintf("%.2f%%", percent)
+	pageLabel := app.chapterPageLabel()
+	percentLeft := 290 - app.uiFace.Measure(percentage)
+	pageLeft := percentLeft - 10 - app.uiFace.Measure(pageLabel)
+	canvas.DrawText(app.uiFace, 6, 1, fitText(app.uiFace, app.document.contextualChapterTitle(app.chapterIndex), pageLeft-14))
+	canvas.DrawText(app.uiFace, pageLeft, 1, pageLabel)
+	canvas.DrawTextRight(app.uiFace, 290, 1, percentage)
 	canvas.FillRect(image.Rect(4, readerHeaderBottom-2, 292, readerHeaderBottom))
 	if len(app.pages) > 0 {
 		page := app.pages[app.pageIndex]
 		y := readerBodyTop
 		for _, line := range page.Lines {
-			canvas.DrawTextThreshold(app.bodyFace, 7, y, line, readerBodyThreshold)
+			canvas.DrawText(app.bodyFace, 7, y, line)
 			y += app.bodyFace.LineHeight()
 		}
 	}

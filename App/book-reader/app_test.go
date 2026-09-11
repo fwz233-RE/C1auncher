@@ -201,10 +201,10 @@ func TestReaderReturnsToBookmarkListAfterBookmarkJump(t *testing.T) {
 }
 
 func TestListHintsPutBackBeforeForward(t *testing.T) {
-	if chapterListHint != "↑↓选择  ←返回  →阅读  P书签" {
+	if chapterListHint != "←返回  ↑上移  ↓下移  →阅读" {
 		t.Fatalf("chapter hint = %q", chapterListHint)
 	}
-	if bookmarkListHint != "↑↓选择  ←返回  →跳转  P删除" {
+	if bookmarkListHint != "←返回  ↑上移  ↓下移  →跳转" {
 		t.Fatalf("bookmark hint = %q", bookmarkListHint)
 	}
 	if readerFooterPrefix != "←章节  ↑上页  ↓下页  " {

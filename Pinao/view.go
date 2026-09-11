@@ -11,6 +11,8 @@ type viewState struct {
 	StepMode                  bool
 	Page, PageCount           int
 	Step                      int
+	Ties                      uint16 // Bits mark continuations into each cell, including the previous page.
+	TieOut                    bool
 	Pattern, Keys, Notes      uint16
 	Drums                     uint8
 	Footer                    string
@@ -25,8 +27,20 @@ func (m *model) view(now time.Time) viewState {
 	v.Playing, v.Recording, v.Step = m.Playing, m.Recording, m.Step
 	v.StepMode = m.StepMode
 	for i, hits := range *m.currentPattern() {
+		for _, h := range hits {
+			if h.Tie {
+				v.Ties |= 1 << uint(i)
+			}
+		}
 		if len(hits) > 0 {
 			v.Pattern |= 1 << uint(i)
+		}
+	}
+	if m.Page+1 < m.Song.pageCount() {
+		for _, h := range m.Song.patternAt(m.Page + 1)[0] {
+			if h.Tie {
+				v.TieOut = true
+			}
 		}
 	}
 	for i, until := range m.Feedback {

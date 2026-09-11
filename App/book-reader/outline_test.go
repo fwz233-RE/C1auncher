@@ -109,7 +109,7 @@ func TestVolumeDirectoryExpandCollapseAndReadIntroduction(t *testing.T) {
 		t.Fatalf("collapsed rows=%+v", rows)
 	}
 	app.handle(c1device.KeyDown)
-	if app.chapterPick != 1 || app.directoryHint() != "↑↓选择  ←返回  →展开  P书签" {
+	if app.chapterPick != 1 || app.directoryHint() != "←返回  ↑上移  ↓下移  →展开" {
 		t.Fatal("volume header not selected")
 	}
 	app.handle(c1device.KeyRight)
@@ -259,7 +259,7 @@ func TestLegacyCacheProgressAndBookmarksKeepStableChapterIDs(t *testing.T) {
 	if err := json.Unmarshal(data, &rebuilt); err != nil {
 		t.Fatal(err)
 	}
-	if rebuilt.Version != 2 || !rebuilt.Chapters[1].HasBody {
+	if rebuilt.Version != chapterIndexCacheVersion || !rebuilt.Chapters[1].HasBody {
 		t.Fatal("legacy cache not rebuilt")
 	}
 	app.handle(c1device.KeyRight)

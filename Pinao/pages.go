@@ -94,7 +94,9 @@ func (m *model) changePage(delta int, now time.Time) {
 		m.message("EDGE - HOLD I/O: INSERT PAGE", now)
 		return
 	}
+	from := m.Page*steps + m.Step
 	m.Page, m.Step = next, 0
+	m.extendHeld(from, now)
 	m.ClearUntil = time.Time{}
 	m.pageSavePending = true
 	m.message(fmt.Sprintf("PAGE %02d/%02d", m.Page+1, m.Song.pageCount()), now)
@@ -110,14 +112,21 @@ func (m *model) insertPage(delta int, now time.Time) {
 	}
 	// Move page slice headers, preserving all note data. The inserted page is
 	// blank, not a copy. Its array and all existing page arrays are independent.
+	from := m.Page*steps + m.Step
 	oldCount := m.Song.pageCount()
 	m.Song.Pages = append(m.Song.Pages, [steps][]Hit{})
 	for p := oldCount; p > index; p-- {
 		*m.Song.patternAt(p) = *m.Song.patternAt(p - 1)
 	}
 	*m.Song.patternAt(index) = [steps][]Hit{}
-	m.Song.Format = 2
+	m.Song.Format = max(2, m.Song.Format)
+	m.Song.repairTies()
 	m.Page, m.Step = index, 0
+	if delta > 0 {
+		m.extendHeld(from, now)
+	} else {
+		m.cancelTies()
+	}
 	m.Playing, m.StepMode = false, true
 	m.ClearUntil = time.Time{}
 	m.changed(now)
