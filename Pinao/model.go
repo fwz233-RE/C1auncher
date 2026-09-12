@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -25,6 +26,59 @@ type Song struct {
 }
 
 func defaultSong() Song { return Song{Format: 1, BPM: 110, Octave: 4, Volume: 45} }
+
+// firstInstallSong is written only when the device has no user song yet.
+// The embedded melody is the right-hand Octave 5 arrangement supplied for the
+// first-run experience; subsequent launches load the user's saved project.
+func firstInstallSong() Song {
+	s := Song{Format: 2, BPM: 95, Octave: 5, Volume: 75}
+	midi := map[byte]int{'A': 72, 'S': 74, 'D': 76, 'F': 77, 'G': 79, 'H': 81, 'J': 83, 'K': 84}
+	const score = `D+A S+A A+A S+A | D+F F+F D+F S+G |
+D+A S+A A+A S+A | D+F F+F D+F S+G |
+D+A S+A A+A S+A | D+F F+F D+F S+G |
+D+A S+A A+A S+A | D+F F+F D+F S+G |
+D+A D+A S+A F+F D+F S+G |
+S+A S+A A+A A+F F+F D+F S+G |
+S+A A+F S+F D+G |
+0 D+G G+A K+A |
+J+A K+A J+A K+A |
+J+G H+G G+G G+G S+G F+G |
+F+A D+A D+A G+G |
+F+A D+A S+A D+G G+G |
+A+A 0 A+A |
+S+G A+G J+G A+G G+G A+G |
+F+A D+A S+G A+A A+A |
+A+A 0 A+A S+A |
+D+A D+A S+A F+F D+F S+G |
+S+A S+A A+A F+F D+F S+G |
+S+A A+F S+F D+G |
+0 D+G G+A K+A`
+	cells := make([][]Hit, 0, 112)
+	for _, token := range strings.Fields(score) {
+		if token == "|" {
+			continue
+		}
+		if token == "0" {
+			cells = append(cells, nil)
+			continue
+		}
+		cells = append(cells, []Hit{{MIDI: midi[token[0]], Tone: 0}})
+	}
+	for len(cells) < steps {
+		cells = append(cells, nil)
+	}
+	copy(s.Pattern[:], cells[:steps])
+	for offset := steps; offset < len(cells); offset += steps {
+		var page [steps][]Hit
+		end := offset + steps
+		if end > len(cells) {
+			end = len(cells)
+		}
+		copy(page[:], cells[offset:end])
+		s.Pages = append(s.Pages, page)
+	}
+	return s
+}
 func (s Song) validate() error {
 	if (s.Format < 1 || s.Format > 3) || (s.Format == 1 && len(s.Pages) != 0) || s.pageCount() > maxPages || s.BPM < 60 || s.BPM > 180 || s.Octave < 3 || s.Octave > 6 || s.Tone < 0 || s.Tone > 2 || s.Volume < 0 || s.Volume > 100 {
 		return fmt.Errorf("invalid song settings")

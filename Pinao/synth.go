@@ -10,7 +10,7 @@ const (
 	phaseScale     = 4294967296.0 / sampleRate
 	attackSamples  = sampleRate / 200 // 5 ms
 	releaseSamples = sampleRate / 40  // 25 ms
-	tailSamples    = sampleRate / 200
+	tailSamples    = sampleRate / 1000 // 1 ms retrigger continuity fade
 	maxHoldSamples = 8 * sampleRate
 )
 
@@ -90,19 +90,19 @@ func (s *Synth) SetVolume(v int) {
 }
 
 func (s *Synth) allocate(id int) *synthVoice {
-	index := -1
+	// A retrigger must not overwrite the oscillator that is currently producing
+	// the old note. Release every older instance of this logical ID, then start
+	// the new attack in a separate slot whenever one is available.
 	for i := range s.voices {
 		if s.voices[i].active && s.voices[i].id == id {
-			index = i
-			break
+			s.voices[i].release()
 		}
 	}
-	if index < 0 {
-		for i := range s.voices {
-			if !s.voices[i].active {
-				index = i
-				break
-			}
+	index := -1
+	for i := range s.voices {
+		if !s.voices[i].active {
+			index = i
+			break
 		}
 	}
 	if index < 0 {
@@ -110,7 +110,6 @@ func (s *Synth) allocate(id int) *synthVoice {
 			v := &s.voices[i]
 			// A sequencer recovery/new note may replace live or released voices,
 			// but must not cascade through other sustained notes in this batch.
-			// Live keys retain the original oldest-voice stealing behavior.
 			if id >= 300 && id < 308 && v.id >= 300 && v.id < 308 && s.loopKeep&(1<<uint(v.id-300)) != 0 {
 				continue
 			}
@@ -118,15 +117,14 @@ func (s *Synth) allocate(id int) *synthVoice {
 				index = i
 			}
 		}
-		if index < 0 {
-			index = 0
-		} // Defensive fallback for inconsistent external commands.
+	}
+	if index < 0 {
+		index = 0
 	}
 	v := &s.voices[index]
-	tail := v.last
 	s.serial++
 	*v = synthVoice{active: true, id: id, serial: s.serial, velocity: 1,
-		attack: attackSamples, transient: 1, tail: tail, tailLeft: tailSamples}
+		attack: attackSamples, transient: 1}
 	return v
 }
 

@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$Version = '0.2.0', [string]$OutputPath)
+param([string]$Version = '1.0.0', [string]$OutputPath)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if ($Version -cnotmatch '^(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*)){1,3}$') { throw 'Invalid numeric version.' }
