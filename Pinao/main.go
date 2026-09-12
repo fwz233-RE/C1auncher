@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -71,13 +70,26 @@ func run(args []string) error {
 	if *wav != "" {
 		return exportWAV(*wav, demoSong())
 	}
-	song, e := loadSong(*songPath)
+	_, statErr := os.Stat(*songPath)
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return statErr
+	}
+	missing := errors.Is(statErr, os.ErrNotExist)
+	var song Song
+	if missing && *songPath == defaultSongPath() {
+		song = firstInstallSong()
+		if e := saveSong(*songPath, song); e != nil {
+			return fmt.Errorf("write first-install song: %w", e)
+		}
+	} else {
+		var e error
+		song, e = loadSong(*songPath)
+		if e != nil {
+			return e
+		}
+	}
 	if *smoke {
 		song = demoSong()
-		e = nil
-	}
-	if e != nil {
-		return e
 	}
 	if *export != "" {
 		return exportWAV(*export, song)
@@ -244,8 +256,13 @@ func runDevice(ctx context.Context, song Song, path string, smoke bool) (result 
 	}
 }
 
-// Keep exports next to user data, never in the immutable installed package.
-func ensureExportDirectory(songPath string) (string, error) {
-	dir := filepath.Join(filepath.Dir(songPath), "exports")
-	return dir, os.MkdirAll(dir, 0700)
+// Exports belong to the removable storage Music directory exposed by the
+// device, rather than beside the private Pinao project file.
+const removableMusicDirectory = "/storage/mtp/Music"
+
+func ensureExportDirectory(string) (string, error) {
+	if err := os.MkdirAll(removableMusicDirectory, 0700); err != nil {
+		return "", fmt.Errorf("create removable Music directory: %w", err)
+	}
+	return removableMusicDirectory, nil
 }
