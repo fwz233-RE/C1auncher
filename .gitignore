@@ -12,8 +12,6 @@
 !/App/
 !/Pinao/
 !/ChiChuGames/
-!/InkWars/
-!/C1ancher-server/
 !/term-ime/
 
 # Build products, device evidence, caches and local environments.
@@ -81,6 +79,11 @@ id_ed25519
 !/C1ancher/tests/
 !/C1ancher/third_party/
 !/C1ancher/tools/
+
+# These projects stay local and are excluded from all future uploads.
+/C1ancher-server/
+/tools/publisher/
+/InkWars/
 
 # Maintainer-only deployment helpers are not an application developer interface.
 /Pinao/scripts/authorize-server.py
