@@ -11,6 +11,10 @@ This follows the existing core project's GPL v3 license.
 Third-party code and assets retain their original licenses; see
 THIRD_PARTY_NOTICES.md and the notices in the component directories.
 
+The imported term-ime/ component retains its upstream MIT license declaration
+and the individual licenses of its vendored dependencies and data. It is not
+relicensed under the repository's GPL default; see term-ime/THIRD_PARTY_NOTICES.md.
+
 The separately distributed c1publish executables have their own distribution
 notices. See the publisher kit's DISTRIBUTION-NOTE.txt and
 THIRD_PARTY_NOTICES.txt.

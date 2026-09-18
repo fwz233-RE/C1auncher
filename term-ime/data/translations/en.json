@@ -1,0 +1,32 @@
+{
+  "mode.chinese": "中文",
+  "mode.english": "EN",
+
+  "hint.toggle_mode": "Toggle",
+  "hint.select": "Select",
+  "hint.cancel": "Cancel",
+  "hint.switch_lang": "Language",
+
+  "status.pinyin": "Pinyin",
+  "status.initializing": "Initializing...",
+  "status.ui_lang": "UI Language",
+
+  "error.init_failed": "Initialization failed",
+  "error.config_load_failed": "Config load failed",
+
+  "kaomoji.happy": "Happy",
+  "kaomoji.sad": "Sad",
+  "kaomoji.love": "Love",
+  "kaomoji.angry": "Angry",
+  "kaomoji.cute": "Cute",
+  "kaomoji.search": "Search Kaomoji",
+
+  "settings.language": "Language",
+  "settings.title": "Settings",
+  "settings.ui_language": "UI Language",
+  "settings.max_candidates": "Candidates",
+  "settings.fuzzy_pinyin": "Fuzzy pinyin",
+  "option.off": "Off",
+  "option.on": "On",
+  "settings.close": "Close"
+}

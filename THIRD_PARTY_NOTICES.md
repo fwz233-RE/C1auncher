@@ -16,6 +16,11 @@
 - ChiChuGames 的 Adafruit 字体与 Kenney 音效见 [游戏第三方说明](ChiChuGames/THIRD_PARTY_NOTICES.md)。
 - Pinao 的音色和鼓声由程序合成，不附带用户录音或商业音频采样。
 
+## 终端输入法
+
+- [`term-ime/`](term-ime/README.md) 作为普通目录纳入主仓库，保留原项目的 MIT 许可声明，不改成主仓库的 GPL 默认许可。
+- Rime、FTXUI、libuv 等依赖及词库各自保留原许可；来源、固定版本与完整许可位置见 [输入法第三方说明](term-ime/THIRD_PARTY_NOTICES.md)。
+
 ## 发布工具附件
 
 `c1publish` 在 GitHub Release 提供客户端下载，适用的分发说明与许可见 [分发说明](tools/publisher/DISTRIBUTION-NOTE.txt) 和 [Go 第三方许可](tools/publisher/THIRD_PARTY_NOTICES.txt)。

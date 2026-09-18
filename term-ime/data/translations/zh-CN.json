@@ -1,0 +1,32 @@
+{
+  "mode.chinese": "中文",
+  "mode.english": "EN",
+
+  "hint.toggle_mode": "切换",
+  "hint.select": "选择",
+  "hint.cancel": "取消",
+  "hint.switch_lang": "切换语言",
+
+  "status.pinyin": "拼音",
+  "status.initializing": "初始化中...",
+  "status.ui_lang": "界面语言",
+
+  "error.init_failed": "初始化失败",
+  "error.config_load_failed": "配置加载失败",
+
+  "kaomoji.happy": "开心",
+  "kaomoji.sad": "难过",
+  "kaomoji.love": "爱",
+  "kaomoji.angry": "生气",
+  "kaomoji.cute": "可爱",
+  "kaomoji.search": "搜索颜文字",
+
+  "settings.language": "语言",
+  "settings.title": "设置",
+  "settings.ui_language": "界面语言",
+  "settings.max_candidates": "候选词数量",
+  "settings.fuzzy_pinyin": "模糊音",
+  "option.off": "关",
+  "option.on": "开",
+  "settings.close": "关闭"
+}

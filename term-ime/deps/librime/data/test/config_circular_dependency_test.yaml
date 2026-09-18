@@ -1,0 +1,8 @@
+test:
+  __patch: sometimes?
+  home: excited
+  work:
+    __include: /test/home
+
+sometimes:
+  home: naive

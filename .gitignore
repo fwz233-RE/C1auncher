@@ -14,6 +14,7 @@
 !/ChiChuGames/
 !/InkWars/
 !/C1ancher-server/
+!/term-ime/
 
 # Build products, device evidence, caches and local environments.
 **/build/

@@ -26,6 +26,7 @@
 - [`App/badapple/`](App/badapple/README.md)：内置动画、安装即用的 Bad Apple 单色帧播放器及电脑端素材预处理工具（当前无声）。
 - [`App/refresh-test/`](App/refresh-test/README.md)：屏幕刷新测试，全键盘调速、可拍摄帧编号及提交时序日志。
 - [`Pinao/`](Pinao/README.md)：钢琴应用；保留原目录拼写。
+- [`term-ime/`](term-ime/README.md)：Linux 终端中文输入法，内置 Rime 与依赖源码，作为普通目录维护；设备端 MIPS 构建仍待验证。
 - [`ChiChuGames/`](ChiChuGames/README.md)：游戏应用。
 - [`examples/hello/`](examples/hello/README.md)：不依赖其他项目的终端应用示例。
 - [`C1ancher-server/`](C1ancher-server/PUBLIC-README.md)：自助注册发布器及共用应用仓库服务源码。

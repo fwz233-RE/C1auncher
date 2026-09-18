@@ -1,0 +1,43 @@
+# tests for ConfigCompiler features
+
+include_local_reference:
+  - __include: starcraft
+  - __include: /starcraft
+  - __include: :starcraft
+  - __include: :/starcraft
+
+include_external_reference:
+  terrans:
+    __include: config_test:/terrans
+
+include_external_file:
+  __include: config_test:/
+
+patch_reference:
+  __patch: /local/patch
+  battlefields:
+    - lost temple
+    - luna
+    - hunters
+
+patch_literal:
+  __patch:
+    zerg/ground_units/@next: lurker
+  zerg:
+    __include: /starcraft/zerg
+
+patch_list:
+  protoss:
+    __include: /starcraft/protoss
+  __patch:
+    - protoss/ground_units/@next: dark templar
+    - protoss/ground_units/@next: dark archon
+
+# data for testing
+
+local:
+  patch:
+    battlefields/@next: match point
+
+starcraft:
+  __include: starcraft:/

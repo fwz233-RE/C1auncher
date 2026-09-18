@@ -1,0 +1,5 @@
+# Keep vendored upstream source, test fixtures and licenses byte-for-byte.
+/deps/** -text
+*.ocd2 binary
+*.woff2 binary
+*.pdf binary

@@ -1,0 +1,124 @@
+# Rime schema
+# encoding: utf-8
+# 朙月拼音·简化字版·模糊音
+# luna_pinyin_simp 加上模糊音（n/l、zh/z、r/l、r/y、hu/f、en-eng/in-ing、an-ang/ian-iang/uan-uang）。
+# 设置面板的「模糊音」开关在这份 schema 与 luna_pinyin_simp（精确拼音）之间切换，
+# 因此切换不需要重部署——两份 schema 各有一份自己的 prism。
+
+schema:
+  schema_id: luna_pinyin_simp_fuzzy
+  name: 明月拼音·简体·模糊音
+  version: "0.31"
+  description: |
+    朙月拼音，简化字输出模式，启用模糊音。
+    使用 luna_pinyin 词典 + OpenCC 简化字转换。
+
+switches:
+  - name: ascii_mode
+    reset: 0
+    states: ["中文", "西文"]
+  - name: full_shape
+    states: ["半角", "全角"]
+  - name: zh_hans
+    reset: 1
+    states: ["漢字", "汉字"]
+  - name: ascii_punct
+    states: ["。，", "．，"]
+
+engine:
+  processors:
+    - ascii_composer
+    - recognizer
+    - key_binder
+    - speller
+    - punctuator
+    - selector
+    - navigator
+    - express_editor
+  segmentors:
+    - ascii_segmentor
+    - matcher
+    - abc_segmentor
+    - punct_segmentor
+    - fallback_segmentor
+  translators:
+    - punct_translator
+    - script_translator
+    - reverse_lookup_translator
+  filters:
+    - simplifier@zh_hans
+    - uniquifier
+
+speller:
+  alphabet: zyxwvutsrqponmlkjihgfedcba
+  delimiter: " '"
+  algebra:
+    - erase/^xx$/
+    - abbrev/^([a-z]).+$/$1/
+    - abbrev/^([a-z]+[a-z]).+$/$1/
+    - derive/^([nl])ue/$1ve/
+    - derive/^([jqxy])u/$1v/
+    - derive/un$/uen/
+    - derive/iu$/iou/
+    - derive/ui$/uei/
+    - derive/ong$/on/
+    - derive/iong$/ion/
+    # 模糊音，与 data/rime-data/pinyin.yaml 的
+    # zh_z_bufen / n_l_bufen / r_l_bufen / r_y_bufen / hu_f_buhun / en_eng_bufen 等价
+    - derive/^([zcs])h/$1/
+    - derive/^([zcs])([^h])/$1h$2/
+    - derive/^n/l/
+    - derive/^l/n/
+    - derive/^r/l/
+    - derive/^ren/yin/
+    - derive/^r/y/
+    - derive/^hu$/fu/
+    - derive/^hong$/feng/
+    - derive/^hu([in])$/fe$1/
+    - derive/^hu([ao])/f$1/
+    - derive/^fu$/hu/
+    - derive/^feng$/hong/
+    - derive/^fe([in])$/hu$1/
+    - derive/^f([ao])/hu$1/
+    - derive/([ei])n$/$1ng/
+    - derive/([ei])ng$/$1n/
+    # an/ang（一条规则同时覆盖 ian/iang、uan/uang、üan/üang）
+    - derive/an$/ang/
+    - derive/ang$/an/
+
+translator:
+  dictionary: luna_pinyin
+  prism: luna_pinyin_simp_fuzzy
+  preedit_format:
+    - xform/([nl])v/$1ü/
+    - xform/([nl])ue/$1üe/
+    - xform/([jqxy])v/$1u/
+
+simplifier:
+  opencc_config: t2s_full.json
+  tags: [abc]
+  tips: none
+  option_name: "x"
+
+zh_hans:
+  option_name: zh_hans
+  opencc_config: t2s_full.json
+  tips: none
+  excluded_types: [reverse_lookup]
+
+key_binder:
+  bindings:
+    - {when: composing, accept: Control+p, send: Up}
+    - {when: composing, accept: Control+n, send: Down}
+    - {when: composing, accept: Control+b, send: Left}
+    - {when: composing, accept: Control+f, send: Right}
+    - {when: composing, accept: Control+a, send: Home}
+    - {when: composing, accept: Control+e, send: End}
+    - {when: composing, accept: Control+d, send: Delete}
+    - {when: composing, accept: Control+g, send: Escape}
+    - {when: composing, accept: Alt+v, send: Page_Up}
+    - {when: composing, accept: Control+v, send: Page_Down}
+
+recognizer:
+  patterns:
+    reverse_lookup: "`[a-z]*'?$"

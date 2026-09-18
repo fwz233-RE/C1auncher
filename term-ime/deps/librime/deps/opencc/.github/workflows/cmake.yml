@@ -1,0 +1,22 @@
+name: CMake
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: make build
+        run: make build VERBOSE=1 REL_BUILD_DOCUMENTATION=OFF
+      - name: make test
+        run: make test VERBOSE=1
+      - name: make benchmark
+        run: make benchmark VERBOSE=1

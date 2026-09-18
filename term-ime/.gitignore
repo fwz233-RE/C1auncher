@@ -1,0 +1,61 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Object files
+*.o
+*.obj
+
+# Libraries
+*.a
+*.lib
+*.so
+*.dylib
+
+# Executables
+term-ime
+term-ime-event
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug
+*.log
+/tmp/
+
+# OMC
+.omc/
+
+# Website
+website/node_modules/
+website/.next/
+website/out/
+website/.env*.local
+
+website/build/
+website/node_modules/
+
+# Keep upstream repository automation and local assistant state out of this import.
+/.github/
+/AGENTS.md
+/BRAIN.md
+/CLAUDE.md
+/brain/
+/.mindmux/
+
+# The monorepo contains ordinary source folders, not submodules.
+**/.gitmodules
+
+# The old installer downloads upstream releases, not this source import.
+/website/static/install.sh
+
+# Font binaries have no bundled version/provenance or complete license notices.
+# The website already falls back to system monospace fonts.
+/website/static/fonts/
