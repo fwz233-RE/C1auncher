@@ -45,7 +45,8 @@ class EventLoop {
     void unwatch_signal(int signum);
 
    private:
-    uv_loop_t loop_;
+    // libuv preserves loop.data during initialization; never pass indeterminate data.
+    uv_loop_t loop_{};
     bool running_ = false;
 
     // Internal structures for tracking handles

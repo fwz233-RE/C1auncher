@@ -4,7 +4,9 @@
 
 ## 下载与安装
 
-[最新 Release](https://github.com/fwz233-RE/C1auncher/releases/latest) 集中提供 **2.0.0 Windows 安装包**、普通应用发行包及开发者发布工具。各应用保留自己的版本号，下载说明见 [2.0.0 发行说明](docs/release-v2.0.0.md)。
+**当前设备核心版本为 2.9.9（更新序列 27）**，已发布到设备正式更新通道。功能与更新后的数据清理范围见 [2.9.9 版本说明](C1ancher/docs/release-2.9.9.md)，发布核验与限制见 [发布记录](C1ancher/docs/release-2.9.9-published.md)。
+
+GitHub 当前已有的 [2.0.0 Release](https://github.com/fwz233-RE/C1auncher/releases/tag/v2.0.0) 提供 **2.0.0 Windows 安装包**及普通应用发行包；它不是 2.9.9 安装包。各应用保留自己的版本号，旧包下载说明见 [2.0.0 发行说明](docs/release-v2.0.0.md)。本轮同步源码，不创建新的 GitHub Release，也不重新发布设备核心。
 
 安装器应整包解压，保留 EXE 和配套 `payload/`；安装会修改设备启动配置，并在确认新核心正常运行后删除原厂学习软件，操作前请阅读随包用户指南并自行备份。已有 C1ancher 的设备可通过应用管理器下载安装普通应用。
 
@@ -17,7 +19,7 @@
 
 ## 源码目录
 
-- [`C1ancher/`](C1ancher/README.md)：主界面、启动器、应用包管理、保活守护、核心更新、安装器和测试。
+- [`C1ancher/`](C1ancher/README.md)：主界面、启动器、应用包管理、保活守护、核心更新和测试；Windows 安装器源码仅在本地保留。
 - [`App/hello/`](App/hello/README.md)：Go 屏幕与按键示例；[`App/c1device/`](App/c1device/README.md) 提供共用设备接口。
 - [`App/book-reader/`](App/book-reader/README.md)：阅读器。
 - [`App/music-player/`](App/music-player/README.md)：音乐播放器。
@@ -26,13 +28,13 @@
 - [`App/badapple/`](App/badapple/README.md)：内置动画、安装即用的 Bad Apple 单色帧播放器及电脑端素材预处理工具（当前无声）。
 - [`App/refresh-test/`](App/refresh-test/README.md)：屏幕刷新测试，全键盘调速、可拍摄帧编号及提交时序日志。
 - [`Pinao/`](Pinao/README.md)：钢琴应用；保留原目录拼写。
-- [`term-ime/`](term-ime/README.md)：Linux 终端中文输入法，内置 Rime 与依赖源码，作为普通目录维护；设备端 MIPS 构建仍待验证。
+- [`term-ime/`](term-ime/README.md)：Linux 终端中文输入法，内置 Rime 与依赖源码；[`integration/`](term-ime/integration/README.md) 提供独立服务和纯 C 客户端。MIPS 构建、预编译词典及验证边界见该目录文档；输入法尚未在应用商店公开发布。
 - [`ChiChuGames/`](ChiChuGames/README.md)：游戏应用。
 - [`examples/hello/`](examples/hello/README.md)：不依赖其他项目的终端应用示例。
-- [`C1ancher-server/`](C1ancher-server/PUBLIC-README.md)：自助注册发布器及共用应用仓库服务源码。
-- [`tools/publisher/`](tools/publisher/README.md)：发布工具下载、完整性校验和使用说明。
 
-所有内容沿用同一个 GitHub 仓库。旧版本提交和标签保留；核心源码现在位于 `C1ancher/`，旧文档中的仓库根构建命令需先进入该目录。
+公开源码统一在本仓库维护。服务器、发布器、InkWars 和 Windows 安装器源码仅在本地保留，不随本轮源码提交上传；发布器的使用方法见 [打包与发布说明](docs/publishing.md)。旧版本提交和标签保留；核心源码位于 `C1ancher/`，旧文档中的仓库根构建命令需先进入该目录。
+
+维护者的唯一主项目目录为 `D:\c1slim`，发布材料统一归档到项目内的 `build/release-2.9.9/`，不再维护盘符根目录下的平行发布源码目录。`build/`、凭据、个人数据和本地运行记录不提交到 GitHub。
 
 ## 目标设备与构建
 

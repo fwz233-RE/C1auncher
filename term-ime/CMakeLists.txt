@@ -420,3 +420,9 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(app-e2e app-followup-e2e PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endif()
 
+# Local Rime service and pure-C client SDK; optional for existing terminal-only builds.
+option(TERM_IME_BUILD_INTEGRATION "Build c1-ime-service and the C17 integration SDK" ON)
+if(TERM_IME_BUILD_INTEGRATION)
+    add_subdirectory(integration)
+endif()
+

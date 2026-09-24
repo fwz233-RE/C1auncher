@@ -37,8 +37,10 @@ class RimeIme : public ImeEngine {
     std::vector<std::string> get_schema_list();
     std::string get_current_schema();
 
-    // Initialize rime engine
-    bool initialize();
+    // prebuilt_only skips ALL dictionary maintenance/deployment. The caller
+    // must provide validated target-architecture shared/build resources.
+    // Small schema configuration parsing may still write user/build/*.yaml.
+    bool initialize(bool prebuilt_only = false);
     // Fuzzy pinyin (n/l, zh/z, r/l, r/y, hu/f, en-eng, in-ing). Implemented by
     // switching to the bundled <schema>_fuzzy variant — no redeploy involved.
     void set_fuzzy_pinyin(bool on);

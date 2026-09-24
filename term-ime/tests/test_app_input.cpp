@@ -5,6 +5,15 @@
 #include <fstream>
 #include <unistd.h>
 
+TEST(EventLoopRegression, InitializesUserDataBeforeLibuvReadsIt) {
+    EventLoop loop;
+    EXPECT_EQ(loop.loop()->data, nullptr);
+    bool fired = false;
+    loop.set_timer([&fired]() { fired = true; }, 0);
+    loop.run();
+    EXPECT_TRUE(fired);
+}
+
 // Test the actual App routing, not a copy of its logic. Rime's process-global
 // dictionary deployment and the shell are replaced at their existing seams.
 class FakeRime : public RimeIme {

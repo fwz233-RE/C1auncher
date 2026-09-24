@@ -31,14 +31,16 @@ void RimeIme::RimeShutdown::operator()(RimeApi* api) const {
     api->finalize();
 }
 
-bool RimeIme::initialize() {
+bool RimeIme::initialize(bool prebuilt_only) {
     rime_ = rime_get_api();
     if (!rime_) {
         return false;
     }
 
     // Setup traits
-    RIME_STRUCT(RimeTraits, traits);
+    // C++ value-initialization avoids the C API macro's missing-field warnings.
+    RimeTraits traits{};
+    RIME_STRUCT_INIT(RimeTraits, traits);
 
     // Determine shared data directory — prefer term-ime's own bundled data, then
     // fall back to system rime-data (which ships prebuilt prism/table .bin so no
@@ -119,7 +121,7 @@ bool RimeIme::initialize() {
     // prism.bin/table.bin when missing or stale. Without it, on a fresh user data
     // dir rime has no compiled dictionary and input (e.g. pinyin) produces no
     // candidates. full_check=True ensures deployment runs even on first launch.
-    if (rime_->start_maintenance(True)) {
+    if (!prebuilt_only && rime_->start_maintenance(True)) {
         rime_->join_maintenance_thread();
     }
 
@@ -127,7 +129,7 @@ bool RimeIme::initialize() {
     // shared data dir has no prebuilt build/ (our bundled rime-data ships source
     // .yaml, not compiled .bin). Explicitly deploy each schema file if its prism
     // is still missing in the user data dir's staging build/.
-    if (!shared_dir.empty() && rime_->deploy_schema) {
+    if (!prebuilt_only && !shared_dir.empty() && rime_->deploy_schema) {
         // Non-throwing filesystem calls: a missing/unreadable shared data dir must
         // not throw out of here with rime left initialized.
         std::filesystem::path staging = std::filesystem::path(user_dir) / "build";
@@ -139,7 +141,8 @@ bool RimeIme::initialize() {
             std::string stem = p.stem().string();
             std::string schema_id = stem.substr(0, stem.rfind(".schema"));
             std::string prism_name = schema_id + ".prism.bin";
-            if (!std::filesystem::exists(staging / prism_name, ec)) {
+            if (!std::filesystem::exists(staging / prism_name, ec) &&
+                !std::filesystem::exists(std::filesystem::path(prebuilt_dir) / prism_name, ec)) {
                 spdlog::info("Deploying schema: {}", p.string());
                 rime_->deploy_schema(p.string().c_str());
             }
@@ -173,7 +176,8 @@ std::u32string RimeIme::take_commit() {
     if (!rime_ || !session_)
         return U"";
     std::u32string result;
-    RIME_STRUCT(RimeCommit, commit);
+    RimeCommit commit{};
+    RIME_STRUCT_INIT(RimeCommit, commit);
     if (rime_->get_commit(session_, &commit)) {
         if (commit.text)
             result = utf8_to_utf32(commit.text);
@@ -186,7 +190,8 @@ ImeState RimeIme::state() const {
     if (!rime_ || !session_)
         return ImeState::Inactive;
 
-    RIME_STRUCT(RimeContext, context);
+    RimeContext context{};
+    RIME_STRUCT_INIT(RimeContext, context);
     if (rime_->get_context(session_, &context)) {
         bool has_composition = context.composition.length > 0;
         bool has_candidates = context.menu.num_candidates > 0;
@@ -222,7 +227,8 @@ std::string RimeIme::buffer() const {
     if (!rime_ || !session_)
         return "";
 
-    RIME_STRUCT(RimeContext, context);
+    RimeContext context{};
+    RIME_STRUCT_INIT(RimeContext, context);
     if (rime_->get_context(session_, &context)) {
         const char* preedit = context.composition.preedit;
         std::string result(preedit ? preedit : "");
@@ -237,7 +243,8 @@ std::vector<Candidate> RimeIme::candidates() const {
     if (!rime_ || !session_)
         return result;
 
-    RIME_STRUCT(RimeContext, context);
+    RimeContext context{};
+    RIME_STRUCT_INIT(RimeContext, context);
     if (rime_->get_context(session_, &context)) {
         for (int i = 0; i < context.menu.num_candidates; ++i) {
             Candidate cand;
@@ -260,7 +267,8 @@ std::u32string RimeIme::select(int index) {
     if (!rime_ || !session_ || index < 0)
         return U"";
 
-    RIME_STRUCT(RimeContext, context);
+    RimeContext context{};
+    RIME_STRUCT_INIT(RimeContext, context);
     if (!rime_->get_context(session_, &context))
         return U"";
     const bool valid = index < context.menu.num_candidates;
