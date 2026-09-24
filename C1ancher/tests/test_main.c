@@ -8,8 +8,10 @@
 #include "services/terminal.h"
 #include "services/wifi.h"
 #include "ui/canvas.h"
+#include "ui/focus.h"
 #include "ui/model.h"
 #include "ui/render.h"
+#include "c1_ime_client.h"
 #include "pkg/text.h"
 #include "ui/wallpaper.h"
 
@@ -247,8 +249,8 @@ static void test_ui(void)
     uint32_t ink_width;
     uint32_t ink_height;
 
-    expect(state.page == C1_UI_PAGE_DESKTOP && state.selection == 4U,
-           "UI starts locked on the center desktop cell");
+    expect(state.page == C1_UI_PAGE_DESKTOP && state.selection == 0U,
+           "desktop starts with the first of five entries selected");
     expect(c1_ui_enter_lock(&state) && state.page == C1_UI_PAGE_LOCK,
            "desktop OK enters the wallpaper lock screen");
     c1_ui_render(page, &state, &status, NULL);
@@ -275,69 +277,64 @@ static void test_ui(void)
                    "OK keeps its existing confirm function outside the desktop");
         }
     }
+    state.page = C1_UI_PAGE_SETTINGS; state.selection = C1_SETTING_UPDATE;
     transition = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
-    expect(transition.state.page == C1_UI_PAGE_DESKTOP &&
-               transition.state.selection == 4U &&
+    expect(transition.state.page == C1_UI_PAGE_SETTINGS &&
                transition.action == C1_UI_ACTION_UPDATE_REFRESH,
-           "online center Enter checks in the background without opening a terminal");
-    transition = c1_ui_step(state, C1_UI_EVENT_ENTER, NULL);
-    expect(memcmp(&transition.state, &state, sizeof(state)) == 0 &&
-               transition.action == C1_UI_ACTION_NONE,
-           "missing network status makes center Enter a no-op");
+           "online update setting checks in the background");
     status.wifi_connected = false;
     transition = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
-    expect(memcmp(&transition.state, &state, sizeof(state)) == 0 &&
-               transition.action == C1_UI_ACTION_NONE,
-           "offline center Enter preserves the desktop without any action");
-    status.update_available = true;
+    expect(transition.state.wifi_notice[0] && transition.action == C1_UI_ACTION_NONE,
+           "offline update setting shows a no-network notice");
+    transition = c1_ui_step(state, C1_UI_EVENT_ENTER, NULL);
+    expect(transition.state.wifi_notice[0] && transition.action == C1_UI_ACTION_NONE,
+           "missing status cannot start a network update");
+    status.update_available = status.update_prepared = true;
     transition = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
-    expect(transition.state.page == C1_UI_PAGE_DESKTOP &&
-               transition.action == C1_UI_ACTION_NONE,
-           "offline center Enter remains a no-op even with a cached prepared update");
+    expect(transition.state.page == C1_UI_PAGE_TERMINAL &&
+               transition.action == C1_UI_ACTION_TERMINAL_UPDATE,
+           "prepared update can be explicitly confirmed offline");
+    status.update_available = status.update_prepared = false;
     status.wifi_connected = true;
     status.wifi_ipv4[0] = '\0';
     transition = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
-    expect(transition.state.page == C1_UI_PAGE_DESKTOP &&
-               transition.action == C1_UI_ACTION_NONE,
-           "stale connected status without a live IP cannot open the updater");
+    expect(transition.action == C1_UI_ACTION_NONE, "update needs a live network address");
     snprintf(status.wifi_ipv4, sizeof(status.wifi_ipv4), "172.16.21.119");
+    status.service_busy = true;
     transition = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
-    expect(transition.state.page == C1_UI_PAGE_TERMINAL &&
-               transition.state.selection == 0U &&
-               transition.action == C1_UI_ACTION_TERMINAL_UPDATE,
-           "online center Enter opens only a prepared update for confirmation");
-    status.update_available = false;
-    state = c1_ui_reduce(transition.state, C1_UI_EVENT_HOME);
+    expect(transition.action == C1_UI_ACTION_NONE, "busy settings cannot duplicate update checks");
+    status.service_busy = false;
+    state = c1_ui_initial_state();
     transition = c1_ui_step(state, C1_UI_EVENT_RIGHT, &status);
-    expect(transition.state.page == C1_UI_PAGE_TERMINAL &&
-               transition.action == C1_UI_ACTION_NONE,
-           "right opens the terminal immediately");
-    state = transition.state;
-    transition = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
-    expect(transition.state.page == C1_UI_PAGE_TERMINAL &&
-               transition.action == C1_UI_ACTION_NONE,
-           "terminal input is handled by the live PTY runtime");
-    state = c1_ui_reduce(state, C1_UI_EVENT_HOME);
-    expect(state.page == C1_UI_PAGE_DESKTOP && state.selection == 4U,
-           "home returns to the locked center desktop cell");
+    expect(transition.state.page == C1_UI_PAGE_DESKTOP && transition.state.selection == 1U &&
+               transition.action == C1_UI_ACTION_NONE, "desktop arrows select without launching");
+    transition = c1_ui_step(state, C1_UI_EVENT_SELECT_NEXT, &status);
+    expect(transition.state.selection == 0U, "the expression key has no desktop action");
+    transition = c1_ui_step(transition.state, C1_UI_EVENT_DOWN, &status);
+    transition = c1_ui_step(transition.state, C1_UI_EVENT_ENTER, &status);
+    expect(transition.state.page == C1_UI_PAGE_TERMINAL && transition.action == C1_UI_ACTION_NONE,
+           "confirm opens the selected terminal");
+    state = c1_ui_reduce(transition.state, C1_UI_EVENT_HOME);
+    expect(state.page == C1_UI_PAGE_DESKTOP && state.selection == 1U,
+           "home restores the previous desktop selection");
 
     state = c1_ui_initial_state();
     transition = c1_ui_step(state, C1_UI_EVENT_LEFT, &status);
-    expect(transition.state.page == C1_UI_PAGE_TERMINAL &&
-               transition.action == C1_UI_ACTION_TERMINAL_APP,
-           "left opens APP in the shared terminal");
-    state = transition.state;
-    transition = c1_ui_step(state, C1_UI_EVENT_NONE, &status);
-    expect(transition.state.page == C1_UI_PAGE_TERMINAL &&
+    expect(transition.state.page == C1_UI_PAGE_DESKTOP && transition.state.selection == 4U &&
                transition.action == C1_UI_ACTION_NONE,
-           "APP direction requests c1pkg only for its entry event");
-
+           "left wraps to the last desktop entry without launching");
     status.wifi_connected = false;
+    transition = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(transition.action == C1_UI_ACTION_TERMINAL_APP, "apps can be opened offline");
+    transition = c1_ui_step(transition.state, C1_UI_EVENT_NONE, &status);
+    expect(transition.action == C1_UI_ACTION_NONE, "apps only launches once");
+
     status.wifi_enabled = true;
     state = c1_ui_initial_state();
-    transition = c1_ui_step(state, C1_UI_EVENT_UP, &status);
+    state.selection = 2U;
+    transition = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
     expect(transition.state.page == C1_UI_PAGE_WIFI && transition.action == C1_UI_ACTION_WIFI_SCAN,
-           "up opens Wi-Fi and starts a real scan action");
+           "confirming Wi-Fi starts a real scan action");
     transition = c1_ui_step(transition.state, C1_UI_EVENT_ENTER, &status);
     expect(transition.action == C1_UI_ACTION_WIFI_SCAN,
            "left Wi-Fi action button starts a scan");
@@ -437,88 +434,92 @@ static void test_ui(void)
     expect(transition.action == C1_UI_ACTION_WIFI_CONNECT, "center OK also submits a valid password");
     c1_ui_render(desktop, &transition.state, &status, NULL);
     c1_display_frame_clear(page, false);
-    c1_canvas_text(page, 12U, 56U, "********", 2U, true);
-    expect(frame_region_equal(desktop, page, 12U, 56U, 64U, 10U),
+    c1pkg_text(page, 12, 64, "********", 272, 1);
+    expect(frame_region_equal(desktop, page, 12U, 64U, 64U, 16U),
            "password is masked when visibility is disabled");
     transition = c1_ui_step(transition.state, C1_UI_EVENT_TOGGLE_SECRET, &status);
     c1_display_frame_clear(page, false);
-    c1_canvas_text(page, 12U, 56U, transition.state.secret, 2U, true);
+    c1pkg_text(page, 12, 64, transition.state.secret, 272, 1);
     c1_ui_render(desktop, &transition.state, &status, NULL);
-    expect(frame_region_equal(desktop, page, 12U, 56U, 16U, 10U),
-           "Wi-Fi password input displays entered characters at double size");
+    expect(frame_region_equal(desktop, page, 12U, 64U, 64U, 16U),
+           "Wi-Fi password input uses the shared readable bitmap font");
 
     status.wifi_connected = true;
     state = c1_ui_initial_state();
     c1_ui_render(desktop, &state, &status, NULL);
-    expect(frame_region_bounds(desktop, 100U, 0U, 97U, 50U,
-                               &ink_x, &ink_y, &ink_width, &ink_height) &&
-               ink_x == 110U && ink_y == 5U && ink_width == 76U && ink_height == 40U,
-           "desktop WI-FI label is visually centered and fills most of its direction cell");
-    expect(frame_region_bounds(desktop, 0U, 52U, 98U, 49U,
-                               &ink_x, &ink_y, &ink_width, &ink_height) &&
-               ink_x == 10U && ink_y == 56U && ink_width == 77U && ink_height == 40U,
-           "desktop APP label is visually centered and fills most of its direction cell");
-    expect(frame_region_bounds(desktop, 199U, 52U, 97U, 49U,
-                               &ink_x, &ink_y, &ink_width, &ink_height) &&
-               ink_x == 201U && ink_y == 56U && ink_width == 93U && ink_height == 40U,
-           "desktop TERMINAL label is visually centered and fills most of its direction cell");
-    expect(frame_region_bounds(desktop, 100U, 103U, 97U, 49U,
-                               &ink_x, &ink_y, &ink_width, &ink_height) &&
-               ink_x == 102U && ink_y == 107U && ink_width == 92U && ink_height == 40U,
-           "desktop DEVICE label is visually centered and fills most of its direction cell");
-    expect(frame_pixel(desktop, 100U, 52U), "center desktop cell is locked black");
-    expect(frame_region_white_bounds(desktop, 100U, 52U, 97U, 49U,
-                                     &ink_x, &ink_y, &ink_width, &ink_height) &&
-               ink_x == 143U && ink_y == 72U && ink_width == 10U && ink_height == 9U,
-           "desktop center cell shows the original no-update dot");
-    status.update_available = true;
+    expect(frame_pixel(desktop, 0U, 17U) && frame_pixel(desktop, 295U, 17U),
+           "unified desktop reserves a one-pixel top-bar separator");
+    const char *labels[] = {"应用", "终端", "Wi-Fi", "电池", "设置"};
+    for (unsigned i = 0; i < 5; ++i) {
+        unsigned x = 14U, y = 25U + i * 21U;
+        c1_display_frame_clear(page, false);
+        if (i == 0) c1_canvas_fill_rect(page, 6, 23, 284, 20, true);
+        c1pkg_text(page, (int)x, (int)y, labels[i], 104, i != 0);
+        expect(frame_region_equal(desktop, page, x, y, 104U, 16U),
+               "all five entries render readable names without directional labels");
+    }
+    state = c1_ui_step(state, C1_UI_EVENT_SELECT_NEXT, &status).state;
+    expect(state.selection == 0U, "expression key is ignored on the desktop");
+    state = c1_ui_step(state, C1_UI_EVENT_DOWN, &status).state;
     c1_ui_render(desktop, &state, &status, NULL);
-    expect(frame_region_white_bounds(desktop, 100U, 52U, 97U, 49U,
-                                     &ink_x, &ink_y, &ink_width, &ink_height) &&
-               ink_x == 102U && ink_y == 56U && ink_width == 92U && ink_height == 40U,
-           "desktop center cell expands UPDATE to fill its grid cell");
-    status.update_available = false;
-    expect(!frame_pixel(desktop, 100U, 10U), "direction cells remain unselected");
-    expect(frame_pixel(desktop, 98U, 25U) && frame_pixel(desktop, 99U, 25U) &&
-               frame_pixel(desktop, 197U, 25U) && frame_pixel(desktop, 198U, 25U),
-           "desktop uses two-pixel internal vertical separators");
-    expect(frame_pixel(desktop, 50U, 50U) && frame_pixel(desktop, 50U, 51U) &&
-               frame_pixel(desktop, 50U, 101U) && frame_pixel(desktop, 50U, 102U),
-           "desktop uses two-pixel internal horizontal separators");
-    expect(frame_pixel(desktop, 0U, 0U) && frame_pixel(desktop, 295U, 0U) &&
-               frame_pixel(desktop, 0U, 151U) && frame_pixel(desktop, 295U, 151U),
-           "four corner status cells use black backgrounds to the screen edge");
-
-    expect(frame_region_white_bounds(desktop, 0U, 0U, 98U, 50U,
-                                     &ink_x, &ink_y, &ink_width, &ink_height) &&
-               ink_x == 3U && ink_y == 5U && ink_width == 92U && ink_height == 40U,
-           "desktop IPv4 prefix fills the top-left status cell");
-    expect(frame_region_white_bounds(desktop, 199U, 0U, 97U, 50U,
-                                     &ink_x, &ink_y, &ink_width, &ink_height) &&
-               ink_x == 201U && ink_y == 5U && ink_width == 92U && ink_height == 40U,
-           "desktop IPv4 suffix fills the top-right status cell");
-    expect(frame_region_white_bounds(desktop, 0U, 103U, 98U, 49U,
-                                     &ink_x, &ink_y, &ink_width, &ink_height) &&
-               ink_x == 5U && ink_y == 107U && ink_width == 88U && ink_height == 40U,
-           "desktop battery value fills the bottom-left status cell");
-    expect(frame_region_white_bounds(desktop, 199U, 103U, 97U, 49U,
-                                     &ink_x, &ink_y, &ink_width, &ink_height) &&
-               ink_x == 200U && ink_y == 107U && ink_width == 95U && ink_height == 40U,
-           "desktop time fills the bottom-right status cell");
+    expect(frame_pixel(desktop, 11U, 44U) && frame_pixel(desktop, 6U, 44U) &&
+           frame_region_white_bounds(desktop, 6U, 44U, 284U, 20U,
+                                     &ink_x, &ink_y, &ink_width, &ink_height),
+           "selected row is rectangular with readable reversed text");
+    state = c1_ui_initial_state();
+    c1_ui_render(desktop, &state, &status, NULL);
+    status.update_available = true;
+    c1_ui_render(page, &state, &status, NULL);
+    expect(!frame_region_equal(desktop, page, 130U, 107U, 150U, 20U),
+           "prepared update is identified beside Settings");
+    expect(frame_region_equal(desktop, page, 0U, 136U, 296U, 16U),
+           "navigation hints stay stable while update status changes");
+    status.update_available = status.update_prepared = false;
 
     c1_ui_render(connected_status, &state, &status, NULL);
     status.wifi_connected = false;
     status.wifi_connected_ssid[0] = '\0';
     status.wifi_ipv4[0] = '\0';
     c1_ui_render(generic_status, &state, &status, NULL);
-    expect(!frame_region_equal(connected_status, generic_status, 0U, 0U, 98U, 50U) &&
-               !frame_region_equal(connected_status, generic_status, 199U, 0U, 97U, 50U),
-           "disconnecting clears both IPv4 halves from the desktop");
-    expect(!frame_region_white_bounds(generic_status, 0U, 0U, 98U, 50U,
-                                      &ink_x, &ink_y, &ink_width, &ink_height) &&
-               !frame_region_white_bounds(generic_status, 199U, 0U, 97U, 50U,
-                                          &ink_x, &ink_y, &ink_width, &ink_height),
-           "disconnected top status cells remain completely blank");
+    expect(frame_region_equal(connected_status, generic_status, 0U, 0U, 296U, 18U),
+           "network state never adds a dash or Wi-Fi glyph to the top bar");
+    c1_display_frame_clear(page, false);
+    c1pkg_text(page, 232, 67, "无网络", 48, 1);
+    expect(frame_region_equal(generic_status, page, 232U, 67U, 48U, 16U),
+           "offline status is spelled out in the Wi-Fi desktop row");
+    state = c1_ui_initial_state();
+    status.daily_quote[0] = '\0';
+    c1_ui_render(generic_status, &state, &status, NULL);
+    c1_display_frame_clear(page, false);
+    c1pkg_text(page, 6, 136, "Live free or die.", 284, 1);
+    expect(frame_region_equal(generic_status, page, 0U, 136U, 296U, 16U),
+           "offline desktop banner uses the Live free or die fallback");
+
+    state = c1_ui_initial_state();
+    strcpy(status.daily_quote, "中文原句");
+    state.preferences.language = C1_LANGUAGE_ZH;
+    c1_ui_render(page, &state, &status, NULL);
+    state.preferences.language = C1_LANGUAGE_EN;
+    c1_ui_render(desktop, &state, &status, NULL);
+    expect(frame_region_equal(page, desktop, 0U, 134U, 296U, 18U),
+           "desktop footer keeps one original quote in both UI languages");
+    status.daily_quote[0] = '\0';
+
+    state.page = C1_UI_PAGE_BATTERY;
+    state.selection = 0U;
+    status.battery_history.count = 3U;
+    status.battery_history.samples[0] = (c1_battery_sample){1704067200LL, 72U, C1_BATTERY_DISCHARGING, false};
+    status.battery_history.samples[1] = (c1_battery_sample){1704067260LL, 70U, C1_BATTERY_DISCHARGING, true};
+    status.battery_history.samples[2] = (c1_battery_sample){1704067380LL, 68U, C1_BATTERY_PLUGGED, false};
+    status.battery_history_now = 1704067380LL;
+    for (unsigned language = C1_LANGUAGE_ZH; language <= C1_LANGUAGE_EN; ++language) {
+        state.preferences.language = (c1_language)language;
+        c1_ui_render(generic_status, &state, &status, NULL);
+        expect(frame_region_bounds(generic_status, 30U, 56U, 250U, 58U,
+                                   &ink_x, &ink_y, &ink_width, &ink_height),
+               "battery page renders a bounded history graph in both languages");
+    }
+    state = c1_ui_initial_state();
 
     status.wifi_connected = true;
     snprintf(status.wifi_connected_ssid,
@@ -531,10 +532,10 @@ static void test_ui(void)
     status.wifi_connected = false;
     status.wifi_connected_ssid[0] = '\0';
     c1_ui_render(generic_status, &state, &status, NULL);
-    expect(!frame_region_equal(connected_status, generic_status, 220U, 59U, 68U, 19U),
-           "connected network row has a prominent connection label");
-    expect(!frame_region_equal(connected_status, generic_status, 8U, 133U, 180U, 7U),
-           "Wi-Fi page footer identifies the connected address");
+    expect(!frame_region_equal(connected_status, generic_status, 12U, 64U, 8U, 16U),
+           "connected network row has a visible connection marker");
+    expect(!frame_region_equal(connected_status, generic_status, 0U, 21U, 296U, 16U),
+           "Wi-Fi page heading identifies connection state");
 
     status.wifi_connected = true;
     snprintf(status.wifi_connected_ssid,
@@ -546,22 +547,19 @@ static void test_ui(void)
     expect(frame_region_bounds(page, 12U, 76U, 260U, 12U,
                                &ink_x, &ink_y, &ink_width, &ink_height),
            "Wi-Fi scanning state renders readable text rather than a fake progress bar");
-    expect(!frame_region_equal(page, connected_status, 8U, 58U, 280U, 66U),
-           "busy page replaces actionable stale network rows");
+    expect(frame_region_equal(page, connected_status, 8U, 58U, 280U, 66U),
+           "background Wi-Fi activity preserves navigable network rows");
+    expect(!frame_region_equal(page, connected_status, 0U, 136U, 296U, 16U),
+           "background progress appears in the status area");
     status.wifi_busy = false;
     state = c1_ui_initial_state();
     transition = c1_ui_step(state, C1_UI_EVENT_DOWN, &status);
-    state = transition.state;
-    expect(state.page == C1_UI_PAGE_TERMINAL &&
-               transition.action == C1_UI_ACTION_TERMINAL_NEOFETCH,
-           "down opens DEVICE in the terminal and requests Neofetch");
-    transition = c1_ui_step(state, C1_UI_EVENT_NONE, &status);
-    expect(transition.state.page == C1_UI_PAGE_TERMINAL &&
+    expect(transition.state.page == C1_UI_PAGE_DESKTOP && transition.state.selection == 1U &&
                transition.action == C1_UI_ACTION_NONE,
-           "DEVICE direction requests Neofetch only for its entry event");
-    c1_ui_render(page, &state, &status, NULL);
-    expect(memcmp(desktop, page, sizeof(page)) != 0,
-           "bottom DEVICE direction reuses the terminal instead of a detail page");
+           "desktop down selects the terminal without opening it");
+    transition = c1_ui_step(transition.state, C1_UI_EVENT_ENTER, &status);
+    expect(transition.state.page == C1_UI_PAGE_TERMINAL && transition.action == C1_UI_ACTION_NONE,
+           "confirmation opens a clean shell without injecting a command");
 }
 
 static void test_wifi_typography(void)
@@ -582,29 +580,30 @@ static void test_wifi_typography(void)
     snprintf(status.networks[0].ssid, sizeof(status.networks[0].ssid), "书房网络");
     c1_ui_render(frame, &state, &status, NULL);
     c1_display_frame_clear(expected, false);
-    c1pkg_text(expected, 36, 60, "书房网络", 208, 1);
-    expect(frame_region_equal(frame, expected, 36U, 60U, 208U, 16U),
+    c1pkg_text(expected, 26, 64, "书房网络", 234, 1);
+    expect(frame_region_equal(frame, expected, 26U, 64U, 234U, 16U),
            "Chinese SSIDs render complete bitmap glyphs instead of blank bytes");
 
     snprintf(status.networks[0].ssid, sizeof(status.networks[0].ssid), "Short");
     c1_ui_render(short_name, &state, &status, NULL);
     snprintf(status.networks[0].ssid, sizeof(status.networks[0].ssid), "01234567890123456789012345678901");
     c1_ui_render(frame, &state, &status, NULL);
-    expect(frame_region_equal(frame, short_name, 248U, 58U, 40U, 21U),
-           "long SSIDs cannot overwrite the network security label");
+    expect(frame_region_equal(frame, short_name, 267U, 62U, 21U, 21U) &&
+           frame_region_equal(frame, short_name, 12U, 64U, 8U, 16U),
+           "long SSIDs cannot overwrite signal or security indicators");
     c1_display_frame_clear(expected, false);
-    c1pkg_text(expected, 220, 60, "...", 24, 1);
-    expect(frame_region_equal(frame, expected, 220U, 60U, 24U, 16U),
+    c1pkg_text(expected, 244, 64, "..", 16, 1);
+    expect(frame_region_equal(frame, expected, 244U, 64U, 16U, 16U),
            "long SSIDs have a visible pixel-budget ellipsis");
 
     state.selection = 5U;
     c1_ui_render(frame, &state, &status, NULL);
     c1_display_frame_clear(expected, false);
-    c1_canvas_fill_rect(expected, 8U, 58U, 280U, 21U, true);
-    c1pkg_text(expected, 36, 60, "Network-3", 208, 0);
-    expect(frame_region_equal(frame, expected, 36U, 60U, 208U, 16U),
+    c1_canvas_fill_rect(expected, 8U, 62U, 280U, 21U, true);
+    c1pkg_text(expected, 26, 64, "Network-3", 234, 0);
+    expect(frame_region_equal(frame, expected, 26U, 64U, 234U, 16U),
            "fourth network starts the next page with white text on black selection");
-    expect(frame_region_equal(frame, expected, 8U, 80U, 280U, 43U),
+    expect(frame_region_equal(frame, expected, 8U, 84U, 280U, 43U),
            "last page does not retain stale rows from previous page");
 }
 
@@ -660,7 +659,8 @@ static void test_wifi_interactions(void)
     c1_ui_status status = {0};
     c1_ui_transition next;
     status.service_busy = true;
-    next = c1_ui_step(state, C1_UI_EVENT_UP, &status);
+    state.selection = 2U;
+    next = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
     expect(next.state.page == C1_UI_PAGE_WIFI && next.action == C1_UI_ACTION_NONE &&
                next.state.wifi_notice[0] != '\0', "entering Wi-Fi during an update explains why no scan starts");
     state = next.state;
@@ -668,9 +668,13 @@ static void test_wifi_interactions(void)
     next = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
     expect(next.action == C1_UI_ACTION_WIFI_DISABLE, "turn off can be requested while worker is busy");
     status.wifi_busy = true;
+    status.network_count = 1U;
     state.selection = 0U;
     next = c1_ui_step(state, C1_UI_EVENT_DOWN, &status);
-    expect(next.state.selection == 0U, "busy view cannot navigate hidden network rows");
+    expect(next.state.selection == 2U, "busy view still permits browsing retained network rows");
+    next = c1_ui_step(next.state, C1_UI_EVENT_ENTER, &status);
+    expect(next.action == C1_UI_ACTION_NONE && next.state.wifi_notice[0],
+           "browsing during work cannot start a second network transaction");
     status.service_busy = false;
     status.wifi_busy = false;
     status.wifi_connected = true;
@@ -781,15 +785,25 @@ static void test_terminal_screen(void)
     expect(count == 1U && reply[0] == '\r',
            "APP Enter and OK confirmation produces carriage return");
 
-    c1_terminal_screen_feed(&terminal, "\033[19;1H\033[7m \033[0m", 16U);
+    expect(c1_terminal_screen_resize(&terminal, 37U, 8U) == C1_STATUS_OK,
+           "terminal geometry fills the area below the shared header");
+    c1_terminal_screen_reset(&terminal);
+    c1_terminal_screen_feed(&terminal, "A中文", strlen("A中文"));
     state.page = C1_UI_PAGE_TERMINAL;
     c1_ui_render(frame, &state, &status, &terminal);
-    expect(frame_pixel(frame, 0U, 1U),
-           "full-screen terminal renders its first glyph");
-    expect(frame_pixel(frame, 0U, 151U),
-           "terminal content uses the former help row at the bottom");
-    expect(!frame_pixel(frame, 295U, 151U),
-           "terminal renderer stays inside the 49-column grid");
+    uint8_t expected[C1_DISPLAY_FRAME_BYTES] = {0};
+    c1pkg_text(expected, 0, 18, "A中文", 40, 1);
+    expect(frame_region_equal(frame, expected, 0U, 18U, 40U, 16U),
+           "terminal starts immediately below header with full-width Chinese glyphs");
+    expect(frame_pixel(frame, 0U, 17U) && !frame_pixel(frame, 295U, 151U),
+           "terminal has one top bar and no window border");
+    const char *last_cell = "\033[?25l\033[8;37HZ";
+    c1_terminal_screen_feed(&terminal, last_cell, strlen(last_cell));
+    c1_ui_render(frame, &state, &status, &terminal);
+    c1_display_frame_clear(expected, false);
+    c1pkg_text(expected, 288, 130, "Z", 8, 1);
+    expect(frame_region_equal(frame, expected, 288U, 130U, 8U, 16U),
+           "last full-screen row and column are usable rather than clipped");
     c1_terminal_screen_destroy(&terminal);
 }
 
@@ -859,8 +873,12 @@ static void test_power_policy(void)
     c1_power_policy_init(&policy, now);
     expect(policy.state == C1_POWER_ACTIVE,
            "power policy starts active");
+    expect(c1_power_policy_timeout(&policy, now) == -1 &&
+               c1_power_policy_tick(&policy, now + C1_POWER_IDLE_TIMEOUT_MS) == C1_POWER_ACTION_NONE,
+           "unknown external power leaves automatic idle locking disabled");
+    c1_power_policy_set_external_power(&policy, true, false, now);
     expect(c1_power_policy_timeout(&policy, now) == C1_POWER_IDLE_TIMEOUT_MS,
-           "active policy schedules the five-minute idle deadline on the desktop");
+           "known battery power schedules the configured idle deadline");
 
     c1_power_policy_init(&gated_policy, now);
     expect(c1_power_policy_lock(&gated_policy, now),
@@ -887,8 +905,13 @@ static void test_power_policy(void)
            "an online transition cancels the previous unplug interval");
     expect(c1_power_policy_tick(&gated_policy,
                                 now + 6000 + C1_POWER_EXTERNAL_OFFLINE_DELAY_MS) ==
+               C1_POWER_ACTION_NONE &&
+               c1_power_policy_timeout(&gated_policy, now + 6000) == C1_POWER_IDLE_TIMEOUT_MS,
+           "locked unplug starts a full new idle interval rather than only the power grace period");
+    expect(c1_power_policy_tick(&gated_policy,
+                                now + 6000 + C1_POWER_IDLE_TIMEOUT_MS) ==
                C1_POWER_ACTION_SUSPEND,
-           "stable offline power permits suspend after twenty seconds while locked");
+           "locked battery policy permits suspend after the complete unplug idle interval");
     c1_power_policy_suspend_cancelled(&gated_policy);
     expect(gated_policy.state == C1_POWER_LOCKED && gated_policy.suspend_retry_at < 0,
            "late power recheck cancellation returns to locked state without retry delay");
@@ -966,8 +989,8 @@ static void test_power_policy(void)
     expect(c1_power_policy_unlock(&policy, now + 1000001) &&
                policy.state == C1_POWER_ACTIVE,
            "explicit unlock returns to active state");
-    expect(c1_ui_unlock(&state) && state.page == C1_UI_PAGE_DESKTOP,
-           "explicit UI unlock returns to desktop");
+    expect(c1_ui_unlock(&state) && state.page == C1_UI_PAGE_WIFI,
+           "unlock returns to the network list without restoring a cleared password");
 
     c1_power_policy_init(&policy, now);
     expect(c1_power_policy_lock(&policy, now),
@@ -1148,6 +1171,192 @@ static void test_ndjson(void)
     fclose(stream);
 }
 
+static void test_input_overlay_bounds(void)
+{
+    uint8_t frame[C1_DISPLAY_FRAME_BYTES], before[C1_DISPLAY_FRAME_BYTES];
+    c1_ui_state state = c1_ui_initial_state();
+    c1_ui_status status = {0};
+    struct c1_ime_response view = {0};
+    strcpy(view.preedit, "nihao"); strcpy(view.candidates[0], "你好"); view.candidate_count = 1;
+    state.page = C1_UI_PAGE_TERMINAL;
+    c1_ui_render(frame, &state, &status, NULL); memcpy(before, frame, sizeof(frame));
+    c1_ui_render_input(frame, &state, &view, true, false);
+    bool above_unchanged = true, bottom_changed = false;
+    for (unsigned y = 0; y < 152; ++y) for (unsigned x = 0; x < 296; ++x) {
+        unsigned index = (y / 8U) * 296U + x;
+        bool changed = ((frame[index] ^ before[index]) & (0x80U >> (y % 8U))) != 0;
+        if (y < 119 && changed) above_unchanged = false;
+        if (y >= 119 && changed) bottom_changed = true;
+    }
+    expect(above_unchanged && bottom_changed, "IME overlay only writes its reserved 33px region");
+    state.page = C1_UI_PAGE_WIFI_PASSWORD;
+    c1_ui_render(frame, &state, &status, NULL); memcpy(before, frame, sizeof(frame));
+    c1_ui_render_input(frame, &state, &view, true, true);
+    expect(memcmp(frame, before, sizeof(frame)) == 0, "IME overlay cannot paint over a password page");
+}
+
+static void test_focus_frame(void)
+{
+    uint8_t frame[C1_DISPLAY_FRAME_BYTES] = {0}, before[C1_DISPLAY_FRAME_BYTES];
+    c1_ui_focus_frame(frame, 296, 152, 10, 10, 9, 9, true);
+    expect(frame_pixel(frame, 10, 10) && frame_pixel(frame, 18, 18) &&
+           !frame_pixel(frame, 14, 10) && !frame_pixel(frame, 10, 14) && !frame_pixel(frame, 14, 14),
+           "focus uses four open corners, never an arrow or a closed square");
+    memcpy(before, frame, sizeof(frame));
+    c1_ui_focus_frame(frame, 296, 152, UINT32_MAX, UINT32_MAX, 9, 9, true);
+    c1_ui_focus_frame(frame, 296, 152, 290, 148, 9, 9, true);
+    c1_ui_focus_frame(frame, 296, 152, 1, 1, UINT32_MAX, UINT32_MAX, true);
+    expect(!memcmp(frame, before, sizeof(frame)), "invalid focus dimensions cannot wrap or escape the bitmap");
+    c1_ui_focus_frame(frame, 296, 152, 10, 10, 9, 9, false);
+    memset(before, 0, sizeof(before));
+    expect(!memcmp(frame, before, sizeof(frame)), "white focus uses the same geometry on an inverted row");
+}
+
+static void test_selected_rows_are_rectangular(void)
+{
+    uint8_t frame[C1_DISPLAY_FRAME_BYTES];
+    c1_ui_state state = c1_ui_initial_state();
+    c1_ui_status status = {0};
+    state.page = C1_UI_PAGE_DESKTOP;
+    state.selection = 0;
+    c1_ui_render(frame, &state, &status, NULL);
+    expect(frame_pixel(frame, 6, 23) && frame_pixel(frame, 289, 23) &&
+           frame_pixel(frame, 6, 42) && frame_pixel(frame, 289, 42),
+           "selected desktop row retains all four black corners");
+    state.page = C1_UI_PAGE_WIFI;
+    state.selection = 0;
+    c1_ui_render(frame, &state, &status, NULL);
+    expect(frame_pixel(frame, 8, 40) && frame_pixel(frame, 143, 40) &&
+           frame_pixel(frame, 8, 57) && frame_pixel(frame, 143, 57),
+           "selected Wi-Fi action retains all four black corners");
+    status.network_count = 1;
+    strcpy(status.networks[0].ssid, "test");
+    state.selection = 2;
+    c1_ui_render(frame, &state, &status, NULL);
+    expect(frame_pixel(frame, 8, 62) && frame_pixel(frame, 287, 62) &&
+           frame_pixel(frame, 8, 82) && frame_pixel(frame, 287, 82),
+           "selected Wi-Fi network retains all four black corners");
+    state.page = C1_UI_PAGE_SETTINGS;
+    state.selection = 0;
+    c1_ui_render(frame, &state, &status, NULL);
+    expect(frame_pixel(frame, 8, 43) && frame_pixel(frame, 287, 43) &&
+           frame_pixel(frame, 8, 63) && frame_pixel(frame, 287, 63),
+           "selected settings row retains all four black corners");
+}
+
+static void test_battery_ui(void)
+{
+    struct { uint8_t before[16], frame[C1_DISPLAY_FRAME_BYTES], after[16]; } guarded;
+    uint8_t expected[C1_DISPLAY_FRAME_BYTES], gap[C1_DISPLAY_FRAME_BYTES];
+    c1_ui_state state = c1_ui_initial_state();
+    c1_ui_status status = {0};
+    state.page = C1_UI_PAGE_BATTERY;
+    state.battery_view = C1_BATTERY_VIEW_MINUTE;
+    status.time_available = true;
+    status.battery_available = true; status.battery_percent = 72;
+    status.battery_history.count = 2;
+    status.battery_history_now = C1_BATTERY_MIN_TIME + 60;
+    status.battery_history.samples[0] = (c1_battery_sample){C1_BATTERY_MIN_TIME, 72, C1_BATTERY_DISCHARGING, false};
+    status.battery_history.samples[1] = (c1_battery_sample){C1_BATTERY_MIN_TIME + 60, 72, C1_BATTERY_PLUGGED, false};
+    memset(&guarded, 0xa5, sizeof(guarded));
+    c1_ui_render(guarded.frame, &state, &status, NULL);
+    memcpy(gap, guarded.frame, sizeof(gap));
+    c1_display_frame_clear(expected, false);
+    c1pkg_text(expected, 6, 136, "01/01 08:01 72% 插电", 284, true);
+    expect(frame_region_equal(gap, expected, 0, 136, 296, 16), "battery detail replaces the bottom legend with actual local sample time");
+    status.battery_history.samples[1].connected = true;
+    c1_ui_render(guarded.frame, &state, &status, NULL);
+    /* Samples at x276 and x280, level72 at y64. Brackets are at y60/68;
+     * x278,y64 distinguishes a connected segment from two isolated points. */
+    expect(!frame_pixel(gap, 278, 64) && frame_pixel(guarded.frame, 278, 64),
+           "a gap is never connected while continuously observed adjacent minutes are");
+    c1_preferences before = state.preferences;
+    state = c1_ui_step(state, C1_UI_EVENT_LEFT, &status).state;
+    expect(state.selection == 1 && state.battery_selected_at == C1_BATTERY_MIN_TIME &&
+           state.battery_view == C1_BATTERY_VIEW_MINUTE, "left pins the older real sample without changing scale");
+    state = c1_ui_step(state, C1_UI_EVENT_LEFT, &status).state;
+    expect(state.selection == 1, "older selection clamps at first observation");
+    c1_ui_transition next = c1_ui_step(state, C1_UI_EVENT_ENTER, &status);
+    expect(next.state.battery_view == C1_BATTERY_VIEW_MINUTE && next.state.battery_selected_at == state.battery_selected_at &&
+           next.action == C1_UI_ACTION_NONE && !memcmp(&before, &next.state.preferences, sizeof(before)),
+           "Enter does not switch the battery view or change selection, settings or services");
+    next = c1_ui_step(next.state, C1_UI_EVENT_SELECT_NEXT, &status);
+    expect(next.state.battery_view == C1_BATTERY_VIEW_MINUTE, "expression key does not switch the battery view");
+    static const c1_ui_event views[] = {C1_UI_EVENT_VIEW_PREVIOUS, C1_UI_EVENT_VIEW_PREVIOUS,
+        C1_UI_EVENT_VIEW_PREVIOUS, C1_UI_EVENT_VIEW_NEXT, C1_UI_EVENT_VIEW_NEXT, C1_UI_EVENT_VIEW_NEXT};
+    static const c1_battery_view expected_views[] = {C1_BATTERY_VIEW_HOUR, C1_BATTERY_VIEW_DAY,
+        C1_BATTERY_VIEW_DAY, C1_BATTERY_VIEW_HOUR, C1_BATTERY_VIEW_MINUTE, C1_BATTERY_VIEW_MINUTE};
+    for (size_t i = 0; i < sizeof(views) / sizeof(*views); ++i) {
+        next = c1_ui_step(next.state, views[i], &status);
+        expect(next.state.battery_view == expected_views[i] &&
+               next.state.battery_selected_at == state.battery_selected_at && next.state.selection == state.selection &&
+               next.action == C1_UI_ACTION_NONE && !memcmp(&before, &next.state.preferences, sizeof(before)),
+               "volume switches day/hour/minute with clamped ends, without moving the sample or changing settings");
+        next = c1_ui_step(next.state, C1_UI_EVENT_ENTER, &status);
+        expect(next.state.battery_view == expected_views[i] && next.state.battery_selected_at == state.battery_selected_at &&
+               next.action == C1_UI_ACTION_NONE, "Enter leaves every scale and selected sample unchanged");
+    }
+    status.battery_history.samples[2] = (c1_battery_sample){C1_BATTERY_MIN_TIME + 120, 70, C1_BATTERY_DISCHARGING, true};
+    status.battery_history.count = 3;
+    expect(c1_ui_battery_selected(&state, &status) == 0, "background appends do not move a pinned timestamp");
+    state = c1_ui_step(state, C1_UI_EVENT_RIGHT, &status).state;
+    expect(state.selection == 1, "right selects the next newer minute");
+    state = c1_ui_step(state, C1_UI_EVENT_RIGHT, &status).state;
+    expect(state.selection == 0 && !state.battery_selected_at, "right at newest resumes live following");
+    state = c1_ui_step(state, C1_UI_EVENT_RIGHT, &status).state;
+    expect(state.selection == 0 && !state.battery_selected_at && state.battery_view == C1_BATTERY_VIEW_MINUTE,
+           "right clamps at the newest sample without changing scale");
+    status.battery_available = false;
+    c1_ui_render(guarded.frame, &state, &status, NULL);
+    c1_display_frame_clear(expected, false);
+    c1pkg_text(expected, 6, 136, "01/01 08:02 70% 电池", 284, true);
+    expect(frame_region_equal(expected, guarded.frame, 0, 136, 296, 16),
+           "sensor failure does not erase real history or invent a current point");
+    /* A full day's bounds, zoom/pan, selected endpoints and both languages. */
+    status.battery_history.count = C1_BATTERY_HISTORY_POINTS;
+    for (size_t i = 0; i < C1_BATTERY_HISTORY_POINTS; ++i)
+        status.battery_history.samples[i] = (c1_battery_sample){C1_BATTERY_MIN_TIME + (int64_t)i * 60,
+            (uint8_t)(i % 101U), C1_BATTERY_DISCHARGING, i != 0 && i != 50};
+    status.battery_history_now = status.battery_history.samples[C1_BATTERY_HISTORY_POINTS - 1U].timestamp;
+    for (unsigned language = 0; language <= C1_LANGUAGE_EN; ++language) {
+        state.preferences.language = (c1_language)language;
+        for (unsigned view = 0; view <= C1_BATTERY_VIEW_MINUTE; ++view) {
+            state.battery_view = (c1_battery_view)view;
+            for (unsigned endpoint = 0; endpoint < 2; ++endpoint) {
+                state.battery_selected_at = endpoint ? C1_BATTERY_MIN_TIME : 0;
+                c1_ui_render(guarded.frame, &state, &status, NULL);
+                for (unsigned i = 0; i < 16; ++i)
+                    expect(guarded.before[i] == 0xa5 && guarded.after[i] == 0xa5,
+                           "full minute history and focus brackets preserve frame canaries");
+            }
+        }
+    }
+    status.battery_history.count = 0;
+    for (unsigned language = 0; language <= C1_LANGUAGE_EN; ++language) {
+        state.preferences.language = (c1_language)language;
+        c1_ui_render(guarded.frame, &state, &status, NULL);
+        c1_display_frame_clear(expected, false);
+        c1pkg_text(expected, 178, 22, language ? "Vol +/-: view" : "音量选视图", 110, true);
+        expect(frame_region_equal(expected, guarded.frame, 178, 22, 110, 16),
+               "battery toolbar advertises volume view control in both languages");
+        c1pkg_text(expected, 6, 136, language ? "Left/Right: sample  Vol +/-: view" : "左右选采样点  音量选日/时/分", 284, true);
+        expect(frame_region_equal(expected, guarded.frame, 0, 136, 296, 16),
+               "empty history footer advertises arrows for samples and volume for scale");
+    }
+    static const c1_ui_event empty_events[] = {C1_UI_EVENT_LEFT, C1_UI_EVENT_RIGHT, C1_UI_EVENT_ENTER};
+    for (size_t i = 0; i < sizeof(empty_events) / sizeof(*empty_events); ++i) {
+        next = c1_ui_step(state, empty_events[i], &status);
+        expect(next.state.selection == 0 && !next.state.battery_selected_at && next.state.battery_view == state.battery_view &&
+               next.action == C1_UI_ACTION_NONE, "empty history arrows and Enter are safe and never change scale");
+    }
+    expect(c1_ui_step(state, C1_UI_EVENT_VIEW_PREVIOUS, &status).state.battery_view == C1_BATTERY_VIEW_HOUR,
+           "volume still changes views with empty history");
+    state.page = C1_UI_PAGE_DESKTOP; state.selection = 1; state.preferences.terminal_enabled = false;
+    expect(c1_ui_step(state, C1_UI_EVENT_ENTER, &status).state.page == C1_UI_PAGE_TERMINAL,
+           "obsolete terminal switch cannot strand a user after removing the process page");
+}
+
+
 int main(void)
 {
     test_display_frame();
@@ -1156,6 +1365,10 @@ int main(void)
     test_wifi_saved_interactions();
     test_wifi_typography();
     test_ui();
+    test_focus_frame();
+    test_selected_rows_are_rectangular();
+    test_battery_ui();
+    test_input_overlay_bounds();
     test_terminal_screen();
     test_terminal_pty();
     test_power_policy();

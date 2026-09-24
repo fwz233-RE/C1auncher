@@ -112,9 +112,17 @@ static bool interface_ipv4(const char *interface_name, char *value, size_t capac
     return found;
 }
 
+bool c1_linux_battery_read(uint32_t *percent)
+{
+    int64_t value;
+    if (!percent || !read_integer("/sys/class/power_supply/battery/capacity", &value) ||
+        value < 0 || value > 100) return false;
+    *percent = (uint32_t)value;
+    return true;
+}
+
 bool c1_linux_system_status_read(c1_ui_status *status)
 {
-    int64_t capacity = -1;
     int64_t carrier = -1;
     struct timespec current;
     struct tm local;
@@ -124,11 +132,8 @@ bool c1_linux_system_status_read(c1_ui_status *status)
     }
     memset(status, 0, sizeof(*status));
 
-    status->battery_available = read_integer("/sys/class/power_supply/battery/capacity", &capacity) &&
-                                capacity >= 0 && capacity <= 100;
-    if (status->battery_available) {
-        status->battery_percent = (uint32_t)capacity;
-    }
+    status->battery_available = c1_linux_battery_read(&status->battery_percent);
+    status->external_power_known = c1_linux_external_power_read(&status->external_power);
 
     read_integer("/sys/class/net/wlan0/carrier", &carrier);
     status->wifi_connected = carrier == 1 &&

@@ -1,4 +1,6 @@
 #include "pkg.h"
+#include "metrics.h"
+#include "local.h"
 #include "gui.h"
 #include "storage_layout.h"
 #include "platform/app_lease.h"
@@ -757,9 +759,65 @@ static int package_url(char *url, size_t url_size, const struct c1pkg_config *co
     return count >= 0 && (size_t)count < url_size ? 0 : -1;
 }
 
-int c1pkg_store_install(const struct c1pkg_config *config,
-                        const struct c1pkg_package *package,
-                        char *error, size_t error_size)
+static int copy_local_archive(int repository_fd, const struct c1pkg_package *package,
+                               const char *output, char *error, size_t error_size)
+{
+    unsigned char buffer[16384], extra;
+    uint64_t copied = 0U;
+    struct stat info;
+    int source = -1, target = -1, result = -1, saved_errno;
+    ssize_t amount;
+    source = c1pkg_local_openat(repository_fd, package->archive, 0, error, error_size);
+    if (source < 0) return -1;
+    if (fstat(source, &info) != 0) goto failed;
+    if (!S_ISREG(info.st_mode) || info.st_nlink != 1 || info.st_size < 0 ||
+        (uint64_t)info.st_size != package->size) {
+        errno = EINVAL;
+        c1pkg_set_error(error, error_size, "local archive is linked, special, or has incorrect size");
+        goto done;
+    }
+    /* output is inside the existing private staging tree, never the source.
+     * Exclusive creation forbids accidentally clobbering another staged file. */
+    target = open(output, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+    if (target < 0) goto failed;
+    if (c1pkg_progress("Copying local package") != 0) { errno = ECANCELED; goto failed; }
+    while (copied < package->size) {
+        size_t used = 0U;
+        size_t chunk = package->size - copied > sizeof(buffer) ? sizeof(buffer) :
+                       (size_t)(package->size - copied);
+        if (c1pkg_progress(NULL) != 0) { errno = ECANCELED; goto failed; }
+        amount = read(source, buffer, chunk);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) { if (amount == 0) errno = EIO; goto failed; }
+        while (used < (size_t)amount) {
+            ssize_t written = write(target, buffer + used, (size_t)amount - used);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) { if (written == 0) errno = EIO; goto failed; }
+            used += (size_t)written;
+        }
+        copied += (uint64_t)amount;
+    }
+    do { amount = read(source, &extra, 1U); } while (amount < 0 && errno == EINTR);
+    if (amount != 0) { if (amount > 0) errno = EFBIG; goto failed; }
+    if (fsync(target) != 0) goto failed;
+    if (close(target) != 0) { target = -1; goto failed; }
+    target = -1;
+    result = 0;
+    goto done;
+failed:
+    c1pkg_set_error(error, error_size, "copy local archive: %s", strerror(errno));
+done:
+    saved_errno = errno;
+    (void)close(source);
+    if (target >= 0) (void)close(target);
+    /* The common installer owns stage cleanup, including any partial copy. */
+    errno = saved_errno;
+    return result;
+}
+
+static int store_install(const struct c1pkg_config *config, int repository_fd,
+                          const struct c1pkg_package *package,
+                          char *error, size_t error_size)
 {
     const char *tar = c1pkg_helper("/bin/tar", "tar");
     int lock_descriptor = -1;
@@ -786,7 +844,7 @@ int c1pkg_store_install(const struct c1pkg_config *config,
     int retained = 0;
     int result = C1PKG_INSTALL_PACKAGE_ERROR;
 
-    if (config == NULL || config->repo_base == NULL || config->repo_base[0] == '\0' ||
+    if ((repository_fd < 0 && (config == NULL || config->repo_base == NULL || config->repo_base[0] == '\0')) ||
         package == NULL || !c1pkg_safe_id(package->id) || !c1pkg_safe_version(package->version) ||
         !c1pkg_safe_relpath(package->archive) || !c1pkg_safe_relpath(package->entry) ||
         package->size == 0U || package->size > C1PKG_PACKAGE_MAX) {
@@ -812,7 +870,7 @@ int c1pkg_store_install(const struct c1pkg_config *config,
         c1pkg_join(entry, sizeof(entry), payload, package->entry) != 0 ||
         c1pkg_join(entry_metadata, sizeof(entry_metadata), payload, ".c1pkg-entry") != 0 ||
         c1pkg_join(mode_metadata, sizeof(mode_metadata), payload, ".c1pkg-mode") != 0 ||
-        package_url(url, sizeof(url), config, package) != 0) {
+        (repository_fd < 0 && package_url(url, sizeof(url), config, package) != 0)) {
         c1pkg_set_error(error, error_size, "package path or URL is too long");
         goto done;
     }
@@ -865,8 +923,11 @@ int c1pkg_store_install(const struct c1pkg_config *config,
     }
     (void)remove_package_tree(stage, NULL, 0U);
     if (c1pkg_mkdir_p(extract, 0700, error, error_size) != 0 ||
-        c1pkg_fetch(url, archive, package->size, error, error_size) != 0 ||
-        stat(archive, &information) != 0 || (uint64_t)information.st_size != package->size) {
+        (repository_fd >= 0 ? copy_local_archive(repository_fd, package, archive, error, error_size) :
+                              c1pkg_fetch(url, archive, package->size, error, error_size)) != 0 ||
+        lstat(archive, &information) != 0 || !S_ISREG(information.st_mode) ||
+        information.st_nlink != 1 || information.st_size < 0 ||
+        (uint64_t)information.st_size != package->size) {
         if (error != NULL && error[0] == '\0') {
             c1pkg_set_error(error, error_size, "downloaded package size mismatch");
         }
@@ -946,7 +1007,34 @@ done:
     (void)remove_package_tree(stage, NULL, 0U);
     if (result == C1PKG_INSTALL_OK) cleanup_abandoned_work();
     release_lock(lock_descriptor);
+    /* Only a completed authenticated online installation creates an event.
+     * Never couple display statistics to WAL replay, signatures, rollback,
+     * cancellation, offline imports, or the caller's installation outcome.
+     * Queue I/O is best effort; all networking happens in a separate worker. */
+    if (result == C1PKG_INSTALL_OK && repository_fd < 0) {
+        int saved_errno = errno;
+        (void)c1pkg_device_metrics_record_install(config, package);
+        errno = saved_errno;
+    }
     return result;
+}
+
+int c1pkg_store_install(const struct c1pkg_config *config,
+                        const struct c1pkg_package *package,
+                        char *error, size_t error_size)
+{
+    return store_install(config, -1, package, error, error_size);
+}
+
+int c1pkg_store_install_local(int repository_fd, const struct c1pkg_package *package,
+                              char *error, size_t error_size)
+{
+    struct stat info;
+    if (repository_fd < 0 || fstat(repository_fd, &info) != 0 || !S_ISDIR(info.st_mode)) {
+        c1pkg_set_error(error, error_size, "invalid local repository descriptor");
+        return C1PKG_INSTALL_PACKAGE_ERROR;
+    }
+    return store_install(NULL, repository_fd, package, error, error_size);
 }
 
 /* The graphical manager already owns the run lock to keep the desktop idle.

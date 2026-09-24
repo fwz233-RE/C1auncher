@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -158,6 +159,13 @@ static void child_exec(int master,
     }
     close(master);
     (void)setenv("TERM", "xterm-256color", 1);
+    {
+        char terminal_columns[16], terminal_rows[16];
+        snprintf(terminal_columns, sizeof(terminal_columns), "%u", columns);
+        snprintf(terminal_rows, sizeof(terminal_rows), "%u", rows);
+        (void)setenv("COLUMNS", terminal_columns, 1);
+        (void)setenv("LINES", terminal_rows, 1);
+    }
     (void)setenv("PATH", "/usr/data/c1/bin:/sbin:/usr/sbin:/bin:/usr/bin", 1);
     (void)setenv("SHELL", "/bin/bash", 1);
     (void)setenv("HOME", "/root", 1);
@@ -391,6 +399,17 @@ c1_terminal_state c1_terminal_get_state(c1_terminal_session *session)
 int c1_terminal_exit_code(const c1_terminal_session *session)
 {
     return session != NULL ? session->exit_code : 128;
+}
+
+c1_status c1_terminal_resize(c1_terminal_session *session, unsigned int columns, unsigned int rows)
+{
+    if (!session || columns == 0 || rows == 0 || columns > 1000 || rows > 1000)
+        return C1_STATUS_INVALID_ARGUMENT;
+    if (session->master_fd < 0) return C1_STATUS_OK;
+    struct winsize window = {0};
+    window.ws_col = (unsigned short)columns;
+    window.ws_row = (unsigned short)rows;
+    return ioctl(session->master_fd, TIOCSWINSZ, &window) == 0 ? C1_STATUS_OK : C1_STATUS_IO_ERROR;
 }
 
 c1_status c1_terminal_flush(c1_terminal_session *session)

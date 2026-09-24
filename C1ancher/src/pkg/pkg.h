@@ -107,6 +107,9 @@ int c1pkg_sync_directory(const char *path, char *error, size_t error_size);
 int c1pkg_run(char *const argv[], const char *stdout_path, uint64_t file_limit,
               char *error, size_t error_size);
 const char *c1pkg_helper(const char *absolute, const char *name);
+/* Internal service packages remain installable but are omitted from user-facing
+ * application lists and desktop application counts. */
+int c1pkg_is_internal_id(const char *id);
 void c1pkg_set_error(char *error, size_t error_size, const char *format, ...);
 
 /* Progress callbacks return nonzero to cancel; NULL messages only poll input. */
@@ -116,8 +119,19 @@ int c1pkg_repo_read_url(const char *path, char *url, size_t url_size,
                         char *error, size_t error_size);
 int c1pkg_repo_parse(const unsigned char *data, size_t size, struct c1pkg_index *index,
                      char *error, size_t error_size);
+/* Pure configuration binding: no I/O, no wait. GUI parents receiving indexes
+ * from forked workers should call this on initialization/config changes, before
+ * installing, to disambiguate nested repositories on one origin. refresh and
+ * load_cached bind internally. Deadlines are ALWAYS loaded from private durable
+ * state, never inherited from this hint. Returns -1 for ambiguous/unsafe URL. */
+int c1pkg_repo_bind_transport(const struct c1pkg_config *config);
 int c1pkg_repo_refresh(const struct c1pkg_config *config, struct c1pkg_index *index,
                        char *error, size_t error_size);
+/* Verify a local signed index in memory without changing online cache/sequence.
+ * Returns an owned repository directory fd (close it), or -1. Keep this fd
+ * through store_install_local so a renamed source cannot redirect the root. */
+int c1pkg_repo_open_local(const struct c1pkg_config *config, const char *directory,
+                          struct c1pkg_index *index, char *error, size_t error_size);
 int c1pkg_repo_load_cached(const struct c1pkg_config *config, struct c1pkg_index *index,
                            char *error, size_t error_size);
 const struct c1pkg_package *c1pkg_repo_find(const struct c1pkg_index *index,
@@ -142,6 +156,11 @@ int c1pkg_store_list(struct c1pkg_installed_list *list, char *error, size_t erro
 int c1pkg_store_install(const struct c1pkg_config *config,
                         const struct c1pkg_package *package,
                         char *error, size_t error_size);
+/* Only pass a package from the index verified by repo_open_local and its fd.
+ * An already-current version is SKIPPED before archive I/O, just as online.
+ * Callers must verify the index even for this no-op; it is not a repair. */
+int c1pkg_store_install_local(int repository_fd, const struct c1pkg_package *package,
+                              char *error, size_t error_size);
 int c1pkg_store_remove(const char *id, char *error, size_t error_size);
 int c1pkg_store_rollback(const char *id, char *error, size_t error_size);
 int c1pkg_app_uses_direct_io(const char *id);
@@ -157,8 +176,8 @@ int c1pkg_download_list_build(const struct c1pkg_index *index,
                               const struct c1pkg_installed_list *installed,
                               struct c1pkg_download_list *list);
 
-/* Shared GUI/TUI input. Printable ASCII is returned unchanged; commands are
- * outside the byte range so no application-name letter is a list shortcut. */
+/* Shared terminal input. Printable UTF-8 bytes are returned unchanged;
+ * commands are outside the byte range so no application-name byte is a list shortcut. */
 enum c1pkg_input_key {
     C1PKG_KEY_NONE = 256, C1PKG_KEY_UP, C1PKG_KEY_DOWN,
     C1PKG_KEY_LEFT, C1PKG_KEY_RIGHT, C1PKG_KEY_ENTER,

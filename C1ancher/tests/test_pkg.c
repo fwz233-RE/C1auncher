@@ -31,6 +31,9 @@ static void test_versions(void)
 {
     int comparison = 0;
 
+    expect(c1pkg_is_internal_id("c1-ime") && c1pkg_is_internal_id("C1-IME"),
+           "the input service is recognized as an internal package");
+    expect(!c1pkg_is_internal_id("book-reader"), "ordinary applications are not hidden");
     expect(c1pkg_install_decision(NULL, "1.0.0") == 1, "new application can be installed");
     expect(c1pkg_install_decision("1.0.0", "1.1.0") == 1, "newer installed application can update");
     expect(c1pkg_install_decision("1.0.0", "1.0.0") == 0, "same version is a no-op");
@@ -173,11 +176,11 @@ static void test_prefix_and_input(void)
     struct c1pkg_prefix prefix = {{0}, 0U};
     int input[2];
     size_t i;
-    static const char burst[] = "PiAnOrQ\177\b\025 \r\n\033[A\033[6~\033[3~Z";
+    static const char burst[] = "PiAnOrQ\177\b\025 \r\n\033[A\033[6~\033[3~Z\xe4\xbd\xa0";
     static const int expected[] = {'P', 'i', 'A', 'n', 'O', 'r', 'Q',
         C1PKG_KEY_ERASE, C1PKG_KEY_ERASE, C1PKG_KEY_CLEAR, C1PKG_KEY_REFRESH,
         C1PKG_KEY_ENTER, C1PKG_KEY_ENTER, C1PKG_KEY_UP, C1PKG_KEY_RIGHT,
-        C1PKG_KEY_NONE, 'Z'};
+        C1PKG_KEY_NONE, 'Z', 0xe4, 0xbd, 0xa0};
     expect(c1pkg_prefix_input(&prefix, 'P', 100U) && strcmp(prefix.text, "p") == 0,
            "uppercase starts a normalized prefix");
     expect(c1pkg_prefix_matches(&prefix, "Paint", "paint") &&

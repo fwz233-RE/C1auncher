@@ -43,6 +43,7 @@ c1_terminal_state c1_terminal_get_state(c1_terminal_session *session);
 int c1_terminal_exit_code(const c1_terminal_session *session);
 c1_status c1_terminal_write(c1_terminal_session *session, const void *bytes, size_t count);
 ssize_t c1_terminal_read(c1_terminal_session *session, void *buffer, size_t capacity);
+c1_status c1_terminal_resize(c1_terminal_session *session, unsigned int columns, unsigned int rows);
 c1_status c1_terminal_flush(c1_terminal_session *session);
 c1_status c1_terminal_suspend(c1_terminal_session *session, bool *was_running);
 c1_status c1_terminal_resume(c1_terminal_session *session, bool was_running);

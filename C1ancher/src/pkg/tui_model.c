@@ -55,7 +55,7 @@ int c1pkg_input_read(int fd, int timeout_ms)
     if (byte == 8U || byte == 127U) return C1PKG_KEY_ERASE;
     if (byte == 21U) return C1PKG_KEY_CLEAR; /* Ctrl-U */
     if (byte == 3U) return C1PKG_KEY_QUIT;
-    return byte >= 33U && byte <= 126U ? (int)byte : C1PKG_KEY_NONE;
+    return byte >= 33U ? (int)byte : C1PKG_KEY_NONE;
 }
 
 void c1pkg_prefix_clear(struct c1pkg_prefix *prefix)

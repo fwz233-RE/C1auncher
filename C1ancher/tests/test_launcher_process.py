@@ -1,6 +1,7 @@
 """Host process regressions; compiles the real launcher, never accesses hardware."""
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -18,8 +19,11 @@ class LauncherProcessTests(unittest.TestCase):
         subprocess.run([
             "cc", "-D_POSIX_C_SOURCE=200809L", "-std=c11", "-Wall", "-Wextra",
             "-Wpedantic", "-Werror", "-I" + str(ROOT / "src"),
-            str(ROOT / "src/launcher/main.c"), str(ROOT / "src/launcher/policy.c"),
-            str(ROOT / "src/platform/liveness.c"),
+            '-DC1_LAUNCHER_DATA_ROOT="' + str(self.root / 'usr/data') + '"',
+            str(ROOT / "src/launcher/main.c"), str(ROOT / "src/launcher/cleanup.c"),
+            str(ROOT / "src/update/state.c"), str(ROOT / "src/security/secure_file.c"),
+            str(ROOT / "src/launcher/policy.c"),
+            str(ROOT / "src/platform/liveness.c"), str(ROOT / "src/platform/shutdown.c"),
             "-o", str(self.launcher),
         ], check=True)
         self.process = None
@@ -57,6 +61,120 @@ class LauncherProcessTests(unittest.TestCase):
         self.process = subprocess.Popen([str(self.launcher), *args],
                                         start_new_session=True, env=env, **kwargs)
 
+    def start_standard(self, sequence, version, body, python=False, env=None, launch=True, core=None):
+        release = (core or self.root) / "releases" / f"{sequence}-{version}"
+        artifacts = release / "artifacts"
+        artifacts.mkdir(parents=True)
+        launcher = artifacts / "C1ancher-launcher"
+        shutil.copy2(self.launcher, launcher)
+        launcher.chmod(0o700)
+        app = artifacts / "C1ancher"
+        app.write_text(("#!/usr/bin/python3\n" if python else "#!/bin/sh\n") + body)
+        app.chmod(0o700)
+        if env is None:
+            env = dict(os.environ)
+        if launch:
+            self.process = subprocess.Popen([str(launcher)], start_new_session=True, env=env)
+        return release, artifacts, launcher
+
+    def test_release_cleanup_uses_running_release_and_runs_once(self):
+        calls = self.root / "calls"
+        late = self.root / "releases" / "8-created-after-cleanup" / "artifacts"
+        body = (
+            "import os,time\nfrom pathlib import Path\n"
+            f"calls=Path({str(calls)!r})\n"
+            "count=int(calls.read_text()) if calls.exists() else 0\n"
+            "calls.write_text(str(count + 1))\n"
+            f"late=Path({str(late)!r})\n"
+            "if count == 0:\n"
+            " late.mkdir(parents=True)\n"
+            " (late/'payload').write_text('created after cleanup')\n"
+            " raise SystemExit(1)\n"
+            "while True:\n"
+            " os.write(int(os.environ['C1_UI_HEARTBEAT_FD']), b'H')\n"
+            " time.sleep(.05)\n"
+        )
+        old_newest = self.root / "releases" / "9-previous" / "artifacts"
+        old_oldest = self.root / "releases" / "4-old" / "artifacts"
+        newer = self.root / "releases" / "13-future" / "artifacts"
+        old_newest.mkdir(parents=True)
+        old_oldest.mkdir(parents=True)
+        newer.mkdir(parents=True)
+        _, artifacts, _ = self.start_standard(
+            12, "new", body, python=True,
+            env=dict(os.environ, C1_HEARTBEAT_STARTUP_MS="500",
+                     C1_HEARTBEAT_TIMEOUT_MS="300"))
+        self.wait_for(lambda: calls.exists() and calls.read_text() == "2")
+        self.assertTrue((artifacts / "C1ancher").exists())
+        self.assertTrue(old_newest.exists())
+        self.assertFalse(old_oldest.parent.exists())
+        self.assertTrue(newer.exists())
+        self.assertTrue(late.exists())
+        self.process.terminate()
+        self.assertEqual(self.process.wait(timeout=5), 0)
+
+    def test_partition_is_not_cleaned_by_unconfirmed_startup_or_ui_restart(self):
+        data = self.root / 'usr/data'
+        c1 = data / 'c1'
+        core = c1 / 'core'
+        (c1 / 'update/state').mkdir(parents=True, mode=0o700)
+        c1.chmod(0o777)
+        for name in ('21-old', '22-old', '23-previous'):
+            (core / 'releases' / name / 'artifacts').mkdir(parents=True)
+        (core / 'current').symlink_to('releases/24-new')
+        (core / 'previous').symlink_to('releases/23-previous')
+        old = c1 / 'backups/old-payload'
+        old.parent.mkdir(mode=0o777)
+        old.write_text('old backup')
+        old.chmod(0o666)
+        kept = c1 / 'book-reader/documents/book.txt'
+        kept.parent.mkdir(parents=True)
+        kept.write_text('keep the user document')
+        calls = self.root / 'calls'
+        late = data / 'pinao-smoke.sh'
+        body = (
+            "import os,time\nfrom pathlib import Path\n"
+            f"calls=Path({str(calls)!r})\n"
+            "count=int(calls.read_text()) if calls.exists() else 0\n"
+            "calls.write_text(str(count + 1))\n"
+            "if count == 0:\n"
+            f" Path({str(late)!r}).write_text('created after startup cleanup')\n"
+            " raise SystemExit(1)\n"
+            "while True:\n"
+            " os.write(int(os.environ['C1_UI_HEARTBEAT_FD']), b'H')\n"
+            " time.sleep(.05)\n"
+        )
+        self.start_standard(24, 'new', body, python=True, core=core,
+                            env=dict(os.environ, C1_HEARTBEAT_STARTUP_MS='500',
+                                     C1_HEARTBEAT_TIMEOUT_MS='300'))
+        self.wait_for(lambda: calls.exists() and calls.read_text() == '2')
+        self.assertTrue(old.parent.exists())
+        self.assertTrue((core / 'releases/21-old').exists())
+        self.assertTrue((core / 'releases/22-old').exists())
+        self.assertTrue((core / 'releases/23-previous').exists())
+        self.assertEqual(kept.read_text(), 'keep the user document')
+        self.assertEqual(c1.stat().st_mode & 0o777, 0o777)
+        self.assertTrue(late.exists())
+        self.process.terminate()
+        self.assertEqual(self.process.wait(timeout=5), 0)
+
+    def test_cleanup_failure_does_not_block_launcher(self):
+        releases = self.root / "releases"
+        releases.mkdir()
+        old = releases / "3-oldest" / "artifacts"
+        old.mkdir(parents=True)
+        newest = releases / "9-previous" / "artifacts"
+        newest.mkdir(parents=True)
+        os.mkfifo(old / "unsafe")
+        _, _, launcher = self.start_standard(
+            12, "new", "echo started > '" + str(self.root / "started") + "'\nsleep 60\n",
+            launch=False)
+        self.process = subprocess.Popen([str(launcher)], start_new_session=True)
+        self.wait_for((self.root / "started").exists)
+        self.assertTrue(old.parent.exists())
+        self.process.terminate()
+        self.assertEqual(self.process.wait(timeout=5), 0)
+
     def test_missing_startup_heartbeat_revokes_ready(self):
         ready = self.root / "ready"
         self.start_python(f"from pathlib import Path\nimport time\n"
@@ -87,7 +205,7 @@ class LauncherProcessTests(unittest.TestCase):
             "import os,time\nfrom pathlib import Path\n"
             f"Path({str(marker)!r}).write_text(str(os.getpid()))\n"
             "while True:\n os.write(int(os.environ['C1_UI_HEARTBEAT_FD']), b'H')\n time.sleep(.05)\n")
-        self.wait_for(marker.exists)
+        self.wait_for(lambda: marker.exists() and marker.stat().st_size > 0)
         child = int(marker.read_text())
         time.sleep(.9)
         os.kill(child, 0)
@@ -135,9 +253,11 @@ class LauncherProcessTests(unittest.TestCase):
             " fcntl.flock(fd,fcntl.LOCK_EX)\n"
             f" Path({str(pidfile)!r}).write_text(str(os.getpid()))\n time.sleep(60)\n"
             "else:\n"
-            f" while not Path({str(pidfile)!r}).exists(): time.sleep(.01)\n"
+            f" while not (Path({str(pidfile)!r}).exists() and Path({str(pidfile)!r}).stat().st_size > 0): time.sleep(.01)\n"
             " os._exit(75)\n")
-        self.wait_for(pidfile.exists)
+        # Creation precedes write_text's write; wait for the PID, not just
+        # the empty inode, before signalling or checking the descendant.
+        self.wait_for(lambda: pidfile.exists() and pidfile.stat().st_size > 0)
         descendant = int(pidfile.read_text())
         self.assertEqual(self.process.wait(timeout=5), 75)
         with self.assertRaises(ProcessLookupError):
@@ -157,7 +277,9 @@ class LauncherProcessTests(unittest.TestCase):
             " time.sleep(60)\n"
             "else:\n"
             " while True:\n  os.write(int(os.environ['C1_UI_HEARTBEAT_FD']),b'H')\n  time.sleep(.05)\n")
-        self.wait_for(pidfile.exists)
+        # Creation precedes write_text's write; wait for the PID, not just
+        # the empty inode, before signalling or checking the descendant.
+        self.wait_for(lambda: pidfile.exists() and pidfile.stat().st_size > 0)
         descendant = int(pidfile.read_text())
         os.kill(int(ui.read_text()), signal.SIGKILL)
         self.wait_for(lambda: not Path(f"/proc/{descendant}").exists())
@@ -211,6 +333,14 @@ class LauncherProcessTests(unittest.TestCase):
         finally:
             os.close(read_fd)
             os.close(write_fd)
+
+    def test_shutdown_exit_is_propagated_without_restart(self):
+        calls, ready = self.root / "calls", self.root / "ready"
+        self.start(f"echo started >> '{calls}'\necho ready > '{ready}'\nexit 76\n",
+                   "--ready-file", str(ready))
+        self.assertEqual(self.process.wait(timeout=5), 76)
+        self.assertEqual(calls.read_text().splitlines(), ["started"])
+        self.assertFalse(ready.exists())
 
     def test_stop_during_backoff_does_not_spawn_again(self):
         calls = self.root / "calls"

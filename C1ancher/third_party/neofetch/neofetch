@@ -19,11 +19,50 @@ if [[ ! -r $upstream || ! -r $config || ! -r $custom_logo ]]; then
 fi
 
 export TERM=${TERM:-xterm-256color}
-export COLUMNS=${COLUMNS:-49}
-export LINES=${LINES:-19}
+
+# The shell's exported dimensions can outlive a PTY resize (IME on/off).
+# Query the output TTY first, including when stdin is redirected. Environment
+# dimensions are only a fallback when no valid live winsize is available.
+c1_dimension() {
+    [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 > 0 && 10#$1 <= 65535 ))
+}
+# Save stdout before command substitution replaces fd 1 with its capture pipe.
+{
+    # BusyBox stty applies exported LINES/COLUMNS over the kernel winsize.
+    # Clear them only for this probe; retain the originals for fallback below.
+    terminal_size=$(unset LINES COLUMNS; stty size <&3 2>/dev/null || stty size 2>/dev/null || true)
+} 3<&1
+read -r detected_lines detected_columns <<< "$terminal_size"
+if c1_dimension "${detected_lines:-}" && c1_dimension "${detected_columns:-}"; then
+    LINES=$((10#$detected_lines))
+    COLUMNS=$((10#$detected_columns))
+else
+    if c1_dimension "${LINES:-}"; then LINES=$((10#$LINES)); else LINES=24; fi
+    if c1_dimension "${COLUMNS:-}"; then COLUMNS=$((10#$COLUMNS)); else COLUMNS=80; fi
+fi
+export COLUMNS LINES
+
+# Automatic fitting is intentionally limited to a no-argument invocation on a
+# TTY smaller than the original 49x19 profile. Explicit options, custom configs,
+# simple queries and --stdout retain upstream behavior and are not screen-fit.
+# A pipe/file also keeps the complete profile, regardless of stale shell sizes.
+export C1_NEOFETCH_COMPACT=0
+if (( $# == 0 && (COLUMNS < 49 || LINES < 19) )) && [[ -t 1 ]]; then
+    export C1_NEOFETCH_COMPACT=1
+    exec /bin/bash "$upstream" --config "$config" --stdout
+fi
+
+# Do not load the C1 profile before an explicit --config none/custom config:
+# upstream's --config none does not undo an already sourced config file.
+default_config=(--config "$config")
+for argument in "$@"; do
+    case $argument in
+        --config|--no_config) default_config=(); break ;;
+    esac
+done
 
 exec /bin/bash "$upstream" \
-    --config "$config" \
+    "${default_config[@]}" \
     --backend ascii \
     --source "$custom_logo" \
     --ascii_colors 7 \

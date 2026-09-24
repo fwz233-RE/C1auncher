@@ -73,17 +73,28 @@ id_ed25519
 !/C1ancher/VERSION
 !/C1ancher/config/
 !/C1ancher/docs/
-!/C1ancher/installer/
 !/C1ancher/scripts/
 !/C1ancher/src/
 !/C1ancher/tests/
 !/C1ancher/third_party/
 !/C1ancher/tools/
 
-# These projects stay local and are excluded from all future uploads.
+# InkWars stays local and is excluded from GitHub uploads.
+/InkWars/
+
+# Server project stays local, including its bundled publishing tools.
 /C1ancher-server/
 /tools/publisher/
-/InkWars/
+
+# Windows installer sources stay local; publish the complete EXE bundle
+# as a GitHub Release asset instead of committing build products.
+/C1ancher/installer/
+/C1ancher/docs/installer-*.md
+/C1ancher/scripts/install-open-adb.ps1
+/C1ancher/tests/test_installer_*.py
+/C1ancher/tests/installer_*.c
+/C1ancher/tests/test_enrollment_compatibility.py
+/C1ancher/tests/test_running_process_snapshot.py
 
 # Maintainer-only deployment helpers are not an application developer interface.
 /Pinao/scripts/authorize-server.py

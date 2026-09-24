@@ -1,5 +1,8 @@
 /* Isolated HTTP driver: compiled by test_pkg_http.py, never uses device state. */
 #include "pkg_transport_clock.h"
+#ifndef C1PKG_STATE_ROOT
+#error "HTTP tests require an isolated compile-time state root"
+#endif
 #define clock_gettime test_transport_clock_gettime
 #define time test_transport_time
 #define poll test_transport_poll
@@ -16,8 +19,7 @@ static int cancel_resume;
 
 int c1pkg_storage_state_init(char *error, size_t error_size)
 {
-    c1pkg_set_error(error, error_size, "HTTP test does not access package state");
-    return -1;
+    return c1pkg_mkdir_p(C1PKG_STATE_ROOT, 0700, error, error_size);
 }
 
 static uint64_t milliseconds(void)
@@ -79,5 +81,6 @@ int main(int argc, char **argv)
     printf("WAITED %llu\n", (unsigned long long)(test_transport_ms - 100000U));
     printf("RESULT %d ERRNO %d MAXSIZE %llu ELAPSED %llu\nERROR %s\n", result, error_number,
            (unsigned long long)largest, (unsigned long long)(milliseconds() - started), error);
+    (void)c1pkg_remove_tree(C1PKG_STATE_ROOT, NULL, 0U);
     return 0;
 }

@@ -11,14 +11,22 @@
 #include "hal/linux/power.h"
 #include "hal/linux/system_state.h"
 #include "services/terminal.h"
+#include "services/time_sync.h"
+#include "services/input_service.h"
+#include "services/desktop_data.h"
+#include "services/desktop_jobs.h"
+#include "services/battery.h"
 #include "services/wifi.h"
 #include "platform/liveness.h"
+#include "platform/shutdown.h"
 #include "platform/app_lease.h"
 #include "platform/stop.h"
 #include "platform/update_request.h"
 #include "platform/update_health.h"
 #include "update/update.h"
+#include "ui/chrome.h"
 #include "ui/model.h"
+#include "ui/input_method.h"
 #include "ui/render.h"
 #include "ui/terminal_screen.h"
 #include "ui/wallpaper.h"
@@ -35,22 +43,27 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define C1_UI_INPUT_COUNT 2U
 #define C1_UI_STATUS_INTERVAL_MS 60000
+#define C1_BATTERY_SAMPLE_INTERVAL_MS 10000
 #define C1_EXTERNAL_POWER_INTERVAL_MS 5000
 #define C1_TERMINAL_RENDER_DELAY_MS 150
 #define C1_TERMINAL_READ_BUDGET 4096U
 #define C1_TERMINAL_REPEAT_DELAY_MS 450
 #define C1_TERMINAL_REPEAT_INTERVAL_MS 90
 #define C1_LED_SYSFS_ROOT "/sys/class/leds"
-#define C1_TERMINAL_NEOFETCH_COMMAND "clear; neofetch\r"
-#define C1_TERMINAL_APP_COMMAND "clear; /usr/data/c1/bin/c1pkg gui\r"
+#ifndef C1_PKG_EXECUTABLE
+#define C1_PKG_EXECUTABLE "/usr/data/c1/bin/c1pkg"
+#endif
+#define C1_TERMINAL_APP_COMMAND "clear; " C1_PKG_EXECUTABLE " gui\r"
 #define C1_UPDATER_EXECUTABLE "/usr/data/c1/bin/c1updater"
 #define C1_TERMINAL_UPDATE_COMMAND "clear; " C1_UPDATER_EXECUTABLE " tui-prepared\r"
+#define C1_DESKTOP_BATTERY_HISTORY "/usr/data/c1/battery-history.cache"
 
 typedef struct {
     c1_status status;
@@ -74,6 +87,75 @@ static c1_ui_action visible_service_action = C1_UI_ACTION_NONE;
 static c1_wifi_phase visible_wifi_phase = C1_WIFI_PHASE_IDLE;
 static bool wifi_stop_pending;
 static char service_notice[C1_UI_MESSAGE_CAPACITY];
+static c1_preferences desktop_preferences;
+static c1_time_sync network_clock;
+static bool clock_online;
+static c1_desktop_data desktop_summary;
+static c1_desktop_job desktop_job;
+static unsigned desktop_new_apps;
+static uint64_t remote_update_sequence;
+static bool remote_update_available;
+static c1_battery_history battery_history;
+
+static void sample_battery_history(int64_t now)
+{
+    uint32_t percent = 0;
+    bool online = false;
+    bool available = c1_linux_battery_read(&percent);
+    bool known = c1_linux_external_power_read(&online);
+    c1_battery_power power = !known ? C1_BATTERY_POWER_UNKNOWN :
+                              online ? C1_BATTERY_PLUGGED : C1_BATTERY_DISCHARGING;
+    if (c1_battery_history_observe(&battery_history, (int64_t)time(NULL), now,
+                                   available, percent, power))
+        (void)c1_battery_history_save(C1_DESKTOP_BATTERY_HISTORY, &battery_history);
+}
+
+static void reload_desktop_summary(void)
+{
+    c1_desktop_data data, seen;
+    if (!c1_desktop_load(C1_DESKTOP_CACHE, &data)) return;
+    desktop_summary = data;
+    if (!c1_desktop_load(C1_DESKTOP_SEEN, &seen) || strcmp(seen.source, data.source)) {
+        /* First use establishes a baseline without announcing every old app. */
+        if (!c1_app_run_active()) (void)c1_desktop_save(C1_DESKTOP_SEEN, &data);
+        desktop_new_apps = 0;
+    } else desktop_new_apps = c1_desktop_new_count(&data, &seen);
+}
+static c1_input_method desktop_input = {.client = C1_IME_CLIENT_INIT, .deadline = -1};
+static struct c1_ime_response input_view;
+static c1_ui_page input_focus = C1_UI_PAGE_DESKTOP;
+static bool input_terminal_allowed;
+
+static void input_focus_update(const c1_ui_state *state)
+{
+    bool allowed = state->page == C1_UI_PAGE_LOCK_TEXT ||
+        (state->page == C1_UI_PAGE_TERMINAL && input_terminal_allowed && !c1_app_run_active());
+    if (!allowed || input_focus != state->page) {
+        c1_input_method_close(&desktop_input);
+        memset(&input_view, 0, sizeof(input_view));
+    }
+    input_focus = state->page;
+}
+
+static void terminal_geometry(const c1_ui_state *state, unsigned int *columns, unsigned int *rows)
+{
+    (void)state;
+    *columns = C1_CHROME_TERMINAL_COLUMNS;
+    *rows = input_terminal_allowed && (desktop_input.enabled || desktop_input.failed)
+        ? C1_CHROME_TERMINAL_INPUT_ROWS : C1_CHROME_TERMINAL_ROWS;
+}
+
+
+static c1_status start_desktop_terminal(c1_terminal_session *session, c1_terminal_screen *screen,
+                                        const c1_ui_state *state, char *const argv[])
+{
+    unsigned columns, rows;
+    terminal_geometry(state, &columns, &rows);
+    c1_status result = c1_terminal_screen_resize(screen, columns, rows);
+    if (result != C1_STATUS_OK) return result;
+    return argv ? c1_terminal_start_exec(session, columns, rows, argv[0], argv) :
+                  c1_terminal_start(session, columns, rows);
+}
 
 static void service_worker_init(c1_service_worker *worker)
 {
@@ -201,6 +283,15 @@ static c1_ui_event map_key(uint16_t code)
     }
 }
 
+static c1_ui_event map_page_key(c1_ui_page page, uint16_t code)
+{
+    if (page == C1_UI_PAGE_BATTERY) {
+        if (code == KEY_VOLUMEDOWN) return C1_UI_EVENT_VIEW_PREVIOUS;
+        if (code == KEY_VOLUMEUP) return C1_UI_EVENT_VIEW_NEXT;
+    }
+    return map_key(code);
+}
+
 static char physical_letter(uint16_t code)
 {
     static const struct {
@@ -245,9 +336,16 @@ static bool apply_physical_secret_key(c1_ui_state *state, uint16_t code, bool sh
 static bool states_equal(const c1_ui_state *left, const c1_ui_state *right)
 {
     return left->page == right->page && left->selection == right->selection &&
+           left->battery_view == right->battery_view &&
+           left->battery_selected_at == right->battery_selected_at &&
            left->symbol_selection == right->symbol_selection &&
            left->keyboard_layer == right->keyboard_layer &&
            left->terminal_symbol_picker == right->terminal_symbol_picker &&
+           left->terminal_action == right->terminal_action &&
+           left->desktop_selection == right->desktop_selection &&
+           strcmp(left->lock_text_draft, right->lock_text_draft) == 0 &&
+           left->lock_text_cursor == right->lock_text_cursor &&
+           memcmp(&left->preferences, &right->preferences, sizeof(left->preferences)) == 0 &&
            left->secret_length == right->secret_length &&
            left->secret_visible == right->secret_visible &&
            left->selected_security == right->selected_security &&
@@ -339,9 +437,12 @@ static void merge_update_status(c1_ui_status *status)
     char error[C1_UPDATE_ERROR_MAX] = "";
 
     status->update_available = false;
+    status->update_prepared = false;
     if (c1_update_state_load(C1_UPDATE_DEFAULT_STATE_ROOT, &update_state,
                              error, sizeof(error)) == 0) {
-        status->update_available = update_state.phase == C1_UPDATE_PREPARED;
+        status->update_prepared = update_state.phase == C1_UPDATE_PREPARED;
+        status->update_available = status->update_prepared ||
+            (remote_update_available && remote_update_sequence > update_state.sequence);
     }
 }
 
@@ -351,7 +452,29 @@ static bool read_ui_status(c1_ui_status *status)
         return false;
     }
     merge_service_status(status);
+    clock_online = status->wifi_connected && status->wifi_ipv4[0];
     merge_update_status(status);
+    status->new_applications = desktop_new_apps;
+    /* quote_zh is the authoritative original. quote_en remains only as the
+     * legacy protocol/cache slot and must not change the daily quote with UI
+     * language, including when an older cache contains a translation. */
+    snprintf(status->daily_quote, sizeof(status->daily_quote), "%s", desktop_summary.quote_zh);
+    status->time_sync_running = network_clock.state == C1_TIME_RUNNING;
+    status->time_sync_ok = network_clock.state == C1_TIME_SYNCED;
+    time_t wall = time(NULL);
+    time_t adjusted = wall + desktop_preferences.utc_offset_minutes * 60;
+    struct tm date;
+    status->time_available = wall >= 1704067200 && gmtime_r(&adjusted, &date) != NULL;
+    if (status->time_available) {
+        status->hour = (uint32_t)date.tm_hour;
+        status->minute = (uint32_t)date.tm_min;
+        status->year = (uint32_t)date.tm_year + 1900U;
+        status->month = (uint32_t)date.tm_mon + 1U;
+        status->day = (uint32_t)date.tm_mday;
+        status->weekday = (uint32_t)date.tm_wday;
+    }
+    status->battery_history = battery_history;
+    status->battery_history_now = (int64_t)wall;
     return true;
 }
 
@@ -363,10 +486,13 @@ static c1_status render_state(c1_ui_state state,
 {
     uint8_t frame[C1_DISPLAY_FRAME_BYTES];
 
+    input_focus_update(&state);
+    if (state.page == C1_UI_PAGE_LOCK && state.frozen_lock) return C1_STATUS_OK;
     if (c1_app_run_active() && !c1_app_lease_terminal_mode()) return C1_STATUS_OK;
     /* Reload only when drawing the lock screen, never by polling during sleep. */
     if (state.page == C1_UI_PAGE_LOCK) c1_wallpaper_load();
     c1_ui_render(frame, &state, system_status, terminal);
+    c1_ui_render_input(frame, &state, &input_view, desktop_input.enabled, desktop_input.failed);
     if (full_refresh) {
         return c1_linux_display_write_frame(NULL, frame, sizeof(frame), sink);
     }
@@ -488,31 +614,167 @@ static c1_power_key_action power_key_input(c1_power_key *key, c1_power_policy *p
     return c1_power_key_event(key, source, input->code, input->value, now);
 }
 
+/* Deliver queued input before committing an automatic power deadline. A key
+ * arriving at the lock/shutdown boundary must get its normal wake/reset path. */
+static c1_power_action automatic_power_action(c1_power_policy *policy,
+                                               const c1_power_key *key,
+                                               const struct pollfd *inputs,
+                                               int64_t now)
+{
+    if (key->down) return C1_POWER_ACTION_NONE;
+    if (c1_power_policy_timeout(policy, now) == 0) {
+        struct pollfd pending[C1_UI_INPUT_COUNT];
+        for (unsigned i = 0; i < C1_UI_INPUT_COUNT; ++i)
+            pending[i] = (struct pollfd){inputs[i].fd, POLLIN, 0};
+        /* Readiness/errors are handled by the ordinary input drain below.
+         * Never consume keys here or clear the deadline just for an event. */
+        if (poll(pending, C1_UI_INPUT_COUNT, 0) != 0) return C1_POWER_ACTION_NONE;
+    }
+    return c1_power_policy_tick(policy, now);
+}
+
+/* Wake consumes this press; it must not type into or navigate the restored
+ * page. Power holds are handled separately and become KEY_WAKEUP only after a
+ * verified short release. Repeats/releases alone never unlock or reset timers. */
+static bool wake_lock_from_key(c1_ui_state *state, c1_power_policy *policy,
+                               const struct input_event *input, int64_t now)
+{
+    if (!state || !policy || !input || now < 0 || state->page != C1_UI_PAGE_LOCK ||
+        policy->state != C1_POWER_LOCKED || input->type != EV_KEY || input->value != 1 ||
+        input->code == KEY_RESERVED || input->code > KEY_MAX || input->code == KEY_POWER)
+        return false;
+    if (!c1_ui_unlock(state)) return false;
+    return c1_power_policy_unlock(policy, now);
+}
+
 static void poweroff_heartbeat(void)
 {
+    static int last_error;
+    int error = c1_shutdown_keepalive();
+    if (error != 0 && error != last_error)
+        fprintf(stderr, "C1ancher: shutdown supervision renewal failed: %s\n", strerror(error));
+    last_error = error;
     c1_liveness_beat(monotonic_milliseconds());
 }
 
-static void request_poweroff(c1_record_sink sink)
+static int request_poweroff(c1_record_sink sink)
 {
     c1_record record;
     int error;
     c1_record_init(&record, "power", "shutdown-requested");
     (void)c1_record_emit(sink, &record);
+    /* Both the launcher and outer supervisor must acknowledge shutdown before
+     * init can SIGKILL app_daemon. An exit code alone cannot cover that race. */
+    error = c1_shutdown_begin();
+    if (error != 0) {
+        c1_record_init(&record, "power", "shutdown-supervision-failed");
+        (void)c1_record_add_integer(&record, "error", error);
+        (void)c1_record_emit(sink, &record);
+        fprintf(stderr, "C1ancher: shutdown supervision unavailable: %s\n", strerror(error));
+        return error; /* No command without a consumed, authenticated ACK. */
+    }
+    if (c1_stop_requested()) return EINTR;
     error = c1_linux_poweroff_request(poweroff_heartbeat);
+    if (error != 0 && !c1_stop_requested()) {
+        int cancel_error = c1_shutdown_cancel();
+        if (cancel_error != 0) {
+            c1_record_init(&record, "power", "shutdown-cancel-failed");
+            (void)c1_record_add_integer(&record, "error", cancel_error);
+            (void)c1_record_emit(sink, &record);
+            fprintf(stderr, "C1ancher: shutdown cancellation failed: %s\n", strerror(cancel_error));
+        }
+    }
     c1_record_init(&record, "power", error == 0 ? "shutdown-command-completed" : "shutdown-failed");
     (void)c1_record_add_integer(&record, "error", error);
     (void)c1_record_emit(sink, &record);
     if (error != 0) fprintf(stderr, "C1ancher: shutdown failed: %s\n", strerror(error));
     /* Remain alive until init stops us. Returning from the UI on fork success
      * would let the launcher restart it if exec or shutdown subsequently failed. */
+    return error;
+}
+
+/* A shutdown request must never expose the desktop between the lock frame and
+ * the poweroff command. The launcher also receives a dedicated exit status so
+ * a SIGTERM from the shutdown sequence cannot make it restart the UI. */
+static bool prepare_poweroff_lock(c1_ui_state *state,
+                                  c1_power_policy *policy,
+                                  int64_t now)
+{
+    if (state == NULL || policy == NULL || now < 0) return false;
+    if (policy->state == C1_POWER_ACTIVE && !c1_power_policy_lock(policy, now)) return false;
+    if (policy->state != C1_POWER_LOCKED) return false;
+    if (state->page == C1_UI_PAGE_LOCK) return true;
+    return c1_ui_enter_lock(state);
+}
+
+static bool request_poweroff_locked(c1_ui_state *state,
+                                    c1_power_policy *policy,
+                                    c1_terminal_screen *screen,
+                                    c1_record_sink sink)
+{
+    c1_ui_state previous_state;
+    c1_power_policy previous_policy;
+    int64_t now = monotonic_milliseconds();
+    int error;
+
+    if (state == NULL || policy == NULL || screen == NULL || now < 0) return false;
+    previous_state = *state;
+    previous_policy = *policy;
+    /* A visible lock frame is already the final shutdown image. Do not read
+     * status, reload wallpaper or refresh the display just to power off. */
+    bool was_locked = state->page == C1_UI_PAGE_LOCK;
+    if (!prepare_poweroff_lock(state, policy, now) ||
+        (!was_locked && render_current(*state, screen, true, sink) != C1_STATUS_OK)) {
+        *state = previous_state;
+        *policy = previous_policy;
+        return false;
+    }
+    error = request_poweroff(sink);
+    if (error != 0 && !c1_stop_requested()) {
+        *state = previous_state;
+        *policy = previous_policy;
+        if (!was_locked) (void)render_current(*state, screen, true, sink);
+        return false;
+    }
+    return true;
+}
+
+static c1_status wait_for_poweroff(void)
+{
+    /* After init accepts shutdown, only keep the watchdog alive until its
+     * stop signal. Input, late worker/PTY exits and update requests must not
+     * redraw home, trigger another power action or return a restartable error. */
+    while (!c1_stop_requested()) {
+        poweroff_heartbeat();
+        (void)poll(NULL, 0U, 1000);
+    }
+    return C1_STATUS_SHUTDOWN_REQUESTED;
+}
+
+static bool automatic_suspend_safe(const c1_service_worker *worker)
+{
+    struct c1_update_state update;
+    char error[C1_UPDATE_ERROR_MAX] = "";
+    if (worker->pid > 0 || desktop_job.pid > 0 || network_clock.pid > 0 ||
+        c1_app_run_active() || c1_app_lease_active()) return false;
+    if (c1_update_state_load(C1_UPDATE_DEFAULT_STATE_ROOT, &update, error, sizeof(error)) != 0)
+        return false; /* Unknown update state is not permission for a power action. */
+    return update.phase == C1_UPDATE_IDLE || update.phase == C1_UPDATE_CONFIRMED ||
+           update.phase == C1_UPDATE_PREPARED;
+}
+
+static bool automatic_shutdown_safe(const c1_service_worker *worker,
+                                     const c1_terminal_session *user,
+                                     const c1_terminal_session *app)
+{
+    /* Suspend can restore the current terminal; shutdown cannot preserve it.
+     * Never stop user applications just to make the idle deadline achievable. */
+    return user->child_pid <= 0 && app->child_pid <= 0 && automatic_suspend_safe(worker);
 }
 
 static const char *terminal_action_command(c1_ui_action action)
 {
     switch (action) {
-    case C1_UI_ACTION_TERMINAL_NEOFETCH:
-        return C1_TERMINAL_NEOFETCH_COMMAND;
     case C1_UI_ACTION_TERMINAL_APP:
         return C1_TERMINAL_APP_COMMAND;
     case C1_UI_ACTION_TERMINAL_UPDATE:
@@ -576,7 +838,6 @@ static void run_service_action(c1_ui_action action,
     case C1_UI_ACTION_UPDATE_REFRESH:
         result->status = refresh_update();
         break;
-    case C1_UI_ACTION_TERMINAL_NEOFETCH:
     case C1_UI_ACTION_TERMINAL_APP:
     case C1_UI_ACTION_TERMINAL_UPDATE:
     case C1_UI_ACTION_NONE:
@@ -714,14 +975,15 @@ static c1_status service_worker_start(c1_service_worker *worker,
     return C1_STATUS_OK;
 }
 
-/* An offline press and repeated presses during service work are true UI
- * no-ops: no terminal, new worker, navigation publication or forced redraw. */
-static bool ignore_desktop_update(const c1_ui_state *state, c1_ui_event event,
-                                  const c1_ui_transition *transition,
-                                  const c1_service_worker *worker)
+/* Repeated update confirmation during existing work cannot launch another
+ * worker. Offline settings confirmations still render the explicit notice. */
+static bool ignore_settings_update(const c1_ui_state *state, c1_ui_event event,
+                                   const c1_ui_transition *transition,
+                                   const c1_service_worker *worker)
 {
-    return state->page == C1_UI_PAGE_DESKTOP && event == C1_UI_EVENT_ENTER &&
-           (transition->action == C1_UI_ACTION_NONE || worker->pid > 0);
+    (void)transition;
+    return state->page == C1_UI_PAGE_SETTINGS && state->selection == C1_SETTING_UPDATE &&
+           event == C1_UI_EVENT_ENTER && worker->pid > 0;
 }
 
 static bool service_worker_finish(c1_service_worker *worker,
@@ -777,7 +1039,11 @@ static void finish_wifi_interaction(c1_ui_state *state, const c1_service_result 
     if (state->page == C1_UI_PAGE_WIFI) state->wifi_notice[0] = '\0';
     if (result->action != C1_UI_ACTION_WIFI_CONNECT) return;
     if (result->status != C1_STATUS_OK && state->page == C1_UI_PAGE_WIFI &&
-        state->secret_length > 0U && !wifi_stop_pending) {
+        !wifi_stop_pending && (state->secret_length > 0U ||
+        (state->selected_saved && state->selected_security == C1_WIFI_SECURITY_WPA_PSK))) {
+        /* A stale saved password must be editable after a failed reconnect.
+         * Keep the original profile on disk until a new connection commits. */
+        state->selected_saved = false;
         state->page = C1_UI_PAGE_WIFI_PASSWORD;
         state->secret_visible = true;
         snprintf(state->wifi_notice, sizeof(state->wifi_notice), "%s",
@@ -801,7 +1067,6 @@ static void adopt_service_result(const c1_service_result *result)
         }
         break;
     case C1_UI_ACTION_UPDATE_REFRESH:
-    case C1_UI_ACTION_TERMINAL_NEOFETCH:
     case C1_UI_ACTION_TERMINAL_APP:
     case C1_UI_ACTION_TERMINAL_UPDATE:
     case C1_UI_ACTION_NONE:
@@ -924,11 +1189,152 @@ static bool terminal_repeatable(uint16_t code)
            code == KEY_DELETE || code == KEY_VOLUMEUP || code == KEY_VOLUMEDOWN;
 }
 
+/* Shift is a physical modifier, not a libtsm terminal key. Track every key
+ * before navigation/control/power dispatch so consumed chords cannot become
+ * taps. The bitmap also covers keys held BEFORE Shift and both input devices. */
+typedef struct {
+    bool pressed;
+    bool chord_used;
+    unsigned int source;
+    unsigned int held_count;
+    unsigned char held[C1_UI_INPUT_COUNT][(KEY_CNT + 7U) / 8U];
+    bool focus_valid;
+    c1_ui_page page;
+    const c1_terminal_session *session;
+    pid_t child_pid;
+    pid_t shell_pid;
+    bool symbol_picker;
+} c1_ui_shift_key;
+
+static void shift_key_reset(c1_ui_shift_key *shift)
+{
+    memset(shift, 0, sizeof(*shift));
+}
+
+static void shift_key_focus(c1_ui_shift_key *shift, const c1_ui_state *state,
+                            const c1_terminal_session *session)
+{
+    if (!shift->focus_valid || shift->page != state->page ||
+        shift->session != session || shift->child_pid != session->child_pid ||
+        shift->shell_pid != session->shell_pid ||
+        shift->symbol_picker != state->terminal_symbol_picker ||
+        state->page == C1_UI_PAGE_LOCK) {
+        /* Keep other held keys across a page change, but never a pending tap. */
+        shift->pressed = false;
+        shift->chord_used = false;
+    }
+    shift->focus_valid = true;
+    shift->page = state->page;
+    shift->session = session;
+    shift->child_pid = session->child_pid;
+    shift->shell_pid = session->shell_pid;
+    shift->symbol_picker = state->terminal_symbol_picker;
+}
+
+static bool shift_key_event(c1_ui_shift_key *shift, unsigned int source,
+                            uint16_t code, int value)
+{
+    if (source >= C1_UI_INPUT_COUNT || code >= KEY_CNT || value < 0 || value > 2)
+        return false;
+    unsigned char mask = (unsigned char)(1U << (code % 8U));
+    unsigned char *held = &shift->held[source][code / 8U];
+    bool was_down = (*held & mask) != 0;
+    if (value) {
+        *held |= mask;
+        if (!was_down) ++shift->held_count;
+    } else {
+        *held &= (unsigned char)~mask;
+        if (was_down) --shift->held_count;
+    }
+    if (code != KEY_LEFTSHIFT) {
+        if (shift->pressed) shift->chord_used = true;
+        return false;
+    }
+    if (value == 1) {
+        if (shift->pressed) shift->chord_used = true;
+        else {
+            shift->pressed = true;
+            shift->source = source;
+            shift->chord_used = was_down || shift->held_count != 1U;
+        }
+    } else if (value == 2) {
+        /* Auto-repeat never arms a tap, and a held/repeating Shift is not a click. */
+        if (shift->pressed) shift->chord_used = true;
+    } else if (shift->pressed && shift->source == source) {
+        bool tap = !shift->chord_used;
+        shift->pressed = false;
+        shift->chord_used = false;
+        return tap;
+    } else if (shift->pressed) shift->chord_used = true;
+    return false;
+}
+
+static bool terminal_is_pkg_gui(const c1_ui_state *state,
+                                const c1_terminal_session *session,
+                                const c1_terminal_session *app_session,
+                                bool app_mode)
+{
+    char path[64], arguments[256];
+    struct stat running, expected;
+    ssize_t count;
+    int fd;
+    /* shell_pid is the actual direct-exec child; child_pid is its supervisor.
+     * A launch action or direct_exec flag alone remains true AFTER GUI execs
+     * another application, so neither is sufficient to identify the receiver. */
+    if (state->page != C1_UI_PAGE_TERMINAL || state->terminal_symbol_picker ||
+        !app_mode || session != app_session || !session->direct_exec ||
+        session->state != C1_TERMINAL_RUNNING || session->suspended ||
+        session->child_pid <= 0 || session->shell_pid <= 0 || session->master_fd < 0 ||
+        tcgetpgrp(session->master_fd) != session->shell_pid) return false;
+    snprintf(path, sizeof(path), "/proc/%ld/exe", (long)session->shell_pid);
+    /* Inode identity permits the installed path to be a release symlink, but
+     * rejects renamed third-party programs and same-PID exec into another ELF. */
+    if (stat(path, &running) != 0 || stat(C1_PKG_EXECUTABLE, &expected) != 0 ||
+        running.st_dev != expected.st_dev || running.st_ino != expected.st_ino) return false;
+    snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)session->shell_pid);
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    do { count = read(fd, arguments, sizeof(arguments)); } while (count < 0 && errno == EINTR);
+    close(fd);
+    if (count <= 0 || (size_t)count == sizeof(arguments)) return false;
+    char *argument = memchr(arguments, '\0', (size_t)count);
+    if (!argument || argument == arguments) return false;
+    ++argument;
+    /* Only the exact two-argument GUI invocation is eligible, never `run`,
+     * shell/update commands, prefix matches, or incomplete /proc reads. */
+    if (arguments + count - argument != 4 || memcmp(argument, "gui\0", 4U)) return false;
+    snprintf(path, sizeof(path), "/proc/%ld/exe", (long)session->shell_pid);
+    return stat(path, &running) == 0 && running.st_dev == expected.st_dev &&
+        running.st_ino == expected.st_ino && tcgetpgrp(session->master_fd) == session->shell_pid;
+}
+
+static c1_status apply_shift_tap(c1_ui_state *state, c1_terminal_session *session,
+                                 bool pkg_gui, bool *changed)
+{
+    *changed = false;
+    if (pkg_gui) {
+        static const char left_shift[] = "\033[57441u";
+        return c1_terminal_write(session, left_shift, sizeof(left_shift) - 1U);
+    }
+    if (c1_ui_is_password_page(state->page) || state->page == C1_UI_PAGE_TERMINAL ||
+        state->page == C1_UI_PAGE_LOCK_TEXT) {
+        state->keyboard_layer = c1_ui_keyboard_next_layer(state->keyboard_layer);
+        *changed = true;
+    }
+    return C1_STATUS_OK;
+}
+
+static c1_status send_shift_space(c1_terminal_session *session)
+{
+    static const char modified_space[] = "\033[32;2u";
+    return c1_terminal_write(session, modified_space, sizeof(modified_space) - 1U);
+}
+
 static c1_status send_terminal_key(c1_terminal_session *session,
                                    c1_terminal_screen *screen,
                                    uint16_t code,
                                    c1_ui_keyboard_layer layer,
-                                   bool shift_pressed,
+                                   bool shifted,
                                    bool control_pressed,
                                    bool *changed)
 {
@@ -939,11 +1345,11 @@ static c1_status send_terminal_key(c1_terminal_session *session,
     if (letter != '\0') {
         char character = control_pressed
                              ? letter
-                             : c1_ui_physical_character(layer, letter, shift_pressed);
+                             : c1_ui_physical_character(layer, letter, shifted);
 
         handled = c1_terminal_screen_character(screen, (unsigned char)character, modifiers);
-    } else if (code == KEY_SPACE) {
-        handled = c1_terminal_screen_character(screen, ' ', modifiers);
+    } else if (code == KEY_SPACE || code == KEY_TAB) {
+        handled = c1_terminal_screen_character(screen, code == KEY_TAB ? '\t' : ' ', modifiers);
     } else {
         c1_terminal_key key;
 
@@ -952,8 +1358,11 @@ static c1_status send_terminal_key(c1_terminal_session *session,
         case KEY_DOWN: key = C1_TERMINAL_KEY_DOWN; break;
         case KEY_LEFT: key = C1_TERMINAL_KEY_LEFT; break;
         case KEY_RIGHT: key = C1_TERMINAL_KEY_RIGHT; break;
+        /* Application PTYs must distinguish candidate pages from left/right. */
+        case KEY_VOLUMEUP: key = C1_TERMINAL_KEY_PAGE_DOWN; break;
+        case KEY_VOLUMEDOWN: key = C1_TERMINAL_KEY_PAGE_UP; break;
         case KEY_DELETE:
-            key = shift_pressed ? C1_TERMINAL_KEY_DELETE : C1_TERMINAL_KEY_BACKSPACE;
+            key = shifted ? C1_TERMINAL_KEY_DELETE : C1_TERMINAL_KEY_BACKSPACE;
             break;
         case KEY_ENTER: key = C1_TERMINAL_KEY_ENTER; break;
         case KEY_BACK:
@@ -971,10 +1380,161 @@ static c1_status send_terminal_key(c1_terminal_session *session,
     return flush_terminal_replies(session, screen);
 }
 
+static uint32_t input_keysym(uint16_t code, c1_ui_keyboard_layer layer, bool shift, bool control)
+{
+    char letter = physical_letter(code);
+    if (letter) return (unsigned char)(control ? letter : c1_ui_physical_character(layer, letter, shift));
+    switch (code) {
+    case KEY_SPACE: return ' ';
+    case KEY_TAB: return 0xff09U;
+    case KEY_ENTER:
+    case KEY_OK: return C1_IME_KEY_RETURN;
+    case KEY_DELETE: return shift ? 0xffffU : C1_IME_KEY_BACKSPACE;
+    case KEY_BACK: return C1_IME_KEY_ESCAPE;
+    case KEY_UP: return 0xff52U;
+    case KEY_DOWN: return 0xff54U;
+    case KEY_LEFT: return C1_IME_KEY_LEFT;
+    case KEY_RIGHT: return C1_IME_KEY_RIGHT;
+    case KEY_VOLUMEUP: return C1_IME_KEY_PAGE_DOWN;
+    case KEY_VOLUMEDOWN: return C1_IME_KEY_PAGE_UP;
+    default: return 0;
+    }
+}
+
+static void configure_power_preferences(c1_power_policy *policy, const c1_preferences *preferences)
+{
+    c1_power_settings settings = c1_preferences_power_settings(preferences->power_mode);
+    c1_power_policy_configure(policy, settings.lock_minutes * 60000LL, 0,
+                              settings.shutdown_minutes * 60000LL);
+    policy->suspend_on_lock = settings.suspend_on_lock;
+}
+
+static void save_preferences_transition(c1_ui_state *next, const c1_ui_state *old, c1_power_policy *policy)
+{
+    if (!memcmp(&old->preferences, &next->preferences, sizeof(old->preferences))) return;
+    if (!c1_preferences_save(&next->preferences, C1_DESKTOP_CONFIG)) {
+        next->preferences = old->preferences;
+        if (old->page == C1_UI_PAGE_LOCK_TEXT) {
+            next->page = C1_UI_PAGE_LOCK_TEXT;
+            memcpy(next->lock_text_draft, old->lock_text_draft, sizeof(next->lock_text_draft));
+            next->lock_text_cursor = old->lock_text_cursor;
+        }
+        snprintf(next->wifi_notice, sizeof(next->wifi_notice), "%s",
+                 c1_ui_tr(old->preferences.language, "保存失败，请重试", "Save failed; retry"));
+        return;
+    }
+    next->wifi_notice[0] = 0;
+    desktop_preferences = next->preferences;
+    configure_power_preferences(policy, &desktop_preferences);
+    (void)setenv("C1_UI_LANGUAGE", desktop_preferences.language == C1_LANGUAGE_EN ? "en" : "zh", 1);
+}
+
+/* This is the lock editor's physical-key route, before generic IME/navigation.
+ * A confirm observed with outstanding input is irrevocably input-only. Its
+ * eventual unconsumed reply must not become a delayed save after a prior commit. */
+static bool route_lock_text_key(c1_ui_state *state, c1_power_policy *policy,
+                                uint16_t code, int value, bool shift, bool control)
+{
+    if (state->page != C1_UI_PAGE_LOCK_TEXT) return false;
+    if (value != 1) return true; /* Releases/repeats never save. */
+    bool confirm = code == KEY_OK || code == KEY_ENTER;
+    bool busy = desktop_input.count || desktop_input.client.pending_sequence ||
+        (input_view.flags & C1_IME_COMPOSING) || input_view.preedit[0] || input_view.candidate_count;
+    if (code == KEY_BACK || code == KEY_HOME || (confirm && !busy)) {
+        c1_ui_event event = code == KEY_BACK ? C1_UI_EVENT_BACK :
+            code == KEY_HOME ? C1_UI_EVENT_HOME : C1_UI_EVENT_ENTER;
+        c1_ui_transition next = c1_ui_step(*state, event, NULL);
+        save_preferences_transition(&next.state, state, policy);
+        *state = next.state;
+        input_focus_update(state);
+        return true;
+    }
+    uint32_t key = input_keysym(code, state->keyboard_layer, shift, control);
+    if (key && c1_input_method_key(&desktop_input, key, control ? C1_IME_MOD_CONTROL : 0U)) return true;
+    if (confirm) {
+        /* Stale composition after a transport failure is not permission to save. */
+        desktop_input.failed = true;
+        return true;
+    }
+    if (key >= 32U && key <= 126U) (void)c1_ui_lock_text_append_ascii(state, (char)key);
+    else if (key == C1_IME_KEY_BACKSPACE || code == KEY_DELETE) (void)c1_ui_lock_text_delete(state);
+    else if (key == C1_IME_KEY_LEFT || key == C1_IME_KEY_RIGHT)
+        (void)c1_ui_lock_text_move(state, key == C1_IME_KEY_LEFT ? -1 : 1);
+    else return false;
+    return true;
+}
+
+static c1_status deliver_input(c1_ui_state *state, c1_power_policy *policy,
+                               c1_terminal_session *session, c1_terminal_screen *screen,
+                               const struct c1_ime_response *reply)
+{
+    if (reply->status != C1_IME_STATUS_OK || !(reply->flags & C1_IME_READY)) {
+        c1_input_method_close(&desktop_input);
+        desktop_input.failed = true;
+        return C1_STATUS_OK;
+    }
+    input_view = *reply;
+    if (reply->commit[0]) {
+        if (state->page == C1_UI_PAGE_TERMINAL) {
+            c1_status result = c1_terminal_write(session, reply->commit, strlen(reply->commit));
+            if (result != C1_STATUS_OK) return result;
+        } else if (!c1_ui_lock_text_append_utf8(state, reply->commit)) {
+            snprintf(state->wifi_notice, sizeof(state->wifi_notice), "%s",
+                c1_ui_tr(state->preferences.language, "文字过长或包含不支持字符", "Text too long / invalid"));
+        }
+    }
+    if (reply->request.operation != C1_IME_OP_KEY || (reply->flags & C1_IME_CONSUMED)) return C1_STATUS_OK;
+    uint32_t key = reply->request.keysym;
+    if (state->page == C1_UI_PAGE_LOCK_TEXT) {
+        if (key >= 32 && key <= 126) (void)c1_ui_lock_text_append_ascii(state, (char)key);
+        else if (key == C1_IME_KEY_BACKSPACE) (void)c1_ui_lock_text_delete(state);
+        else if (key == C1_IME_KEY_LEFT || key == C1_IME_KEY_RIGHT)
+            (void)c1_ui_lock_text_move(state, key == C1_IME_KEY_LEFT ? -1 : 1);
+        /* RETURN was queued while input was pending/composing: never save here,
+         * even if preceding queued keys already ended the composition. */
+        else if (key == C1_IME_KEY_ESCAPE) {
+            c1_ui_transition next = c1_ui_step(*state, C1_UI_EVENT_BACK, NULL);
+            save_preferences_transition(&next.state, state, policy);
+            *state = next.state;
+        }
+        return C1_STATUS_OK;
+    }
+    /* The IME uses volume +/- as next/previous candidate page. Without a
+     * composition the same physical keys retain desktop scrollback behavior,
+     * rather than becoming PageUp/PageDown keystrokes sent to the shell. */
+    if (key == C1_IME_KEY_PAGE_UP || key == C1_IME_KEY_PAGE_DOWN) {
+        if (key == C1_IME_KEY_PAGE_DOWN) c1_terminal_screen_scroll_page_up(screen);
+        else c1_terminal_screen_scroll_page_down(screen);
+        return C1_STATUS_OK;
+    }
+    unsigned modifiers = reply->request.modifiers & C1_IME_MOD_CONTROL ? C1_TERMINAL_MOD_CONTROL : 0;
+    if ((key >= 32 && key <= 126) || key == 0xff09U)
+        (void)c1_terminal_screen_character(screen, key == 0xff09U ? '\t' : key, modifiers);
+    else {
+        c1_terminal_key special;
+        switch (key) {
+        case C1_IME_KEY_BACKSPACE: special = C1_TERMINAL_KEY_BACKSPACE; break;
+        case C1_IME_KEY_RETURN: special = C1_TERMINAL_KEY_ENTER; break;
+        case C1_IME_KEY_ESCAPE: special = C1_TERMINAL_KEY_ESCAPE; break;
+        case 0xff51U: special = C1_TERMINAL_KEY_LEFT; break;
+        case 0xff52U: special = C1_TERMINAL_KEY_UP; break;
+        case 0xff53U: special = C1_TERMINAL_KEY_RIGHT; break;
+        case 0xff54U: special = C1_TERMINAL_KEY_DOWN; break;
+        case 0xffffU: special = C1_TERMINAL_KEY_DELETE; break;
+        case C1_IME_KEY_PAGE_UP: special = C1_TERMINAL_KEY_PAGE_UP; break;
+        case C1_IME_KEY_PAGE_DOWN: special = C1_TERMINAL_KEY_PAGE_DOWN; break;
+        default: return C1_STATUS_OK;
+        }
+        (void)c1_terminal_screen_special(screen, special, modifiers);
+    }
+    c1_terminal_screen_scroll_reset(screen);
+    return flush_terminal_replies(session, screen);
+}
+
 c1_status c1_linux_ui_run(c1_record_sink sink)
 {
-    struct pollfd pollfds[C1_UI_INPUT_COUNT + 3U] = {
-        {-1, POLLIN, 0}, {-1, POLLIN, 0}, {-1, 0, 0}, {-1, POLLIN, 0}, {-1, POLLIN, 0}
+    struct pollfd pollfds[C1_UI_INPUT_COUNT + 4U] = {
+        {-1, POLLIN, 0}, {-1, POLLIN, 0}, {-1, 0, 0}, {-1, POLLIN, 0}, {-1, POLLIN, 0}, {-1, POLLIN, 0}
     };
     c1_ui_state state = c1_ui_initial_state();
     c1_terminal_session user_session, app_session;
@@ -982,12 +1542,14 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
     c1_terminal_session *terminal_session = &user_session;
     c1_terminal_screen *terminal_screen = &user_screen;
     c1_service_worker service_worker;
+    c1_input_service input_service;
     c1_power_policy power_policy;
     c1_linux_led_chaser led_chaser;
     c1_status status;
     int64_t started_at;
     int64_t next_status_at;
     int64_t next_external_power_at;
+    int64_t next_battery_at;
     int64_t terminal_render_at = -1;
     bool terminal_dirty = false;
     c1_ui_action pending_terminal_action = C1_UI_ACTION_NONE;
@@ -999,9 +1561,9 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
     bool terminal_app_mode = false;
     bool external_app_active = false;
     bool external_app_terminal = false;
+    bool shutdown_requested = false;
     c1_ui_health_retry health_retry = {0};
-    bool shift_pressed = false;
-    bool shift_chord_used = false;
+    c1_ui_shift_key shift_key = {0};
     bool control_pressed = false;
     c1_power_key power_key = {0};
     bool input_dropped[C1_UI_INPUT_COUNT] = {false};
@@ -1010,8 +1572,31 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
     uint64_t poll_calls = 0U;
     uint64_t poll_events = 0U;
     uint64_t poll_timeouts = 0U;
+    int64_t summary_next_at = 0, core_next_at = 0;
+    c1_ui_page summary_page = C1_UI_PAGE_LOCK;
 
     c1_liveness_init();
+    /* Adopt the inherited channel before any service/terminal worker forks. */
+    {
+        int shutdown_error = c1_shutdown_init();
+        if (shutdown_error != 0)
+            fprintf(stderr, "C1ancher: coordinated shutdown unavailable: %s\n", strerror(shutdown_error));
+    }
+    c1_input_service_init(&input_service);
+    c1_input_method_init(&desktop_input);
+    memset(&input_view, 0, sizeof(input_view));
+    memset(&desktop_summary, 0, sizeof(desktop_summary));
+    c1_battery_history_init(&battery_history);
+    (void)c1_battery_history_load(C1_DESKTOP_BATTERY_HISTORY, &battery_history);
+    desktop_new_apps = 0;
+    remote_update_sequence = 0;
+    remote_update_available = false;
+    c1_desktop_job_init(&desktop_job);
+    reload_desktop_summary();
+    (void)c1_preferences_load(&state.preferences, C1_DESKTOP_CONFIG);
+    desktop_preferences = state.preferences;
+    c1_time_sync_init(&network_clock);
+    (void)setenv("C1_UI_LANGUAGE", state.preferences.language == C1_LANGUAGE_EN ? "en" : "zh", 1);
     c1_terminal_init(&user_session);
     c1_terminal_init(&app_session);
     service_worker_init(&service_worker);
@@ -1040,14 +1625,18 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
         goto done;
     }
     c1_power_policy_init(&power_policy, started_at);
+    configure_power_preferences(&power_policy, &state.preferences);
     /* Provision public media folders on boot, without requiring any app launch. */
     (void)c1_media_directories_prepare_from(C1_MEDIA_ROOT);
     c1_wallpaper_load();
     update_external_power(&power_policy, started_at);
+    sample_battery_history(started_at);
+    next_battery_at = started_at + C1_BATTERY_SAMPLE_INTERVAL_MS;
     status = render_current(state, terminal_screen, true, sink);
     if (status != C1_STATUS_OK) {
         goto done;
     }
+    (void)c1_input_service_start(&input_service);
     c1_liveness_beat(monotonic_milliseconds());
     try_update_health(&health_retry, monotonic_milliseconds());
     (void)c1_linux_led_chaser_start(&led_chaser, C1_LED_SYSFS_ROOT, started_at);
@@ -1060,12 +1649,29 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
         int64_t now = monotonic_milliseconds();
         nfds_t poll_count = C1_UI_INPUT_COUNT;
 
+        if (shutdown_requested) {
+            status = wait_for_poweroff();
+            break;
+        }
         if (now < 0) {
             status = C1_STATUS_IO_ERROR;
             break;
         }
         c1_liveness_beat(now);
+        if (now >= next_battery_at) {
+            /* Independent of input/redraws and display leases; never redraw a
+             * frozen lock screen just to collect a battery observation. */
+            sample_battery_history(now);
+            next_battery_at = now + C1_BATTERY_SAMPLE_INTERVAL_MS;
+            if (state.page == C1_UI_PAGE_BATTERY && !c1_app_lease_active()) {
+                /* Battery page follows ten-second telemetry. The display
+                 * backend skips identical frames; no refresh while locked. */
+                status = render_current(state, terminal_screen, false, sink);
+                if (status != C1_STATUS_OK) break;
+            }
+        }
         c1_linux_poweroff_reap();
+        (void)c1_input_service_poll(&input_service);
         if (!terminal_app_mode && terminal_session == &app_session) {
             c1_terminal_stop(&app_session);
             terminal_session = &user_session;
@@ -1076,8 +1682,75 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
             terminal_dirty = false;
             terminal_render_at = -1;
         }
+        shift_key_focus(&shift_key, &state, terminal_session);
+        if (summary_page != state.page) {
+            if (state.page == C1_UI_PAGE_DESKTOP) {
+                reload_desktop_summary();
+                status = render_current(state, terminal_screen, false, sink);
+                if (status != C1_STATUS_OK) break;
+            }
+            summary_page = state.page;
+        }
+        if (!state.preferences.background_checks || state.page == C1_UI_PAGE_LOCK || !clock_online || wifi_stop_pending)
+            c1_desktop_job_cancel(&desktop_job, now);
+        int job_result = c1_desktop_job_poll(&desktop_job, now);
+        if (job_result) {
+            if (desktop_job.kind == 1) {
+                if (job_result > 0) reload_desktop_summary();
+                summary_next_at = now + (job_result > 0 ? 15 * 60000 : 5 * 60000);
+            } else {
+                uint64_t sequence; bool available;
+                if (job_result > 0 && c1_desktop_update_parse(desktop_job.output, desktop_job.used, &sequence, &available)) {
+                    remote_update_sequence = sequence; remote_update_available = available;
+                    core_next_at = now + 6 * 60 * 60000LL;
+                } else core_next_at = now + 15 * 60000;
+            }
+            if (state.page == C1_UI_PAGE_DESKTOP || state.page == C1_UI_PAGE_SETTINGS) {
+                status = render_current(state, terminal_screen, false, sink);
+                if (status != C1_STATUS_OK) break;
+            }
+        }
+        if (desktop_job.pid <= 0 && state.preferences.background_checks && clock_online &&
+            !wifi_stop_pending && state.page == C1_UI_PAGE_DESKTOP && power_policy.state == C1_POWER_ACTIVE &&
+            service_worker.pid <= 0 && network_clock.pid <= 0 && !c1_app_run_active()) {
+            int kind = now >= summary_next_at ? 1 : now >= core_next_at ? 2 : 0;
+            if (kind && !c1_desktop_job_start(&desktop_job, kind, now)) {
+                if (kind == 1) summary_next_at = now + 5 * 60000;
+                else core_next_at = now + 15 * 60000;
+            }
+        }
+        input_terminal_allowed = !terminal_app_mode && terminal_session == &user_session;
+        input_focus_update(&state);
+        if (desktop_input.client.fd >= 0) {
+            struct c1_ime_response response;
+            int result = c1_input_method_tick(&desktop_input, &response, now);
+            if (result > 0) {
+                status = deliver_input(&state, &power_policy, terminal_session, terminal_screen, &response);
+                if (status != C1_STATUS_OK) break;
+            }
+            if (result != 0) {
+                if (state.page == C1_UI_PAGE_TERMINAL) {
+                    terminal_dirty = true;
+                    terminal_render_at = now;
+                } else {
+                    status = render_current(state, terminal_screen, false, sink);
+                    if (status != C1_STATUS_OK) break;
+                }
+            }
+        }
+        if (state.page == C1_UI_PAGE_TERMINAL) {
+            unsigned int columns, rows;
+            terminal_geometry(&state, &columns, &rows);
+            if (terminal_screen->columns != columns || terminal_screen->rows != rows) {
+                status = c1_terminal_screen_resize(terminal_screen, columns, rows);
+                if (status == C1_STATUS_OK) status = c1_terminal_resize(terminal_session, columns, rows);
+                if (status != C1_STATUS_OK) break;
+                terminal_dirty = true;
+                terminal_render_at = now;
+            }
+        }
         if (c1_stop_requested()) {
-            status = C1_STATUS_INTERRUPTED;
+            status = shutdown_requested ? C1_STATUS_SHUTDOWN_REQUESTED : C1_STATUS_INTERRUPTED;
             break;
         }
         {
@@ -1088,6 +1761,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
             if (lease_active) {
                 bool terminal_mode = c1_app_lease_terminal_mode();
                 if (terminal_mode != external_app_terminal) {
+                    shift_key_reset(&shift_key);
                     external_app_terminal = terminal_mode;
                     terminal_dirty = terminal_mode;
                     terminal_render_at = terminal_mode ? now : -1;
@@ -1095,8 +1769,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                 if (!external_app_active) {
                     external_app_active = true;
                     external_app_terminal = terminal_mode;
-                    shift_pressed = false;
-                    shift_chord_used = false;
+                    shift_key_reset(&shift_key);
                     control_pressed = false;
                     repeat_code = 0U;
                     repeat_at = -1;
@@ -1113,7 +1786,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                 external_app_terminal = false;
                 if (terminal_app_mode && !c1_terminal_is_running(terminal_session)) {
                     state.page = C1_UI_PAGE_DESKTOP;
-                    state.selection = 4U;
+                    state.selection = state.desktop_selection < 5U ? state.desktop_selection : 0U;
                     terminal_app_mode = false;
                     pending_terminal_action = C1_UI_ACTION_NONE;
                 }
@@ -1135,18 +1808,40 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
             status = C1_STATUS_UPDATE_REQUESTED;
             break;
         }
-        if (now >= next_external_power_at) {
+        /* Recheck the cable immediately before a due automatic action, rather
+         * than acting on a sample up to five seconds old. */
+        if (now >= next_external_power_at || c1_power_policy_timeout(&power_policy, now) == 0) {
             update_external_power(&power_policy, now);
             next_external_power_at = now + C1_EXTERNAL_POWER_INTERVAL_MS;
         }
         c1_linux_led_chaser_tick(&led_chaser, now);
+        c1_time_sync_tick(&network_clock, state.preferences.network_time &&
+                          power_policy.state == C1_POWER_ACTIVE, clock_online, now);
         {
             /* A held power key must not be interrupted by idle lock/suspend. */
-            c1_power_action power_action = power_key.down ? C1_POWER_ACTION_NONE :
-                c1_power_policy_tick(&power_policy, now);
+            c1_power_action power_action = automatic_power_action(
+                &power_policy, &power_key, pollfds, now);
 
+            if (power_action == C1_POWER_ACTION_SHUTDOWN) {
+                bool accepted = false;
+                if (automatic_shutdown_safe(&service_worker, &user_session, &app_session)) {
+                    accepted = request_poweroff_locked(&state, &power_policy,
+                                                       terminal_screen, sink);
+                    if (accepted) shutdown_requested = true;
+                }
+                if (!accepted) {
+                    /* Failed requests and safety deferrals retry from the
+                     * completion time, never at an expired deadline. */
+                    int64_t completed_at = monotonic_milliseconds();
+                    c1_power_policy_shutdown_failed(
+                        &power_policy, completed_at >= 0 ? completed_at : now);
+                }
+                continue;
+            }
             if (power_action == C1_POWER_ACTION_ENTER_LOCK) {
                 (void)c1_ui_enter_lock(&state);
+                shift_key_reset(&shift_key);
+                control_pressed = false;
                 c1_linux_led_chaser_quiet(&led_chaser);
                 repeat_code = 0U;
                 repeat_at = -1;
@@ -1155,18 +1850,27 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                 if (status != C1_STATUS_OK) {
                     break;
                 }
+                /* Publish the lock frame before a separate loop iteration
+                 * can attempt immediate performance-mode suspend. */
                 continue;
             }
             if (power_action == C1_POWER_ACTION_SUSPEND) {
                 c1_linux_power_context power_context;
                 c1_status prepare_status;
 
-                if (service_worker.pid > 0) {
+                if (!automatic_suspend_safe(&service_worker)) {
                     c1_power_policy_suspend_failed(&power_policy, now);
                     continue;
                 }
                 prepare_status = c1_linux_power_prepare(
                     &power_context, terminal_session);
+                now = monotonic_milliseconds();
+                if (now < 0) {
+                    if (prepare_status == C1_STATUS_OK)
+                        c1_linux_power_rollback(&power_context, terminal_session);
+                    status = C1_STATUS_IO_ERROR;
+                    break;
+                }
 
                 if (prepare_status == C1_STATUS_OK) {
                     c1_status suspend_status;
@@ -1178,11 +1882,11 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                         break;
                     }
                     c1_linux_led_chaser_stop(&led_chaser);
+                    battery_history.continuous = false;
                     suspend_status = c1_linux_power_suspend(sink);
                     c1_power_key_reset(&power_key);
                     resume_status = c1_linux_power_resume(&power_context, terminal_session);
-                    shift_pressed = false;
-                    shift_chord_used = false;
+                    shift_key_reset(&shift_key);
                     control_pressed = false;
                     repeat_code = 0U;
                     repeat_at = -1;
@@ -1202,7 +1906,9 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                     } else if (suspend_status == C1_STATUS_OK) {
                         c1_power_policy_resumed(&power_policy, now);
                     } else if (suspend_status == C1_STATUS_INTERRUPTED) {
-                        c1_power_policy_suspend_cancelled(&power_policy);
+                        /* A late cable/lease race must not busy-retry a
+                         * zero-delay performance policy. */
+                        c1_power_policy_suspend_failed(&power_policy, now);
                     } else if (suspend_status == C1_STATUS_UNAVAILABLE) {
                         c1_power_policy_suspend_unavailable(&power_policy);
                     } else {
@@ -1218,7 +1924,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                 } else if (prepare_status == C1_STATUS_INTERRUPTED) {
                     update_external_power(&power_policy, now);
                     next_external_power_at = now + C1_EXTERNAL_POWER_INTERVAL_MS;
-                    c1_power_policy_suspend_cancelled(&power_policy);
+                    c1_power_policy_suspend_failed(&power_policy, now);
                 } else if (prepare_status == C1_STATUS_UNAVAILABLE) {
                     c1_power_policy_suspend_unavailable(&power_policy);
                 } else {
@@ -1242,7 +1948,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                                            terminal_screen,
                                            repeat_code,
                                            state.keyboard_layer,
-                                           shift_pressed,
+                                           shift_key.pressed,
                                            control_pressed,
                                            &terminal_dirty);
                 if (status != C1_STATUS_OK) {
@@ -1264,7 +1970,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
             terminal_dirty = false;
             terminal_render_at = -1;
         }
-        if (state.page != C1_UI_PAGE_TERMINAL && state.page != C1_UI_PAGE_LOCK &&
+        if (state.page != C1_UI_PAGE_LOCK &&
             now >= next_status_at) {
             status = emit_runtime_stats(sink, poll_calls, poll_events, poll_timeouts);
             if (status != C1_STATUS_OK) {
@@ -1299,12 +2005,11 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
             if (led_timeout >= 0 && (poll_timeout < 0 || led_timeout < poll_timeout)) {
                 poll_timeout = led_timeout;
             }
-            if (state.page != C1_UI_PAGE_TERMINAL && state.page != C1_UI_PAGE_LOCK) {
+            if (state.page != C1_UI_PAGE_LOCK) {
                 poll_timeout = deadline_timeout(poll_timeout, next_status_at, now);
             }
-            if (power_policy.state == C1_POWER_LOCKED) {
-                poll_timeout = deadline_timeout(poll_timeout, next_external_power_at, now);
-            }
+            poll_timeout = deadline_timeout(poll_timeout, next_external_power_at, now);
+            poll_timeout = deadline_timeout(poll_timeout, next_battery_at, now);
             if (state.page == C1_UI_PAGE_TERMINAL) {
                 poll_timeout = deadline_timeout(poll_timeout, terminal_render_at, now);
                 poll_timeout = deadline_timeout(poll_timeout, repeat_at, now);
@@ -1314,9 +2019,13 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                     ? c1_terminal_fd(&user_session) : -1;
             pollfds[C1_UI_INPUT_COUNT + 2U].events = c1_terminal_poll_events(&user_session);
             pollfds[C1_UI_INPUT_COUNT + 2U].revents = 0;
-            poll_count = C1_UI_INPUT_COUNT + 3U;
+            pollfds[C1_UI_INPUT_COUNT + 3U].fd = desktop_input.client.fd;
+            pollfds[C1_UI_INPUT_COUNT + 3U].events = c1_input_method_poll_events(&desktop_input);
+            pollfds[C1_UI_INPUT_COUNT + 3U].revents = 0;
+            poll_count = C1_UI_INPUT_COUNT + 4U;
+            poll_timeout = deadline_timeout(poll_timeout, desktop_input.deadline, now);
             poll_timeout = deadline_timeout(poll_timeout, now + C1_HEARTBEAT_INTERVAL_MS, now);
-            if (external_app_active || pending_terminal_action != C1_UI_ACTION_NONE)
+            if (desktop_job.pid > 0 || external_app_active || pending_terminal_action != C1_UI_ACTION_NONE)
                 poll_timeout = deadline_timeout(poll_timeout, now + 100, now);
             poll_result = poll(pollfds, poll_count, poll_timeout);
             ++poll_calls;
@@ -1344,14 +2053,14 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
             if (!external_app_active) {
                 c1_power_key_reset(&power_key);
                 external_app_active = true;
-                shift_pressed = false;
-                shift_chord_used = false;
+                shift_key_reset(&shift_key);
                 control_pressed = false;
                 repeat_code = 0U;
                 repeat_at = -1;
                 c1_linux_led_chaser_quiet(&led_chaser);
             }
             if (terminal_mode != external_app_terminal) {
+                shift_key_reset(&shift_key);
                 terminal_dirty = terminal_mode;
                 terminal_render_at = terminal_mode ? now : -1;
             }
@@ -1376,6 +2085,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                         terminal_dirty = false;
                         terminal_render_at = -1;
                     }
+                    shift_key_focus(&shift_key, &state, terminal_session);
                     bool terminal_page = state.page == C1_UI_PAGE_TERMINAL;
                     bool password_page = c1_ui_is_password_page(state.page);
                     bool app_volume_key;
@@ -1384,6 +2094,10 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                     if (input.type == EV_SYN && input.code == SYN_DROPPED) {
                         input_dropped[index] = true;
                         c1_power_key_reset(&power_key);
+                        shift_key_reset(&shift_key);
+                        control_pressed = false;
+                        repeat_code = 0U;
+                        repeat_at = -1;
                         continue;
                     }
                     if (input_dropped[index]) {
@@ -1394,10 +2108,19 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                     if (input.type != EV_KEY) {
                         continue;
                     }
+                    if (shutdown_requested) {
+                        continue;
+                    }
+                    bool shift_tap = shift_key_event(&shift_key, (unsigned int)index,
+                                                     input.code, input.value);
                     if (input.code == KEY_POWER || input.code == KEY_WAKEUP) {
                         c1_power_key_action power_action = power_key_input(
                             &power_key, &power_policy, (unsigned int)index, &input, now);
                         if (power_action != C1_POWER_KEY_SHORT) continue;
+                        /* A legacy app may own evdev/display. A desktop-only
+                         * lock would neither stop its input nor be unlockable
+                         * while the run lease keeps the power policy active. */
+                        if (external_app_active) continue;
                         /* Deliver short press only on release. A long hold must
                          * never lock/unlock first or forward a stray terminal key. */
                         input.code = KEY_WAKEUP;
@@ -1411,7 +2134,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                             terminal_ended_announced = false;
                             pending_terminal_action = C1_UI_ACTION_NONE;
                             state.page = C1_UI_PAGE_DESKTOP;
-                            state.selection = 4U;
+                            state.selection = state.desktop_selection < 5U ? state.desktop_selection : 0U;
                             if (!c1_app_run_active()) {
                                 external_app_active = false;
                                 c1_linux_display_reset_cache();
@@ -1436,9 +2159,11 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                     if (input.value == 1) {
                         c1_power_policy_note_activity(&power_policy, now);
                     }
-                    if (input.value == 1 && state.page == C1_UI_PAGE_DESKTOP &&
-                        input.code == KEY_WAKEUP) {
+                    if (input.value == 1 && state.page != C1_UI_PAGE_LOCK &&
+                        input.code == KEY_WAKEUP && !(terminal_page && shift_key.pressed)) {
                         if (c1_power_policy_lock(&power_policy, now) && c1_ui_enter_lock(&state)) {
+                            shift_key_reset(&shift_key);
+                            control_pressed = false;
                             c1_linux_led_chaser_quiet(&led_chaser);
                             repeat_code = 0U;
                             repeat_at = -1;
@@ -1450,18 +2175,17 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                         }
                         continue;
                     }
-                    if (input.value == 1 && state.page == C1_UI_PAGE_LOCK &&
-                        (input.code == KEY_OK || input.code == KEY_WAKEUP)) {
-                        if (c1_power_policy_unlock(&power_policy, now) && c1_ui_unlock(&state)) {
-                            c1_linux_led_chaser_pulse(&led_chaser, now);
-                            repeat_code = 0U;
-                            repeat_at = -1;
-                            status = render_current(state, terminal_screen, true, sink);
-                            if (status != C1_STATUS_OK) {
-                                goto done;
-                            }
-                            next_status_at = now + C1_UI_STATUS_INTERVAL_MS;
-                        }
+                    if (wake_lock_from_key(&state, &power_policy, &input, now)) {
+                        /* Consume the wake press, including Shift state, so its
+                         * release cannot open a menu on the restored page. */
+                        shift_key_reset(&shift_key);
+                        control_pressed = false;
+                        c1_linux_led_chaser_pulse(&led_chaser, now);
+                        repeat_code = 0U;
+                        repeat_at = -1;
+                        status = render_current(state, terminal_screen, true, sink);
+                        if (status != C1_STATUS_OK) goto done;
+                        next_status_at = now + C1_UI_STATUS_INTERVAL_MS;
                         continue;
                     }
                     if (state.page == C1_UI_PAGE_LOCK) {
@@ -1471,26 +2195,18 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                         c1_linux_led_chaser_pulse(&led_chaser, now);
                     }
                     if (input.code == KEY_LEFTSHIFT) {
-                        if (input.value == 1) {
-                            shift_pressed = true;
-                            shift_chord_used = false;
-                        } else if (input.value == 0) {
-                            bool shift_tap = shift_pressed && !shift_chord_used &&
-                                             (password_page || terminal_page);
-
-                            shift_pressed = false;
-                            shift_chord_used = false;
-                            if (shift_tap) {
-                                state.keyboard_layer = c1_ui_keyboard_next_layer(state.keyboard_layer);
-                                if (terminal_page) {
-                                    terminal_dirty = true;
-                                    terminal_render_at = now;
-                                } else {
-                                    status = render_current(state, terminal_screen, false, sink);
-                                    if (status != C1_STATUS_OK) {
-                                        goto done;
-                                    }
-                                }
+                        if (shift_tap) {
+                            bool changed;
+                            status = apply_shift_tap(&state, terminal_session,
+                                terminal_is_pkg_gui(&state, terminal_session, &app_session,
+                                                    terminal_app_mode), &changed);
+                            if (status != C1_STATUS_OK) goto done;
+                            if (changed && terminal_page) {
+                                terminal_dirty = true;
+                                terminal_render_at = now;
+                            } else if (changed) {
+                                status = render_current(state, terminal_screen, false, sink);
+                                if (status != C1_STATUS_OK) goto done;
                             }
                         }
                         continue;
@@ -1527,11 +2243,51 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                     if (input.value != 1) {
                         continue;
                     }
-                    if (shift_pressed) {
-                        shift_chord_used = true;
+                    /* The graphical package frontend owns its own IME and
+                     * display. Preserve the modified key over its PTY rather
+                     * than turning Shift+Space into an ordinary refresh key. */
+                    if (terminal_page && terminal_app_mode && shift_key.pressed && input.code == KEY_SPACE &&
+                        c1_terminal_is_running(terminal_session)) {
+                        status = send_shift_space(terminal_session);
+                        if (status != C1_STATUS_OK) goto done;
+                        repeat_code = 0; repeat_at = -1;
+                        continue;
+                    }
+                    bool input_target = state.page == C1_UI_PAGE_LOCK_TEXT ||
+                        (terminal_page && !terminal_app_mode && !external_app_active &&
+                         !state.terminal_symbol_picker && c1_terminal_is_running(terminal_session));
+                    if (input_target && input.code == KEY_SPACE && shift_key.pressed) {
+                        (void)c1_input_method_toggle(&desktop_input, NULL, now);
+                        repeat_code = 0; repeat_at = -1;
+                        if (terminal_page) { terminal_dirty = true; terminal_render_at = now; }
+                        else {
+                            status = render_current(state, terminal_screen, false, sink);
+                            if (status != C1_STATUS_OK) goto done;
+                        }
+                        continue;
+                    }
+                    if (state.page == C1_UI_PAGE_LOCK_TEXT) {
+                        c1_ui_state previous = state;
+                        bool input_was_failed = desktop_input.failed;
+                        if (route_lock_text_key(&state, &power_policy, input.code, input.value,
+                                                shift_key.pressed, control_pressed)) {
+                            repeat_code = 0; repeat_at = -1;
+                            if (!states_equal(&previous, &state) || input_was_failed != desktop_input.failed) {
+                                status = render_current(state, terminal_screen, false, sink);
+                                if (status != C1_STATUS_OK) goto done;
+                            }
+                            continue;
+                        }
+                    }
+                    if (input_target) {
+                        uint32_t key = input_keysym(input.code, state.keyboard_layer, shift_key.pressed, control_pressed);
+                        if (key && c1_input_method_key(&desktop_input, key, control_pressed ? C1_IME_MOD_CONTROL : 0)) {
+                            repeat_code = 0; repeat_at = -1;
+                            continue;
+                        }
                     }
                     if (terminal_page) {
-                        if (input.code == KEY_HOME && !shift_pressed) {
+                        if (input.code == KEY_HOME && !shift_key.pressed) {
                             repeat_code = 0U;
                             repeat_at = -1;
                             state.terminal_symbol_picker = false;
@@ -1542,7 +2298,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                                 terminal_ended_announced = false;
                             }
                             state.page = C1_UI_PAGE_DESKTOP;
-                            state.selection = 4U;
+                            state.selection = state.desktop_selection < 5U ? state.desktop_selection : 0U;
                             terminal_app_mode = false;
                             status = render_current(state, terminal_screen, true, sink);
                             if (status != C1_STATUS_OK) {
@@ -1579,6 +2335,8 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                             continue;
                         }
                         if (input.code == KEY_WAKEUP) {
+                            c1_input_method_close(&desktop_input);
+                            memset(&input_view, 0, sizeof(input_view));
                             state.terminal_symbol_picker = true;
                             state.symbol_selection = 0U;
                             repeat_code = 0U;
@@ -1612,9 +2370,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                         if (!c1_terminal_is_running(terminal_session)) {
                             if (input.code == KEY_ENTER) {
                                 c1_terminal_screen_reset(terminal_screen);
-                                status = c1_terminal_start(terminal_session,
-                                                           C1_TERMINAL_COLUMNS,
-                                                           C1_TERMINAL_ROWS);
+                                status = start_desktop_terminal(terminal_session, terminal_screen, &state, NULL);
                                 if (status != C1_STATUS_OK) {
                                     c1_terminal_screen_feed(terminal_screen,
                                                             "TERMINAL START FAILED\r\n",
@@ -1632,7 +2388,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                                                    terminal_screen,
                                                    input.code,
                                                    state.keyboard_layer,
-                                                   shift_pressed,
+                                                   shift_key.pressed,
                                                    control_pressed,
                                                    &terminal_dirty);
                         if (status != C1_STATUS_OK) {
@@ -1644,7 +2400,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                         continue;
                     }
                     if (password_page &&
-                        apply_physical_secret_key(&state, input.code, shift_pressed)) {
+                        apply_physical_secret_key(&state, input.code, shift_key.pressed)) {
                         status = render_current(state, terminal_screen, false, sink);
                         if (status != C1_STATUS_OK) {
                             goto done;
@@ -1653,8 +2409,9 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                         continue;
                     }
                     {
-                        c1_ui_event event = map_key(input.code);
+                        c1_ui_event event = map_page_key(state.page, input.code);
 
+                        if (input.code == KEY_TAB) event = C1_UI_EVENT_SELECT_NEXT;
                         if (password_page && input.code == KEY_ENTER) {
                             event = C1_UI_EVENT_SUBMIT;
                         } else if (password_page && input.code == KEY_TAB) {
@@ -1671,7 +2428,8 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                                 goto done;
                             }
                             transition = c1_ui_step(state, event, &current_status);
-                            if (ignore_desktop_update(&state, event, &transition,
+                            save_preferences_transition(&transition.state, &state, &power_policy);
+                            if (ignore_settings_update(&state, event, &transition,
                                                       &service_worker)) {
                                 continue;
                             }
@@ -1681,6 +2439,9 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                                 status = C1_STATUS_IO_ERROR;
                                 goto done;
                             }
+                            if (transition.action == C1_UI_ACTION_WIFI_DISABLE ||
+                                !transition.state.preferences.background_checks)
+                                c1_desktop_job_cancel(&desktop_job, now);
                             if (!states_equal(&state, &transition.state)) {
                                 state = transition.state;
                             }
@@ -1696,7 +2457,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                                 if (terminal_app_mode) {
                                     char *arguments[] = {
                                         transition.action == C1_UI_ACTION_TERMINAL_APP
-                                            ? "/usr/data/c1/bin/c1pkg" : C1_UPDATER_EXECUTABLE,
+                                            ? C1_PKG_EXECUTABLE : C1_UPDATER_EXECUTABLE,
                                         transition.action == C1_UI_ACTION_TERMINAL_UPDATE
                                             ? "tui-prepared" : "gui", NULL
                                     };
@@ -1707,10 +2468,9 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                                     terminal_screen = &app_screen;
                                     c1_terminal_stop(terminal_session);
                                     c1_terminal_screen_reset(terminal_screen);
-                                    status = c1_terminal_start_exec(terminal_session,
-                                                                   C1_TERMINAL_COLUMNS,
-                                                                   C1_TERMINAL_ROWS,
-                                                                   arguments[0], arguments);
+                                    input_terminal_allowed = false;
+                                    input_focus_update(&state);
+                                    status = start_desktop_terminal(terminal_session, terminal_screen, &state, arguments);
                                     terminal_started_once = true;
                                     terminal_ended_announced = false;
                                     pending_terminal_action = C1_UI_ACTION_NONE;
@@ -1721,12 +2481,11 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                                 } else {
                                     terminal_session = &user_session;
                                     terminal_screen = &user_screen;
+                                    input_terminal_allowed = true;
                                 }
                                 if (!terminal_app_mode && !terminal_was_running) {
                                     c1_terminal_screen_reset(terminal_screen);
-                                    status = c1_terminal_start(terminal_session,
-                                                               C1_TERMINAL_COLUMNS,
-                                                               C1_TERMINAL_ROWS);
+                                    status = start_desktop_terminal(terminal_session, terminal_screen, &state, NULL);
                                     if (status != C1_STATUS_OK) {
                                         c1_terminal_screen_feed(terminal_screen,
                                                                 "TERMINAL START FAILED\r\n",
@@ -1830,7 +2589,10 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
         now = monotonic_milliseconds();
         if (now < 0) { status = C1_STATUS_IO_ERROR; break; }
         if (power_key_timer(&power_key, pollfds, now) == C1_POWER_KEY_SHUTDOWN) {
-            request_poweroff(sink);
+            if (request_poweroff_locked(&state, &power_policy, terminal_screen, sink)) {
+                shutdown_requested = true;
+                continue;
+            }
         }
 
         if (poll_count > C1_UI_INPUT_COUNT) {
@@ -1887,6 +2649,14 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
                         break;
                     }
                     adopt_service_result(&result);
+                    if (result.action == C1_UI_ACTION_UPDATE_REFRESH && state.page == C1_UI_PAGE_SETTINGS) {
+                        c1_ui_status updated = {0};
+                        merge_update_status(&updated);
+                        snprintf(state.wifi_notice, sizeof(state.wifi_notice), "%s",
+                            result.status != C1_STATUS_OK ? c1_ui_tr(state.preferences.language, "检查未完成，请联网后重试", "Check failed; connect and retry") :
+                            updated.update_prepared ? c1_ui_tr(state.preferences.language, "已准备更新，请按确认继续", "Update ready; OK to continue") :
+                            c1_ui_tr(state.preferences.language, "当前没有可用更新", "No update available"));
+                    }
                     finish_wifi_interaction(&state, &result);
                     if (wifi_stop_pending) {
                         wifi_stop_pending = false;
@@ -1930,7 +2700,7 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
             !terminal_ended_announced) {
             if (terminal_app_mode) {
                 state.page = C1_UI_PAGE_DESKTOP;
-                state.selection = 4U;
+                state.selection = state.desktop_selection < 5U ? state.desktop_selection : 0U;
                 terminal_app_mode = false;
                 terminal_ended_announced = true;
                 pending_terminal_action = C1_UI_ACTION_NONE;
@@ -1963,6 +2733,20 @@ c1_status c1_linux_ui_run(c1_record_sink sink)
     }
 
 done:
+    c1_desktop_job_cancel(&desktop_job, monotonic_milliseconds());
+    for (unsigned attempt = 0; attempt < 600U && desktop_job.pid > 0; ++attempt) {
+        (void)c1_desktop_job_poll(&desktop_job, monotonic_milliseconds());
+        c1_liveness_beat(monotonic_milliseconds());
+        if (desktop_job.pid > 0) (void)poll(NULL, 0, 20);
+    }
+    c1_input_method_close(&desktop_input);
+    (void)c1_input_service_stop(&input_service);
+    for (unsigned attempt = 0; attempt < 100U && input_service.pid > 0; ++attempt) {
+        (void)c1_input_service_stop(&input_service);
+        c1_liveness_beat(monotonic_milliseconds());
+        if (input_service.pid > 0) (void)poll(NULL, 0, 20);
+    }
+    c1_time_sync_stop(&network_clock);
     service_worker_stop(&service_worker);
     c1_terminal_stop(&app_session);
     c1_terminal_stop(&user_session);

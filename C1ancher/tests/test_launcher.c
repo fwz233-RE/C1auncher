@@ -34,6 +34,9 @@ int main(void)
 
     result = decide(true, true, C1_LAUNCHER_UPDATE_EXIT, 1U, 3U);
     expect(result.action == C1_LAUNCHER_STOP, "stop request has priority and exits cleanly");
+    result = decide(false, true, C1_LAUNCHER_SHUTDOWN_EXIT, 1U, 3U);
+    expect(result.action == C1_LAUNCHER_STOP && result.short_crashes == 3U,
+           "accepted shutdown stops the launcher instead of restarting the desktop");
     result = decide(false, true, C1_LAUNCHER_UPDATE_EXIT, 1U, 3U);
     expect(result.action == C1_LAUNCHER_UPDATE && result.short_crashes == 3U,
            "controlled update is returned without restart");

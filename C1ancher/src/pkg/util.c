@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -303,6 +304,11 @@ int c1pkg_sync_directory(const char *path, char *error, size_t error_size)
 const char *c1pkg_helper(const char *absolute, const char *name)
 {
     return access(absolute, X_OK) == 0 ? absolute : name;
+}
+
+int c1pkg_is_internal_id(const char *id)
+{
+    return id != NULL && strcasecmp(id, "c1-ime") == 0;
 }
 
 static int (*progress_callback)(const char *, void *);

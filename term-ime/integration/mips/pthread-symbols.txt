@@ -1,0 +1,20 @@
+# GCC 10 gthread weak references; force libc.a extraction with glibc >= 2.34.
+__pthread_key_create
+pthread_cond_broadcast
+pthread_cond_destroy
+pthread_cond_signal
+pthread_cond_wait
+pthread_cond_timedwait
+pthread_create
+pthread_detach
+pthread_getspecific
+pthread_join
+pthread_key_create
+pthread_key_delete
+pthread_mutex_lock
+pthread_mutex_unlock
+pthread_once
+pthread_rwlock_rdlock
+pthread_rwlock_unlock
+pthread_rwlock_wrlock
+pthread_setspecific

@@ -1,17 +1,19 @@
 /*
  * c1pkg is dependency-free at link time. Ed25519 index verification is built
- * in; repository operations fail closed unless curl, sha256sum, and tar are
- * executable. A trusted raw 32-byte Ed25519 public key must be provisioned at
+ * in; online repository operations use curl, while both installation sources
+ * use sha256sum and tar. A trusted raw 32-byte Ed25519 public key is required at
  * C1PKG_KEY_DEFAULT (or supplied with --key/C1PKG_KEY).
  */
 #include "pkg.h"
 #include "gui.h"
+#include "desktop.h"
 #include "text.h"
 #include "platform/power_config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static void usage(FILE *stream)
 {
@@ -21,11 +23,13 @@ static void usage(FILE *stream)
         "  font-license           print bundled font copyright and license\n"
         "  gui                    Chinese graphical package browser (device)\n"
         "  tui                    legacy ANSI terminal package browser\n"
+        "  desktop-summary        fetch optional daily quote and catalog summary\n"
         "  refresh                fetch and verify repository index\n"
         "  check-updates          verify index and list installed updates; no install\n"
         "  list                   list installed packages\n"
         "  available              list verified repository packages\n"
         "  install ID             install/update ID from verified index\n"
+        "  install-local DIR ID   install/update ID from a signed offline repository\n"
         "  update ID              alias for install\n"
         "  remove ID              atomically uninstall ID\n"
         "  rollback ID            swap current and previous versions\n"
@@ -101,26 +105,40 @@ static int command_check_updates(const struct c1pkg_config *config)
     return 0;
 }
 
-static int command_install(const struct c1pkg_config *config, const char *id)
+static int command_install(const struct c1pkg_config *config, const char *id,
+                            const char *local_directory)
 {
     struct c1pkg_index index;
     const struct c1pkg_package *package;
     char error[C1PKG_ERROR_MAX] = "";
+    int repository_fd = -1;
+    int result;
 
     if (!c1pkg_safe_id(id)) {
         (void)fprintf(stderr, "c1pkg: unsafe application ID\n");
         return 1;
     }
-    if (load_repository(config, &index, error, sizeof(error)) != 0) {
+    /* Authentication precedes the store's same-version shortcut. Offline
+     * metadata never goes through refresh or the persistent online cache. */
+    if (local_directory != NULL) {
+        repository_fd = c1pkg_repo_open_local(config, local_directory, &index, error, sizeof(error));
+        result = repository_fd >= 0 ? 0 : -1;
+    } else {
+        result = load_repository(config, &index, error, sizeof(error));
+    }
+    if (result != 0) {
         (void)fprintf(stderr, "c1pkg: %s\n", error);
         return 1;
     }
     package = c1pkg_repo_find(&index, id);
     if (package == NULL) {
+        if (repository_fd >= 0) (void)close(repository_fd);
         (void)fprintf(stderr, "c1pkg: package not found in verified index: %s\n", id);
         return 1;
     }
-    int result = c1pkg_store_install(config, package, error, sizeof(error));
+    result = repository_fd >= 0 ? c1pkg_store_install_local(repository_fd, package, error, sizeof(error)) :
+                                 c1pkg_store_install(config, package, error, sizeof(error));
+    if (repository_fd >= 0) (void)close(repository_fd);
     if (result < C1PKG_INSTALL_OK) {
         (void)fprintf(stderr, "c1pkg: %s\n", error);
         return 1;
@@ -200,6 +218,10 @@ int main(int argc, char **argv)
     if (strcmp(command, "font-license") == 0 && argument == argc) {
         return fputs(c1pkg_font_license(), stdout) == EOF || fflush(stdout) != 0 ? 1 : 0;
     }
+    if (strcmp(command, "install-local") == 0) {
+        if (argument + 2 != argc) { usage(stderr); return 2; }
+        return command_install(&config, argv[argument + 1], argv[argument]);
+    }
     if (explicit_repo == 0) {
         /* CLI > nonempty environment > persistent configuration > HTTP default.
          * Local operations remain usable with bad repository configuration. */
@@ -213,6 +235,9 @@ int main(int argc, char **argv)
             (void)fprintf(stderr, "c1pkg: %s\n", error);
             error[0] = '\0';
         }
+    }
+    if (strcmp(command, "desktop-summary") == 0 && argument == argc) {
+        return c1pkg_desktop_summary(&config);
     }
     if (strcmp(command, "gui") == 0 && argument == argc) {
         return c1pkg_gui(&config);
@@ -240,7 +265,7 @@ int main(int argc, char **argv)
     }
     if ((strcmp(command, "install") == 0 || strcmp(command, "update") == 0) &&
         argument + 1 == argc) {
-        return command_install(&config, argv[argument]);
+        return command_install(&config, argv[argument], NULL);
     }
     if (strcmp(command, "remove") == 0 && argument + 1 == argc) {
         if (c1pkg_store_remove(argv[argument], error, sizeof(error)) != 0) {

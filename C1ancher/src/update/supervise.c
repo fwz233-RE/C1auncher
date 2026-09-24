@@ -1,4 +1,4 @@
-#define _DEFAULT_SOURCE 1
+#define _GNU_SOURCE 1
 
 #include "update/supervise.h"
 #include "update/supervise_policy.h"
@@ -9,7 +9,9 @@
 #include "launcher/policy.h"
 #include "security/secure_file.h"
 #include "platform/liveness.h"
+#include "platform/shutdown.h"
 
+#include <poll.h>
 #include <fcntl.h>
 #include <stdlib.h>
 
@@ -64,7 +66,7 @@ static void install_handlers(void)
     (void)sigaction(SIGCHLD, &action, NULL);
 }
 
-static pid_t wait_launcher(pid_t child, int *status)
+static pid_t wait_launcher(pid_t child, int *status, struct c1_shutdown_server *shutdown)
 {
     sigset_t blocked, original;
     pid_t result = -1;
@@ -75,9 +77,14 @@ static pid_t wait_launcher(pid_t child, int *status)
     (void)sigaddset(&blocked, SIGHUP);
     if (sigprocmask(SIG_BLOCK, &blocked, &original) != 0) return -1;
     while (!supervise_stop) {
+        struct pollfd watch = {shutdown->fd, POLLIN, 0};
+        struct timespec interval = {0, 100000000L};
+        c1_shutdown_server_poll(shutdown, child, NULL);
+        (void)c1_shutdown_server_active(shutdown);
         result = waitpid(child, status, WNOHANG);
         if (result == child || (result < 0 && errno != EINTR)) break;
-        (void)sigsuspend(&original);
+        watch.fd = shutdown->fd;
+        (void)ppoll(&watch, 1U, &interval, &original);
     }
     (void)sigprocmask(SIG_SETMASK, &original, NULL);
     return result;
@@ -105,23 +112,40 @@ static void terminate_child(pid_t child)
     }
 }
 
-static pid_t start_launcher(const char *path, const char *ready_file, int *heartbeat_fd)
+static pid_t start_launcher(const char *path, const char *ready_file, int *heartbeat_fd,
+                            struct c1_shutdown_server *shutdown)
 {
-    int reports[2];
+    int reports[2], channel[2] = {-1, -1};
     pid_t parent = getpid(), child;
     if (pipe(reports) != 0) return -1;
+    {
+        int error = c1_shutdown_pair(channel);
+        if (error != 0) {
+            fprintf(stderr, "C1 supervisor: shutdown channel unavailable: %s\n", strerror(error));
+            channel[0] = channel[1] = -1;
+        }
+    }
     if (fcntl(reports[0], F_SETFD, FD_CLOEXEC) != 0 ||
         fcntl(reports[0], F_SETFL, O_NONBLOCK) != 0 ||
         fcntl(reports[1], F_SETFL, O_NONBLOCK) != 0) {
-        (void)close(reports[0]); (void)close(reports[1]); return -1;
+        (void)close(reports[0]); (void)close(reports[1]);
+        (void)close(channel[0]); (void)close(channel[1]); return -1;
     }
     child = fork();
     if (child != 0) {
         (void)close(reports[1]);
-        if (child < 0) (void)close(reports[0]);
-        else *heartbeat_fd = reports[0];
+        (void)close(channel[1]);
+        if (child < 0) { (void)close(reports[0]); (void)close(channel[0]); }
+        else {
+            *heartbeat_fd = reports[0];
+            shutdown->fd = channel[0];
+            shutdown->until_ms = 0;
+        }
         return child;
     }
+    (void)close(channel[0]);
+    (void)unsetenv(C1_SHUTDOWN_FD_ENV);
+    if (channel[1] >= 0 && c1_shutdown_export(channel[1]) != 0) _exit(125);
     {
         char text[32];
         (void)close(reports[0]);
@@ -220,6 +244,7 @@ static int reconcile(const char *state_root, const char *core_root,
 }
 
 static int pending_watch(pid_t child, int *status, int heartbeat_fd,
+                         struct c1_shutdown_server *shutdown,
                          const char *state_root, const char *core_root,
                          const char *key_path, const char *ready_file,
                          const struct c1_update_state *state,
@@ -228,24 +253,52 @@ static int pending_watch(pid_t child, int *status, int heartbeat_fd,
     int64_t started = monotonic_ms(), ready_at = -1, last_beat = -1, ui_pid = -1;
     struct stat ready_identity = {0};
     char marker_error[C1_UPDATE_ERROR_MAX];
+    bool was_shutting_down = false;
     for (;;) {
-        pid_t result = waitpid(child, status, WNOHANG);
-        int64_t now = monotonic_ms();
+        pid_t result;
+        bool shutting_down;
+        int64_t now;
+        c1_shutdown_server_poll(shutdown, child, NULL);
+        shutting_down = c1_shutdown_server_active(shutdown);
+        result = waitpid(child, status, WNOHANG);
+        now = monotonic_ms();
+        if (was_shutting_down && !shutting_down) {
+            started = now;
+            ready_at = last_beat = ui_pid = -1;
+        }
+        was_shutting_down = shutting_down;
         struct c1_update_pending_observation observation;
         enum c1_update_pending_action action;
         if (result < 0 && errno != EINTR) return -1;
         {
             struct c1_liveness_message message;
-            ssize_t amount;
-            while ((amount = read(heartbeat_fd, &message, sizeof(message))) > 0) {
+            ssize_t amount = -1;
+            unsigned int drained;
+            /* A noisy child must not starve shutdown requests or waitpid. */
+            for (drained = 0; drained < 64U; ++drained) {
+                amount = read(heartbeat_fd, &message, sizeof(message));
+                if (amount <= 0) break;
                 now = monotonic_ms();
                 if ((size_t)amount != sizeof(message) || message.ui_pid <= 0 ||
-                    message.monotonic_ms < started || message.monotonic_ms > now ||
-                    message.monotonic_ms < last_beat) return -1;
+                    message.monotonic_ms > now) return -1;
+                /* Pre-cancellation beats cannot satisfy the new health window. */
+                if (message.monotonic_ms < started) continue;
+                if (message.monotonic_ms < last_beat) return -1;
                 if (ui_pid != message.ui_pid) { ready_at = -1; ui_pid = message.ui_pid; }
                 last_beat = message.monotonic_ms;
             }
             if (amount < 0 && errno != EAGAIN && errno != EINTR) return -1;
+        }
+        if (shutting_down) {
+            if (result == child) return 1;
+            if (supervise_stop) { terminate_child(child); return 2; }
+            /* Shutdown progress is deliberately NOT candidate health. */
+            ready_at = -1;
+            {
+                struct timespec delay = {0, 100000000L};
+                (void)nanosleep(&delay, NULL);
+            }
+            continue;
         }
         marker_error[0] = '\0';
         {
@@ -321,6 +374,7 @@ int c1_update_supervise(const char *state_root, const char *core_root,
     char expected[C1_UPDATE_PATH_MAX];
     unsigned int crashes = 0U;
     int count, heartbeat_fd = -1;
+    struct c1_shutdown_server shutdown = {-1, 0};
     supervise_stop = 0;
     supervise_child = -1;
     count = snprintf(expected, sizeof(expected), "%s/current/artifacts/C1ancher-launcher", core_root);
@@ -338,6 +392,8 @@ int c1_update_supervise(const char *state_root, const char *core_root,
         struct c1_launcher_observation observation;
         struct c1_launcher_decision decision;
         if (heartbeat_fd >= 0) { (void)close(heartbeat_fd); heartbeat_fd = -1; }
+        if (shutdown.fd >= 0) { (void)close(shutdown.fd); shutdown.fd = -1; }
+        shutdown.until_ms = 0;
         if (supervise_stop) return 0;
         reconciliation = reconcile(state_root, core_root, key_path, &state,
                                    error, error_size);
@@ -358,11 +414,11 @@ int c1_update_supervise(const char *state_root, const char *core_root,
             return C1_UPDATER_FATAL_EXIT;
         }
         started = monotonic_ms();
-        child = start_launcher(expected, ready_file, &heartbeat_fd);
+        child = start_launcher(expected, ready_file, &heartbeat_fd, &shutdown);
         if (child < 0) return C1_UPDATER_FATAL_EXIT;
         supervise_child = child;
         if (state.phase == C1_UPDATE_PENDING_BOOT) {
-            watch = pending_watch(child, &status, heartbeat_fd, state_root, core_root, key_path,
+            watch = pending_watch(child, &status, heartbeat_fd, &shutdown, state_root, core_root, key_path,
                                   ready_file, &state, error, error_size);
             if (watch == 2) {
                 supervise_child = -1;
@@ -377,6 +433,9 @@ int c1_update_supervise(const char *state_root, const char *core_root,
             }
             if (watch == 1) {
                 supervise_child = -1;
+                if (c1_shutdown_server_active(&shutdown) ||
+                    (WIFEXITED(status) && WEXITSTATUS(status) == C1_LAUNCHER_SHUTDOWN_EXIT))
+                    return 0; /* Intentional poweroff is not a failed candidate boot. */
                 if (rollback_wait(state_root, core_root, key_path,
                                        error, error_size) != 0) return C1_UPDATER_FATAL_EXIT;
                 continue;
@@ -389,7 +448,7 @@ int c1_update_supervise(const char *state_root, const char *core_root,
             }
         }
         if (watch == 0) {
-            pid_t waited = wait_launcher(child, &status);
+            pid_t waited = wait_launcher(child, &status, &shutdown);
             if (supervise_stop) {
                 terminate_child(child);
                 supervise_child = -1;
@@ -398,6 +457,7 @@ int c1_update_supervise(const char *state_root, const char *core_root,
             if (waited != child) return C1_UPDATER_FATAL_EXIT;
         }
         supervise_child = -1;
+        if (c1_shutdown_server_active(&shutdown)) return 0;
         finished = monotonic_ms();
         if (WIFEXITED(status) && WEXITSTATUS(status) == C1_LAUNCHER_UPDATE_EXIT) {
             struct c1_update_state reloaded;
@@ -427,6 +487,7 @@ int c1_update_supervise(const char *state_root, const char *core_root,
         observation.short_crashes = crashes;
         decision = c1_launcher_decide(&observation);
         crashes = decision.short_crashes;
+        if (decision.action == C1_LAUNCHER_STOP) return 0;
         if (decision.action == C1_LAUNCHER_FATAL) {
             if (state.phase == C1_UPDATE_CONFIRMED &&
                 rollback_wait(state_root, core_root, key_path,

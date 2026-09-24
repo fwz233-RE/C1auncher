@@ -48,7 +48,8 @@ int c1pkg_repo_load_cached(const struct c1pkg_config *config, struct c1pkg_index
 const struct c1pkg_package *c1pkg_repo_find(const struct c1pkg_index *index, const char *id)
 {
     size_t i;
-    for (i = 0U; i < index->count; ++i) if (strcmp(index->packages[i].id, id) == 0) return &index->packages[i];
+    for (i = 0U; i < index->count; ++i)
+        if (strcmp(index->packages[i].id, id) == 0) return &index->packages[i];
     return NULL;
 }
 
@@ -70,9 +71,8 @@ int c1pkg_store_install(const struct c1pkg_config *config, const struct c1pkg_pa
         c1pkg_set_error(error, size, "arbitrary human diagnostic");
         return install_fails;
     }
-    for (i = 0U; i < local.count; ++i) {
+    for (i = 0U; i < local.count; ++i)
         if (strcmp(local.items[i].id, package->id) == 0) strcpy(local.items[i].version, package->version);
-    }
     return 0;
 }
 
@@ -94,30 +94,34 @@ static void setup(struct tui_state *state)
     memset(&local, 0, sizeof(local));
     repository.sequence = 1U; repository.count = 6U; local.count = 5U;
     for (i = 0U; i < repository.count; ++i) {
-        strcpy(repository.packages[i].id, ids[i]); strcpy(repository.packages[i].name, ids[i]);
-        strcpy(repository.packages[i].version, versions[i]); strcpy(repository.packages[i].author, "Author");
+        strcpy(repository.packages[i].id, ids[i]);
+        strcpy(repository.packages[i].name, ids[i]);
+        strcpy(repository.packages[i].version, versions[i]);
+        strcpy(repository.packages[i].author, "Author");
     }
     for (i = 0U; i < local.count; ++i) {
-        strcpy(local.items[i].id, local_ids[i]); strcpy(local.items[i].version, local_versions[i]);
+        strcpy(local.items[i].id, local_ids[i]);
+        strcpy(local.items[i].version, local_versions[i]);
     }
     refresh_fails = 0; install_fails = 0; installs = 0; installed_id[0] = '\0';
 }
 
 /* Catch only the standalone launcher handoff; all key handling is production. */
 static int dispatch_tui_key(struct tui_state *state, const struct c1pkg_config *config,
-                           int key, uint64_t now_ms)
+                            int key, uint64_t now_ms)
 {
     if (setjmp(launched) != 0) return 1;
     (void)tui_list_key(state, config, key, now_ms);
     return 0;
 }
 
-static void test_exact_and_unmatched_tui(struct tui_state *state, const struct c1pkg_config *config)
+static void test_persistent_search_tui(struct tui_state *state, const struct c1pkg_config *config)
 {
     static const char *ids[] = {"a", "b", "piano", "piano-tools"};
     static const char *names[] = {"Piano Lessons", "PIANO", "Piano Keyboard", "Piano"};
     size_t i;
     unsigned int tab;
+
     setup(state);
     state->index.count = state->installed.count = 4U;
     for (i = 0U; i < 4U; ++i) {
@@ -129,52 +133,43 @@ static void test_exact_and_unmatched_tui(struct tui_state *state, const struct c
     }
     rebuild_downloads(state);
     for (tab = 0U; tab < 2U; ++tab) {
-        const char *input = "PIANO";
         state->tab = tab;
-        c1pkg_prefix_clear(&state->prefix);
-        for (i = 0U; input[i]; ++i) dispatch_tui_key(state, config, input[i], 100U + i * 100U);
-        expect(state->selected[tab] == 2U,
-               "TUI exact piano ID beats preceding long name and exact display name on both tabs");
-        /* Remove the exact-ID candidate without changing list positions. */
-        strcpy(state->installed.items[2].id, "other");
-        strcpy(state->index.packages[2].id, "other");
-        strcpy(state->downloads.items[2].id, "other");
-        dispatch_tui_key(state, config, C1PKG_KEY_ERASE, 600U);
-        expect(state->selected[tab] == 0U, "TUI incomplete pian selects first prefix");
-        dispatch_tui_key(state, config, 'o', 700U);
-        expect(state->selected[tab] == 1U, "TUI exact display name outranks prefix with stable ties");
-        strcpy(state->installed.items[2].id, "piano");
-        strcpy(state->index.packages[2].id, "piano");
-        strcpy(state->downloads.items[2].id, "piano");
-        dispatch_tui_key(state, config, C1PKG_KEY_ERASE, 800U);
-        dispatch_tui_key(state, config, 'o', 900U);
-        dispatch_tui_key(state, config, 'z', 1000U);
-        expect(tui_prefix_unmatched(state) && state->selected[tab] == 2U,
-               "TUI no-match suffix retains current selection");
-        expect(!dispatch_tui_key(state, config, KEY_ENTER, 2499U) &&
-               strcmp(state->prefix.text, "pianoz") == 0 && strstr(state->status, "No match") != NULL,
-               "TUI Enter before timeout blocks stale launch/management and retains warning");
-        expect(!dispatch_tui_key(state, config, KEY_ENTER, 2500U) && strcmp(state->prefix.text, "pianoz") == 0,
-               "TUI Enter at timeout cannot silently clear unmatched input");
-        expire_tui_prefix(state, 2500U);
-        expect(state->prefix.text[0] == '\0' && state->selected[tab] == 2U &&
-               strstr(state->status, "timed out; cleared") != NULL,
-               "TUI idle timeout explicitly reports clearing and unchanged selection");
-        render(state);
+        state->query[0] = '\0';
+        rebuild_visible(state);
+        for (i = 0U; i < 5U; ++i)
+            dispatch_tui_key(state, config, "PIANO"[i], 100U + i * 100U);
+        expect(strcmp(state->query, "piano") == 0 && item_count(state) == 4U && state->selected[tab] == 0U,
+               "TUI uses persistent case-insensitive substring search for mixed-language names");
+        dispatch_tui_key(state, config, KEY_DOWN, 10000U);
+        expect(state->selected[tab] == 1U && strcmp(state->query, "piano") == 0,
+               "TUI navigation preserves the search filter indefinitely");
+        dispatch_tui_key(state, config, KEY_QUIT, 10001U);
+        expect(state->query[0] == '\0' && item_count(state) == 4U,
+               "TUI Back clears the filter before leaving the page");
+        for (i = 0U; i < 6U; ++i)
+            dispatch_tui_key(state, config, "pianoz"[i], 10100U + i);
+        expect(tui_query_unmatched(state) && item_count(state) == 0U,
+               "TUI empty results are explicit and cannot retain a stale match");
+        expect(!dispatch_tui_key(state, config, KEY_ENTER, 20000U) && strstr(state->status, "No match") != NULL,
+               "TUI Enter refuses to execute when the persistent filter has no result");
+        dispatch_tui_key(state, config, KEY_QUIT, 20001U);
+        expect(state->query[0] == '\0' && item_count(state) == 4U,
+               "TUI clear-and-retry restores the full list");
     }
-    state->tab = 0U;
-    dispatch_tui_key(state, config, 'z', 3000U);
-    dispatch_tui_key(state, config, C1PKG_KEY_CLEAR, 3100U);
-    expect(dispatch_tui_key(state, config, KEY_ENTER, 3200U) && strcmp(launched_id, "piano") == 0,
-           "TUI explicit clear then Enter launches selected ID");
-    strcpy(state->prefix.text, "pianoz"); state->prefix.updated_ms = 3300U;
-    dispatch_tui_key(state, config, C1PKG_KEY_ERASE, 3400U);
-    expect(dispatch_tui_key(state, config, KEY_ENTER, 3500U) && strcmp(launched_id, "piano") == 0,
-           "TUI corrected prefix enables exact-ID launch");
-    dispatch_tui_key(state, config, 'z', 4000U);
-    expire_tui_prefix(state, 5500U); render(state);
-    expect(dispatch_tui_key(state, config, KEY_ENTER, 5600U) && strcmp(launched_id, "piano") == 0,
-           "TUI launch resumes after timeout clearing is displayed");
+}
+
+static void test_hidden_service_tui(struct tui_state *state)
+{
+    setup(state);
+    state->index.count = state->installed.count = 1U;
+    strcpy(state->index.packages[0].id, "c1-ime");
+    strcpy(state->index.packages[0].name, "C1-IME");
+    strcpy(state->index.packages[0].version, "1.0.0");
+    strcpy(state->installed.items[0].id, "c1-ime");
+    strcpy(state->installed.items[0].version, "1.0.0");
+    rebuild_downloads(state);
+    expect(state->visible_count[0] == 0U && state->visible_count[1] == 0U,
+           "TUI also hides the internal input service from both package lists");
 }
 
 int main(void)
@@ -226,44 +221,52 @@ int main(void)
     render(&state);
     frame_end = ftell(stdout);
     (void)fseek(frames, frame_start, SEEK_SET);
-    while (ftell(frames) < frame_end && (character = fgetc(frames)) != EOF) if (character == '\n') ++lines;
+    while (ftell(frames) < frame_end && (character = fgetc(frames)) != EOF)
+        if (character == '\n') ++lines;
     expect(lines == 19, "author detail preserves the 19-row TUI frame");
     expect(state.tab == 0U, "TUI starts on installed apps");
     strcpy(state.index.packages[0].name, "Paint");
     strcpy(state.index.packages[1].name, "Piano");
     strcpy(state.index.packages[3].name, "Piper");
     strcpy(state.index.packages[4].name, "Radio");
+    rebuild_visible(&state);
+    state.query[0] = '\0';
     state.selected[0] = 4U;
+    rebuild_visible(&state);
     {
         int input[2];
         if (pipe(input) != 0 || dup2(input[0], STDIN_FILENO) < 0) return 1;
         close(input[0]);
-        expect(write(input[1], "PIp\177R \r", 7U) == 7, "enqueue complete TUI input burst");
+        expect(write(input[1], "PIP\177R \r", 7U) == 7, "enqueue complete TUI input burst");
         search_tui(&state, read_key(), 100U);
-        expect(state.selected[0] == 0U, "TUI P finds first matching display name");
+        expect(state.selected[0] == 0U && strcmp(state.query, "p") == 0, "TUI P filters display names");
         search_tui(&state, read_key(), 200U);
-        expect(state.selected[0] == 1U, "TUI PI selects Piano");
+        expect(state.selected[0] == 0U && strcmp(state.query, "pi") == 0, "TUI PI keeps matching names");
         search_tui(&state, read_key(), 300U);
-        expect(state.selected[0] == 2U, "TUI PIP uniquely selects Piper");
+        expect(state.selected[0] == 0U && strcmp(state.query, "pip") == 0, "TUI PIP filters Piper without prefix ranking");
         search_tui(&state, read_key(), 400U);
-        expect(state.selected[0] == 1U && strcmp(state.prefix.text, "pi") == 0,
-               "TUI backspace restores broader prefix");
+        expect(state.selected[0] == 0U && strcmp(state.query, "pi") == 0, "TUI backspace restores the broader filter");
         search_tui(&state, read_key(), 1900U);
-        expect(state.selected[0] == 3U && strcmp(state.prefix.text, "r") == 0,
-               "TUI R searches Radio after timeout, never refreshes");
+        expect(state.selected[0] == 0U && strcmp(state.query, "pir") == 0,
+               "TUI search remains persistent after idle time");
         expect(read_key() == KEY_REFRESH && read_key() == KEY_ENTER, "TUI Space and Enter are retained in burst");
         close(input[1]);
     }
+    state.query[0] = '\0';
+    rebuild_visible(&state);
+    state.query[0] = 'r'; state.query[1] = 'a'; state.query[2] = 'd'; state.query[3] = 'i'; state.query[4] = 'o'; state.query[5] = '\0';
+    rebuild_visible(&state);
     if (setjmp(launched) == 0) perform_action(&state, &config);
-    expect(strcmp(launched_id, "update") == 0, "installed Enter launches the selected ID, not a name or stale index");
+    expect(strcmp(launched_id, "update") == 0, "installed Enter launches the selected filtered ID");
     state.tab = 1U;
     rebuild_downloads(&state);
-    c1pkg_prefix_clear(&state.prefix);
-    search_tui(&state, 'R', 2000U);
-    expect(state.selected[1] == 4U, "TUI download list supports the same name prefix");
-    test_exact_and_unmatched_tui(&state, &config);
+    state.query[0] = 'r'; state.query[1] = 'a'; state.query[2] = 'd'; state.query[3] = 'i'; state.query[4] = 'o'; state.query[5] = '\0';
+    rebuild_visible(&state);
+    expect(state.visible_count[1] == 1U, "TUI download list uses the same persistent filter");
+    test_persistent_search_tui(&state, &config);
+    test_hidden_service_tui(&state);
     (void)fclose(frames);
-    if (failures != 0) { fprintf(stderr, "%d TUI workflow test(s) failed\n", failures); return 1; }
+    if (failures != 0) { fprintf(stderr, "%d TUI workflow test(s) failed.\n", failures); return 1; }
     fprintf(stderr, "All package TUI workflow tests passed.\n");
     return 0;
 }

@@ -111,14 +111,79 @@ struct tui_state {
     struct c1pkg_download_list downloads;
     size_t selected[2];
     size_t offset[2];
+    size_t visible[2][C1PKG_MAX_DOWNLOAD_ITEMS];
+    size_t visible_count[2];
     unsigned int tab;
-    struct c1pkg_prefix prefix;
+    char query[C1PKG_NAME_MAX + 1U];
     char status[C1PKG_ERROR_MAX];
 };
 
+static size_t raw_item_count(const struct tui_state *state, unsigned int tab)
+{
+    return tab == 0U ? state->installed.count : state->downloads.count;
+}
+
 static size_t item_count(const struct tui_state *state)
 {
-    return state->tab == 0U ? state->installed.count : state->downloads.count;
+    return state->visible_count[state->tab];
+}
+
+static size_t item_index(const struct tui_state *state, unsigned int tab, size_t position)
+{
+    return state->visible[tab][position];
+}
+
+static void tui_item_fields(const struct tui_state *state, unsigned int tab, size_t raw,
+                            const char **id, const char **name)
+{
+    if (tab == 0U) {
+        const struct c1pkg_package *package;
+        *id = state->installed.items[raw].id;
+        package = c1pkg_repo_find(&state->index, *id);
+        *name = package != NULL && package->name[0] != '\0' ? package->name : *id;
+    } else {
+        *id = state->downloads.items[raw].id;
+        *name = state->downloads.items[raw].name;
+    }
+}
+
+static unsigned char tui_fold(unsigned char byte)
+{
+    return byte >= 'A' && byte <= 'Z' ? (unsigned char)(byte + ('a' - 'A')) : byte;
+}
+
+static int tui_contains(const char *value, const char *query)
+{
+    size_t length = strlen(query);
+    const char *start;
+    if (length == 0U) return 1;
+    for (start = value; *start != '\0'; ++start) {
+        size_t offset = 0U;
+        while (offset < length && start[offset] != '\0' &&
+               tui_fold((unsigned char)start[offset]) == tui_fold((unsigned char)query[offset])) {
+            ++offset;
+        }
+        if (offset == length) return 1;
+    }
+    return 0;
+}
+
+static void rebuild_visible(struct tui_state *state)
+{
+    unsigned int tab;
+    for (tab = 0U; tab < 2U; ++tab) {
+        size_t raw, count = raw_item_count(state, tab);
+        state->visible_count[tab] = 0U;
+        for (raw = 0U; raw < count; ++raw) {
+            const char *id;
+            const char *name;
+            tui_item_fields(state, tab, raw, &id, &name);
+            if (!c1pkg_is_internal_id(id) &&
+                (tui_contains(name, state->query) || tui_contains(id, state->query))) {
+                state->visible[tab][state->visible_count[tab]++] = raw;
+            }
+        }
+    }
 }
 
 static void clamp_selection(struct tui_state *state)
@@ -131,58 +196,38 @@ static void clamp_selection(struct tui_state *state)
         *selected = 0U;
         *offset = 0U;
     } else {
-        if (*selected >= count) {
-            *selected = count - 1U;
-        }
-        if (*selected < *offset) {
-            *offset = *selected;
-        } else if (*selected >= *offset + TUI_ROWS) {
-            *offset = *selected - TUI_ROWS + 1U;
-        }
+        if (*selected >= count) *selected = count - 1U;
+        if (*selected < *offset) *offset = *selected;
+        else if (*selected >= *offset + TUI_ROWS) *offset = *selected - TUI_ROWS + 1U;
     }
-}
-
-static int tui_prefix_rank(const struct tui_state *state, size_t i)
-{
-    const char *id, *name;
-    if (state->tab == 0U) {
-        const struct c1pkg_package *package;
-        id = state->installed.items[i].id;
-        package = c1pkg_repo_find(&state->index, id);
-        name = package != NULL ? package->name : id;
-    } else {
-        id = state->downloads.items[i].id;
-        name = state->downloads.items[i].name;
-    }
-    return c1pkg_prefix_match_rank(&state->prefix, name, id);
 }
 
 static int search_tui(struct tui_state *state, int key, uint64_t now_ms)
 {
-    size_t i;
-    int best_rank = 0;
-    if (!c1pkg_prefix_input(&state->prefix, key, now_ms)) return 0;
-    for (i = 0U; i < item_count(state); ++i) {
-        int rank = tui_prefix_rank(state, i);
-        if (rank > best_rank) {
-            best_rank = rank;
-            state->selected[state->tab] = i;
+    size_t length = strlen(state->query);
+    (void)now_ms;
+    if (key != C1PKG_KEY_ERASE && key != C1PKG_KEY_CLEAR && (key < 33 || key > 255)) return 0;
+    if (key == C1PKG_KEY_ERASE) {
+        if (length > 0U) {
+            do { --length; } while (length > 0U && ((unsigned char)state->query[length] & 0xc0U) == 0x80U);
+            state->query[length] = '\0';
         }
+    } else if (key == C1PKG_KEY_CLEAR) {
+        state->query[0] = '\0';
+    } else if (length < C1PKG_NAME_MAX) {
+        state->query[length] = (char)tui_fold((unsigned char)key);
+        state->query[length + 1U] = '\0';
     }
+    rebuild_visible(state);
+    state->selected[state->tab] = 0U;
+    state->offset[state->tab] = 0U;
     clamp_selection(state);
     return 1;
 }
 
-static int tui_prefix_unmatched(const struct tui_state *state)
+static int tui_query_unmatched(const struct tui_state *state)
 {
-    return state->prefix.text[0] != '\0' &&
-           (item_count(state) == 0U || tui_prefix_rank(state, state->selected[state->tab]) == 0);
-}
-
-static void expire_tui_prefix(struct tui_state *state, uint64_t now_ms)
-{
-    if (c1pkg_prefix_expire(&state->prefix, now_ms))
-        snprintf(state->status, sizeof(state->status), "Search timed out; cleared. Selection unchanged.");
+    return state->query[0] != '\0' && item_count(state) == 0U;
 }
 
 static const char *download_mark(enum c1pkg_download_status status)
@@ -216,16 +261,18 @@ static void render(const struct tui_state *state)
                state->tab == 1U ? "[DOWNLOAD]" : " DOWNLOAD ");
     border();
     for (row = 0U; row < TUI_ROWS; ++row) {
-        size_t item = offset + row;
-        if (item >= count) {
+        size_t position = offset + row;
+        if (position >= count) {
             frame_line("");
         } else if (state->tab == 0U) {
-            const struct c1pkg_installed *installed = &state->installed.items[item];
-            frame_line("%c %-31.31s %11.11s", item == state->selected[0] ? '>' : ' ',
+            const struct c1pkg_installed *installed =
+                &state->installed.items[item_index(state, 0U, position)];
+            frame_line("%c %-31.31s %11.11s", position == state->selected[0] ? '>' : ' ',
                        installed->id, installed->version);
         } else {
-            const struct c1pkg_download_item *download = &state->downloads.items[item];
-            frame_line("%c%s %-28.28s %12.12s", item == state->selected[1] ? '>' : ' ',
+            const struct c1pkg_download_item *download =
+                &state->downloads.items[item_index(state, 1U, position)];
+            frame_line("%c%s %-28.28s %12.12s", position == state->selected[1] ? '>' : ' ',
                        download_mark(download->status), download->name,
                        download_version(download));
         }
@@ -234,21 +281,20 @@ static void render(const struct tui_state *state)
     if (count > 0U) {
         const char *author = "Unknown";
         if (state->tab == 1U) {
-            author = state->downloads.items[state->selected[1]].author;
+            author = state->downloads.items[item_index(state, 1U, state->selected[1])].author;
         } else {
             const struct c1pkg_package *package = c1pkg_repo_find(&state->index,
-                state->installed.items[state->selected[0]].id);
+                state->installed.items[item_index(state, 0U, state->selected[0])].id);
             if (package != NULL) author = package->author;
         }
         frame_line(" By: %.40s", author);
     } else {
         frame_line("");
     }
-    frame_line(tui_prefix_unmatched(state) ? " No match: edit or clear search before Enter" :
+    frame_line(tui_query_unmatched(state) ? " No match: clear search before Enter" :
                state->tab == 0U ? " Enter:open Space:refresh+update Esc:quit" :
                                   " Enter:manage Space:refresh+update Esc:quit");
-    if (state->prefix.text[0] != '\0') frame_line(" %s: %.36s",
-        tui_prefix_unmatched(state) ? "No match" : "Find", state->prefix.text);
+    if (state->query[0] != '\0') frame_line(" Find: %.40s", state->query);
     else frame_line(" %.46s", state->status);
     final_border();
     (void)fflush(stdout);
@@ -275,6 +321,7 @@ static int rebuild_downloads(struct tui_state *state)
                        "ERROR: cannot build download list");
         return -1;
     }
+    rebuild_visible(state);
     clamp_selection(state);
     return 0;
 }
@@ -296,7 +343,7 @@ static void refresh(struct tui_state *state, const struct c1pkg_config *config, 
     struct c1pkg_index fresh;
     int verified = 0;
 
-    c1pkg_prefix_clear(&state->prefix);
+    /* The query is persistent across refreshes; rebuilding only changes matches. */
     c1pkg_set_progress(operation_progress, state);
 
     (void)snprintf(state->status, sizeof(state->status), "Refreshing signed repository...");
@@ -614,22 +661,21 @@ static int perform_action(struct tui_state *state, const struct c1pkg_config *co
 {
     size_t count = item_count(state);
 
-    if (tui_prefix_unmatched(state)) {
-        snprintf(state->status, sizeof(state->status), "No match: edit or clear search before Enter");
+    if (tui_query_unmatched(state)) {
+        snprintf(state->status, sizeof(state->status), "No match: clear search before Enter");
         return 0;
     }
-    c1pkg_prefix_clear(&state->prefix);
     if (count == 0U) {
         (void)snprintf(state->status, sizeof(state->status), "No item selected");
         return 0;
     }
     if (state->tab == 0U) {
         char id[C1PKG_ID_MAX + 1U];
-        (void)strcpy(id, state->installed.items[state->selected[0]].id);
+        (void)strcpy(id, state->installed.items[item_index(state, 0U, state->selected[0])].id);
         launch_selected_app(id);
     } else {
         const struct c1pkg_download_item *item =
-            &state->downloads.items[state->selected[1]];
+            &state->downloads.items[item_index(state, 1U, state->selected[1])];
         if (item->status == C1PKG_DOWNLOAD_NOT_INSTALLED) {
             struct c1pkg_download_item copy = *item;
             install_download(state, config, &copy, 0);
@@ -646,15 +692,14 @@ static int tui_list_key(struct tui_state *state, const struct c1pkg_config *conf
     size_t count;
     if (key == C1PKG_KEY_EOF || key == C1PKG_KEY_QUIT) return 1;
     if (search_tui(state, key, now_ms)) return 0;
-    if (key == KEY_QUIT && state->prefix.text[0] != '\0') {
-        c1pkg_prefix_clear(&state->prefix);
+    if (key == KEY_QUIT && state->query[0] != '\0') {
+        state->query[0] = '\0';
+        rebuild_visible(state);
+        clamp_selection(state);
         return 0;
     }
     if (key == KEY_NONE) return 0;
-    /* Validate Enter before clearing the prefix, including at the timeout
-     * boundary when the cleared state has not yet been painted. */
     if (key == KEY_ENTER) return perform_action(state, config);
-    c1pkg_prefix_clear(&state->prefix);
     count = item_count(state);
     if (key == KEY_QUIT) return 1;
     if (key == KEY_LEFT || key == KEY_RIGHT) {
@@ -688,7 +733,6 @@ int c1pkg_tui(const struct c1pkg_config *config)
     refresh(&state, config, 0);
     while (done == 0) {
         int key;
-        expire_tui_prefix(&state, c1pkg_input_now_ms());
         render(&state);
         key = read_key();
         done = tui_list_key(&state, config, key, c1pkg_input_now_ms());

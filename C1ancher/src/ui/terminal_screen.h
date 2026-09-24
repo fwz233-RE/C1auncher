@@ -33,6 +33,8 @@ typedef struct {
     bool inverse;
     bool underline;
     bool bold;
+    bool continuation;
+    unsigned int width;
 } c1_terminal_cell;
 
 struct tsm_screen;
@@ -45,7 +47,10 @@ typedef struct {
     char reply[512];
     size_t reply_offset;
     size_t reply_length;
+    unsigned int columns, rows;
 } c1_terminal_screen;
+
+c1_status c1_terminal_screen_resize(c1_terminal_screen *terminal, unsigned int columns, unsigned int rows);
 
 c1_status c1_terminal_screen_init(c1_terminal_screen *terminal);
 void c1_terminal_screen_destroy(c1_terminal_screen *terminal);

@@ -46,6 +46,8 @@ c1_status c1_terminal_screen_init(c1_terminal_screen *terminal)
         c1_terminal_screen_destroy(terminal);
         return C1_STATUS_UNAVAILABLE;
     }
+    terminal->columns = C1_TERMINAL_COLUMNS;
+    terminal->rows = C1_TERMINAL_ROWS;
     tsm_screen_set_max_sb(terminal->screen, C1_TERMINAL_SCROLLBACK);
     result = tsm_vte_new(&terminal->vte,
                          terminal->screen,
@@ -58,6 +60,17 @@ c1_status c1_terminal_screen_init(c1_terminal_screen *terminal)
         return C1_STATUS_UNAVAILABLE;
     }
     tsm_vte_set_backspace_sends_delete(terminal->vte, true);
+    return C1_STATUS_OK;
+}
+
+c1_status c1_terminal_screen_resize(c1_terminal_screen *terminal, unsigned int columns, unsigned int rows)
+{
+    if (!terminal || !terminal->screen || !columns || !rows || columns > C1_TERMINAL_COLUMNS || rows > C1_TERMINAL_ROWS)
+        return C1_STATUS_INVALID_ARGUMENT;
+    if (columns == terminal->columns && rows == terminal->rows) return C1_STATUS_OK;
+    if (tsm_screen_resize(terminal->screen, columns, rows) != 0) return C1_STATUS_UNAVAILABLE;
+    terminal->columns = columns;
+    terminal->rows = rows;
     return C1_STATUS_OK;
 }
 
@@ -116,6 +129,8 @@ static int collect_cell(struct tsm_screen *screen,
         return 0;
     }
     cell = &terminal->cells[row][column];
+    cell->width = width;
+    cell->continuation = width == 0;
     cell->codepoint = length > 0U && characters != NULL ? characters[0] : (uint32_t)' ';
     cell->inverse = attributes != NULL && attributes->inverse;
     cell->underline = attributes != NULL && attributes->underline;

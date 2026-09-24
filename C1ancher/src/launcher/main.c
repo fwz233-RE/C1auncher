@@ -1,8 +1,11 @@
 #define _GNU_SOURCE 1
 
+#include "launcher/cleanup.h"
 #include "launcher/policy.h"
 #include "platform/liveness.h"
+#include "platform/shutdown.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
@@ -24,8 +27,42 @@
 #define C1_LAUNCHER_PATH_MAX 4096U
 
 static int upstream_fd = -1;
+static struct c1_shutdown_client shutdown_upstream = {-1, 0, 0};
 static volatile sig_atomic_t stop_requested;
 static volatile sig_atomic_t child_pid = -1;
+static pid_t maintenance_pid = -1;
+static int maintenance_finished;
+static int64_t maintenance_next;
+
+static void maintenance_start(int64_t now)
+{
+    if (maintenance_finished || maintenance_pid > 0 || now < maintenance_next) return;
+    maintenance_next = now + 5000;
+    pid_t parent = getpid();
+    maintenance_pid = fork();
+    if (maintenance_pid != 0) return;
+    (void)signal(SIGTERM, SIG_DFL);
+    (void)signal(SIGINT, SIG_DFL);
+    (void)signal(SIGHUP, SIG_DFL);
+    sigset_t empty;
+    sigemptyset(&empty);
+    (void)sigprocmask(SIG_SETMASK, &empty, NULL);
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != parent) _exit(1);
+    /* A cleanup child must not keep UI heartbeat/shutdown endpoints alive. */
+    DIR *fds = opendir("/proc/self/fd");
+    if (!fds) _exit(1);
+    struct dirent *entry;
+    while ((entry = readdir(fds)) != NULL) {
+        char *end;
+        long fd = strtol(entry->d_name, &end, 10);
+        if (!*end && fd > STDERR_FILENO && fd <= INT_MAX && fd != dirfd(fds)) close((int)fd);
+    }
+    closedir(fds);
+    int result = c1_launcher_cleanup_after_update(NULL);
+    if (result != 0 && errno != EAGAIN && errno != EACCES)
+        fprintf(stderr, "C1 launcher: post-update cleanup will retry: %s\n", strerror(errno));
+    _exit(result == 0 ? 0 : 1);
+}
 
 static int64_t monotonic_milliseconds(void)
 {
@@ -40,7 +77,7 @@ static int companion_path(char *path, size_t size)
     char *slash;
     ssize_t length = readlink("/proc/self/exe", executable, sizeof(executable) - 1U);
     int count;
-    if (length <= 0 || (size_t)length >= sizeof(executable)) return -1;
+    if (length <= 0 || (size_t)length >= sizeof(executable) - 1U) return -1;
     executable[(size_t)length] = '\0';
     slash = strrchr(executable, '/');
     if (slash == NULL) return -1;
@@ -91,10 +128,18 @@ static int run_child(const char *c1ancher_path, const char *ready_file,
     unsigned int timeout_ms = c1_liveness_setting("C1_HEARTBEAT_TIMEOUT_MS", C1_HEARTBEAT_TIMEOUT_MS);
     pid_t parent = getpid(), process;
     sigset_t blocked, original;
-    int heartbeat[2];
-    bool failed = false;
+    int heartbeat[2], shutdown_pair[2] = {-1, -1};
+    struct c1_shutdown_server shutdown = {-1, 0};
+    bool failed = false, shutting_down = false;
 
     if (pipe2(heartbeat, O_CLOEXEC | O_NONBLOCK) != 0) return -1;
+    if (shutdown_upstream.fd >= 0 && c1_shutdown_pair(shutdown_pair) != 0) {
+        close(heartbeat[0]); close(heartbeat[1]);
+        if (shutdown_pair[0] >= 0) close(shutdown_pair[0]);
+        if (shutdown_pair[1] >= 0) close(shutdown_pair[1]);
+        return -1;
+    }
+    shutdown.fd = shutdown_pair[0];
     (void)sigemptyset(&blocked);
     (void)sigaddset(&blocked, SIGCHLD);
     (void)sigaddset(&blocked, SIGTERM);
@@ -102,10 +147,14 @@ static int run_child(const char *c1ancher_path, const char *ready_file,
     (void)sigaddset(&blocked, SIGHUP);
     if (sigprocmask(SIG_BLOCK, &blocked, &original) != 0) {
         close(heartbeat[0]); close(heartbeat[1]);
+        if (shutdown_pair[0] >= 0) close(shutdown_pair[0]);
+        if (shutdown_pair[1] >= 0) close(shutdown_pair[1]);
         return -1;
     }
     if (stop_requested) {
         close(heartbeat[0]); close(heartbeat[1]);
+        if (shutdown_pair[0] >= 0) close(shutdown_pair[0]);
+        if (shutdown_pair[1] >= 0) close(shutdown_pair[1]);
         (void)sigprocmask(SIG_SETMASK, &original, NULL);
         *status = 0; *runtime_ms = 0U;
         return 0;
@@ -113,12 +162,17 @@ static int run_child(const char *c1ancher_path, const char *ready_file,
     process = fork();
     if (process < 0) {
         close(heartbeat[0]); close(heartbeat[1]);
+        if (shutdown_pair[0] >= 0) close(shutdown_pair[0]);
+        if (shutdown_pair[1] >= 0) close(shutdown_pair[1]);
         (void)sigprocmask(SIG_SETMASK, &original, NULL);
         return -1;
     }
     if (process == 0) {
         char descriptor[32];
         close(heartbeat[0]);
+        if (shutdown_pair[0] >= 0) close(shutdown_pair[0]);
+        if (shutdown_upstream.fd >= 0) close(shutdown_upstream.fd);
+        if (shutdown_pair[1] >= 0 && c1_shutdown_export(shutdown_pair[1]) != 0) _exit(125);
         if (upstream_fd >= 0) close(upstream_fd);
         (void)unsetenv(C1_SUPERVISOR_HEARTBEAT_FD_ENV);
         (void)signal(SIGTERM, SIG_DFL);
@@ -133,10 +187,20 @@ static int run_child(const char *c1ancher_path, const char *ready_file,
         _exit(127);
     }
     close(heartbeat[1]);
+    if (shutdown_pair[1] >= 0) close(shutdown_pair[1]);
     child_pid = process;
     for (;;) {
         pid_t result;
-        int64_t now = monotonic_milliseconds();
+        int64_t now;
+        bool was_shutting_down = shutting_down;
+        c1_shutdown_server_poll(&shutdown, process, &shutdown_upstream);
+        shutting_down = c1_shutdown_server_active(&shutdown);
+        now = monotonic_milliseconds();
+        if (was_shutting_down && !shutting_down) {
+            /* Restart the observation window, never manufacture a UI beat. */
+            started = now;
+            last_beat = -1;
+        }
         char beats[128];
         ssize_t count;
         bool progress = false;
@@ -158,8 +222,9 @@ static int run_child(const char *c1ancher_path, const char *ready_file,
                 }
             }
         }
-        if (stop_requested || c1_liveness_expired(now, started, last_beat,
-                                                  startup_ms, timeout_ms)) {
+        if (!stop_requested && !shutting_down && last_beat >= 0) maintenance_start(now);
+        if (stop_requested || (!shutting_down && c1_liveness_expired(now, started, last_beat,
+                                                  startup_ms, timeout_ms))) {
             /* Revoke candidate readiness before the stop grace, not after it. */
             if (clear_ready(ready_file) != 0) failed = true;
             stop_child(process);
@@ -177,6 +242,10 @@ static int run_child(const char *c1ancher_path, const char *ready_file,
             result = 0;
             for (reaped = 0U; reaped < 32U; ++reaped) {
                 result = waitpid(-1, &exited_status, WNOHANG);
+                if (result > 0 && result == maintenance_pid) {
+                    maintenance_finished = WIFEXITED(exited_status) && WEXITSTATUS(exited_status) == 0;
+                    maintenance_pid = -1;
+                }
                 if (result == process) {
                     *status = exited_status;
                     break;
@@ -192,19 +261,25 @@ static int run_child(const char *c1ancher_path, const char *ready_file,
             int64_t remaining = (last_beat < 0 ? started + startup_ms : last_beat + timeout_ms)
                                 - monotonic_milliseconds();
             struct timespec interval;
-            struct pollfd progress_fd = {count == 0 ? -1 : heartbeat[0], POLLIN, 0};
+            struct pollfd progress_fds[2] = {
+                {count == 0 ? -1 : heartbeat[0], POLLIN, 0}, {shutdown.fd, POLLIN, 0}
+            };
+            if (shutting_down || remaining > 100) remaining = 100;
             if (remaining < 0) remaining = 0;
             interval.tv_sec = (time_t)(remaining / 1000);
             interval.tv_nsec = (long)(remaining % 1000) * 1000000L;
-            (void)ppoll(&progress_fd, 1U, &interval, &original);
+            (void)ppoll(progress_fds, 2U, &interval, &original);
         }
     }
     child_pid = -1;
     close(heartbeat[0]);
+    if (shutdown.fd >= 0) close(shutdown.fd);
+    if (shutting_down) *status = C1_LAUNCHER_SHUTDOWN_EXIT << 8;
     if (clear_ready(ready_file) != 0) failed = true;
     /* Adopted children are ours even if they created a new session. Never
      * restart while survivors can still hold the old run/hardware locks. */
     if (!c1_descendants_cleanup(C1_CHILD_STOP_GRACE_MS)) failed = true;
+    maintenance_pid = -1; /* A terminated pass is retried after the next UI starts. */
     (void)sigprocmask(SIG_SETMASK, &original, NULL);
     finished = monotonic_milliseconds();
     *runtime_ms = started >= 0 && finished >= started ? (uint64_t)(finished - started) : 0U;
@@ -254,6 +329,11 @@ int main(int argc, char **argv)
     install_signal_handlers();
     if (c1_descendants_adopt() != 0) return C1_LAUNCHER_CRASH_STORM_EXIT;
     {
+        int error = c1_shutdown_client_init(&shutdown_upstream);
+        if (error != 0 && error != ENOTCONN)
+            fprintf(stderr, "C1 launcher: shutdown channel unavailable: %s\n", strerror(error));
+    }
+    {
         const char *value = getenv(C1_SUPERVISOR_HEARTBEAT_FD_ENV);
         if (value != NULL) {
             char *end;
@@ -270,6 +350,10 @@ int main(int argc, char **argv)
                 return C1_LAUNCHER_CRASH_STORM_EXIT;
         }
     }
+    /* Maintenance is best effort and belongs to launcher startup, never to
+     * the UI restart loop below. No persistent marker is needed on a full disk. */
+    if (!stop_requested && c1_launcher_cleanup_once(NULL) != 0)
+        fprintf(stderr, "C1 launcher: startup cleanup incomplete: %s\n", strerror(errno));
     for (;;) {
         struct c1_launcher_observation observation;
         struct c1_launcher_decision decision;
@@ -290,7 +374,12 @@ int main(int argc, char **argv)
         observation.short_crashes = crashes;
         decision = c1_launcher_decide(&observation);
         crashes = decision.short_crashes;
-        if (decision.action == C1_LAUNCHER_STOP) return 0;
+        if (decision.action == C1_LAUNCHER_STOP) {
+            /* Preserve shutdown across the outer updater supervisor. A plain
+             * zero exit is otherwise treated as an unexpected launcher exit. */
+            return observation.exited && observation.exit_code == C1_LAUNCHER_SHUTDOWN_EXIT
+                       ? C1_LAUNCHER_SHUTDOWN_EXIT : 0;
+        }
         if (decision.action == C1_LAUNCHER_UPDATE) return C1_LAUNCHER_UPDATE_EXIT;
         if (decision.action == C1_LAUNCHER_FATAL) return C1_LAUNCHER_CRASH_STORM_EXIT;
         while (decision.backoff_seconds != 0U && !stop_requested) {

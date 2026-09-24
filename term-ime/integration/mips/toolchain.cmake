@@ -1,0 +1,23 @@
+# Device ABI: little-endian MIPS32r2, o32, hard float with 32-bit FPRs.
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR mipsel)
+set(C1_MIPS_PREFIX "mipsel-linux-gnu-" CACHE STRING "Cross compiler prefix (may include a path)")
+set(CMAKE_C_COMPILER "${C1_MIPS_PREFIX}gcc")
+set(CMAKE_CXX_COMPILER "${C1_MIPS_PREFIX}g++")
+set(CMAKE_AR "${C1_MIPS_PREFIX}ar" CACHE FILEPATH "Target archiver")
+set(CMAKE_RANLIB "${C1_MIPS_PREFIX}ranlib" CACHE FILEPATH "Target archive indexer")
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES C1_MIPS_PREFIX C1_MIPS_STAGE)
+set(_c1_abi "-EL -march=mips32r2 -mabi=32 -mhard-float -mfp32")
+set(CMAKE_C_FLAGS_INIT "${_c1_abi}")
+set(CMAKE_CXX_FLAGS_INIT "${_c1_abi}")
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-static -Wl,--gc-sections")
+# Search programs on the build host, but never its libraries or system headers.
+# The compiler itself supplies its own target C/C++ standard include directories.
+set(CMAKE_FIND_ROOT_PATH "${C1_MIPS_STAGE};/usr/mipsel-linux-gnu")
+if(CMAKE_SYSROOT)
+    list(PREPEND CMAKE_FIND_ROOT_PATH "${CMAKE_SYSROOT}")
+endif()
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)

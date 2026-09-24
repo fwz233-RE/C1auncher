@@ -308,10 +308,12 @@ def main():
     build = (ROOT / options.build_dir).resolve()
     build.mkdir(parents=True, exist_ok=True)
     DRIVER = build / "host-pkg-http-tests"
+    runtime = tempfile.TemporaryDirectory(prefix="c1pkg-http-state-")
     sources = ["tests/test_pkg_http.c", "src/pkg/util.c", "src/pkg/text.c"] + [
         f"third_party/ed25519/{name}.c" for name in ("fe", "ge", "sc", "sha512", "verify")]
     subprocess.run([options.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Wpedantic", "-Werror",
-                    "-D_POSIX_C_SOURCE=200809L", "-Isrc", "-Isrc/pkg", "-Ithird_party/ed25519",
+                    "-D_POSIX_C_SOURCE=200809L", f'-DC1PKG_STATE_ROOT="{runtime.name}/state"',
+                    "-Isrc", "-Isrc/pkg", "-Ithird_party/ed25519",
                     *sources, "-o", str(DRIVER)], cwd=ROOT, check=True)
     if options.repo_regression:
         # The legacy executable uses a fixed /tmp name; never remove another

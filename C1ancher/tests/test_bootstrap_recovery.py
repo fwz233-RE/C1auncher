@@ -65,10 +65,10 @@ class RecoveryVerifierTests(unittest.TestCase):
         return subprocess.run([str(self.updater), *map(str, args)], env=self.env,
                               capture_output=True, text=True, timeout=10, **kwargs)
 
-    def fixture(self, sequence=1, minimum_bootstrap='1.0.0', minimum_updater='1.0.0', launcher=None):
+    def fixture(self, sequence=1, minimum_bootstrap='1.0.0', minimum_updater='1.0.0', launcher=None, app=None):
         release = self.root / f'input-{sequence}'
         (release / 'artifacts').mkdir(parents=True, mode=0o700)
-        payloads = [b'app', b'pkg', launcher or Path('/bin/true').read_bytes(), self.updater.read_bytes()]
+        payloads = [app or b'app', b'pkg', launcher or Path('/bin/true').read_bytes(), self.updater.read_bytes()]
         # Use a real ELF for recovery exec; it returns 0 only for the test marker
         # command by sharing the production updater's supervise implementation.
         manifest = (f'C1CORE-MANIFEST 1\nS\t{sequence}\nV\t1.0.{sequence}\nE\t1\n'
@@ -212,6 +212,41 @@ class RecoveryVerifierTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.wait()
+
+    def shutdown_chain(self, pending):
+        # Real launcher and updater, signed disposable fixture. The simulated
+        # UI exits with the shutdown code; it never executes poweroff.
+        self.enrolled()
+        launcher = self.root / 'test-launcher'
+        subprocess.run(['cc', '-D_POSIX_C_SOURCE=200809L', '-std=c11', '-Wall',
+                        '-Wextra', '-Wpedantic', '-Werror', '-I' + str(ROOT / 'src'),
+                        str(ROOT / 'src/launcher/main.c'), str(ROOT / 'src/launcher/cleanup.c'),
+                        str(ROOT / 'src/update/state.c'), str(ROOT / 'src/security/secure_file.c'),
+                        str(ROOT / 'src/launcher/policy.c'),
+                        str(ROOT / 'src/platform/liveness.c'), str(ROOT / 'src/platform/shutdown.c'),
+                        '-o', str(launcher)], check=True)
+        calls = self.root / 'ui-starts'
+        app = f'#!/bin/sh\necho started >> "{calls}"\nexit 76\n'.encode()
+        release = self.fixture(2, launcher=launcher.read_bytes(), app=app)
+        self.assertEqual(self.prepare(release).returncode, 0)
+        self.assertEqual(self.command('activate', self.state, self.core, self.key).returncode, 0)
+        if not pending:
+            self.assertEqual(self.command('confirm', self.state, self.core, self.key).returncode, 0)
+        pointer = os.readlink(self.core / 'current')
+        phase = self.command('state', self.state).stdout
+        result = self.command('supervise', self.state, self.core, self.key,
+                              self.root / 'ready', self.core / 'current/artifacts/C1ancher-launcher')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls.read_text().splitlines(), ['started'])
+        self.assertEqual(os.readlink(self.core / 'current'), pointer)
+        self.assertEqual(self.command('state', self.state).stdout, phase)
+        self.assertFalse((self.root / 'ready').exists())
+
+    def test_shutdown_stops_both_supervisors_without_restart(self):
+        self.shutdown_chain(pending=False)
+
+    def test_shutdown_during_pending_boot_does_not_rollback_or_restart(self):
+        self.shutdown_chain(pending=True)
 
     def pending_health(self, continuous):
         self.enrolled()

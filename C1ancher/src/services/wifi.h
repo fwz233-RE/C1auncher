@@ -92,17 +92,28 @@ bool c1_wifi_security_supported(c1_wifi_security security);
  * Scan requires ATTACH, BSS_FLUSH and BSS FIRST/NEXT in wpa_supplicant;
  * near-limit network lists require LIST_NETWORKS LAST_ID pagination; short
  * complete replies also support older standard 4096-byte-reply daemons.
- * Foreign wlan0 supplicants/DHCP clients are refused rather than terminated;
- * vendor wifi_up/down scripts are deliberately not executed. Cold start may
- * load only /etc/firmware/atbm603x_wifi_sdio.ko, with a 6 s hardware budget
- * inside the operation budget, and unblock only wlan0's physical radio.
- * Disable/pause lower only wlan0 and keep the managed daemon available for
- * resume; they do not promise chipset/module power removal. */
+ * Foreign wlan0 supplicants/DHCP clients are refused unless the firmware's
+ * existing factory supplicant is already the wlan0 owner; that control socket
+ * and its configuration are adopted without starting a second daemon. Vendor
+ * wifi_up/down scripts are deliberately not executed. Cold start may load only
+ * /etc/firmware/atbm603x_wifi_sdio.ko, with an initial 6 s hardware budget.
+ * If its probe failed (insmod_stat=0, live/unused module, no bound SDIO device
+ * or wlan0 owner), retry that module once with up to 6 s more, still inside
+ * the operation's total budget. No forced unload or recovery of unknown state.
+ * Unblock only wlan0's physical radio. Disable/pause
+ * lower only wlan0 and keep the managed daemon available for resume; an
+ * intentional disable is persisted as a private runtime marker across a UI
+ * restart. Scan waits for INTERFACE_DISABLED to clear and retries transient
+ * FAIL-BUSY responses; it does not reuse a stale scan event. */
 c1_status c1_wifi_scan(c1_wifi_snapshot *snapshot);
 c1_status c1_wifi_scan_ex(const c1_wifi_operation_options *options, c1_wifi_snapshot *snapshot);
 /* Legacy connect infers security from the scan cache, rejecting ambiguous
  * same-name types. Without a cached match it retains open/PSK inference. */
 c1_status c1_wifi_connect(const char *ssid, const char *password, c1_wifi_snapshot *snapshot);
+/* New credentials are derived with WPA PBKDF2-HMAC-SHA1 and submitted as a
+ * 64-digit PSK; accepted input remains 8-63 printable ASCII characters. This
+ * preserves literal quotes/backslashes and avoids config-file comment parsing
+ * on save/reload. Derived credentials and intermediate state are wiped. */
 c1_status c1_wifi_connect_ex(const char *ssid, const char *password,
                               c1_wifi_security security,
                               const c1_wifi_operation_options *options,

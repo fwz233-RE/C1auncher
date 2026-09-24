@@ -31,6 +31,8 @@ int c1pkg_tui(const struct c1pkg_config *config)
 
 const char *c1pkg_font_license(void) { return "test font license\n"; }
 
+int c1pkg_desktop_summary(const struct c1pkg_config *config) { return c1pkg_tui(config); }
+
 int c1pkg_gui(const struct c1pkg_config *config)
 {
     return c1pkg_tui(config);
@@ -38,6 +40,11 @@ int c1pkg_gui(const struct c1pkg_config *config)
 
 int c1pkg_repo_refresh(const struct c1pkg_config *config, struct c1pkg_index *index, char *error, size_t size)
 { (void)config; (void)error; (void)size; memset(index, 0, sizeof(*index)); return 0; }
+int c1pkg_repo_open_local(const struct c1pkg_config *config, const char *directory,
+                          struct c1pkg_index *index, char *error, size_t size)
+{ (void)config; (void)directory; (void)index; (void)error; (void)size; return -1; }
+int c1pkg_store_install_local(int fd, const struct c1pkg_package *package, char *error, size_t size)
+{ (void)fd; (void)package; (void)error; (void)size; return -1; }
 int c1pkg_store_list(struct c1pkg_installed_list *list, char *error, size_t size)
 { (void)list; (void)error; (void)size; return -1; }
 const struct c1pkg_package *c1pkg_repo_find(const struct c1pkg_index *index, const char *id)
@@ -93,7 +100,7 @@ int main(void)
         size_t i;
         for (i = 0U; i < sizeof(results) / sizeof(results[0]); ++i) {
             install_result = results[i];
-            if (command_install(&config, "app") != (results[i] < 0 ? 1 : 0)) {
+            if (command_install(&config, "app", NULL) != (results[i] < 0 ? 1 : 0)) {
                 fprintf(stderr, "FAIL: CLI install result %d\n", results[i]);
                 ++failures;
             }

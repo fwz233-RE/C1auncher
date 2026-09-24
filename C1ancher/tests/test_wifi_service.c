@@ -1,6 +1,7 @@
-/* Private-translation-unit tests: policy is production wifi.c; every external
- * I/O boundary used by these tests is replaced. No socket, network, process,
- * real clock sleep, or persistent config operation occurs. */
+/* Private-translation-unit tests replace network/config/hardware policy I/O.
+ * The final transport tests use only private socketpairs and children executing
+ * /bin/true, /bin/false and /bin/sleep. No real network interface, DHCP client,
+ * supplicant, credentials, module, sysfs or persistent config is accessed. */
 #include "../src/services/wifi.c"
 
 #include <assert.h>
@@ -24,6 +25,10 @@ static bool slow_commands;
 static bool scan_complete;
 static bool empty_scan;
 static bool repeat_bss_id;
+static int scan_busy_attempts;
+static int scan_start_attempts;
+static bool scan_start_failure;
+static int64_t interface_disabled_until;
 static int scan_rows;
 static int dhcp_calls;
 static int save_calls;
@@ -46,6 +51,11 @@ static bool hardware_enable_success;
 static int hardware_load_calls;
 static int hardware_unblock_calls;
 static int hardware_enable_calls;
+static bool hardware_recovery_allowed;
+static bool hardware_unload_success;
+static int hardware_recovery_checks;
+static int hardware_unload_calls;
+static int64_t hardware_recovered_interface_at;
 static const char *radio_type;
 static const char *radio_hard;
 static const char *radio_soft;
@@ -73,7 +83,7 @@ static void fake_sleep(long ms) { fake_time += ms; }
 static bool fake_ready(void) { return true; }
 static bool fake_available(void) { return !foreign_dhcp; }
 static bool fake_secure(void) { return true; }
-static bool fake_stop(void) { ++stop_calls; return true; }
+static bool fake_stop(void) { ++stop_calls; return !foreign_dhcp; }
 static bool fake_clear(void) { ++clear_calls; return true; }
 static bool fake_backup(config_backup *backup)
 {
@@ -116,7 +126,9 @@ static bool fake_command(const char *text, char *output, size_t capacity, int ti
     if (strcmp(text, "PING") == 0) {
         snprintf(output, capacity, "PONG\n");
     } else if (strcmp(text, "STATUS") == 0) {
-        if (selected_id == 7) {
+        if (fake_time < interface_disabled_until) {
+            snprintf(output, capacity, "wpa_state=INTERFACE_DISABLED\n");
+        } else if (selected_id == 7) {
             snprintf(output, capacity, "%s", previous_network
                          ? "bssid=00:11:22:33:44:55\nssid=old\nid=7\nwpa_state=COMPLETED\n"
                          : "wpa_state=DISCONNECTED\n");
@@ -176,7 +188,10 @@ static bool fake_command(const char *text, char *output, size_t capacity, int ti
         snprintf(output, capacity, "OK\n");
     } else if (strcmp(text, "SCAN") == 0) {
         assert(events_attached);
-        snprintf(output, capacity, "OK\n");
+        ++scan_start_attempts;
+        snprintf(output, capacity, "%s\n",
+                 scan_start_failure || fake_time < interface_disabled_until ? "FAIL" :
+                 scan_start_attempts <= scan_busy_attempts ? "FAIL-BUSY" : "OK");
     } else if (strcmp(text, "BSS FIRST") == 0 || strncmp(text, "BSS NEXT-", 9U) == 0) {
         int id = strcmp(text, "BSS FIRST") == 0 ? 1 : atoi(text + 9) + 1;
         assert(event_waits >= 3 && scan_complete);
@@ -249,7 +264,21 @@ static bool fake_hardware_load(int timeout_ms)
     ++hardware_load_calls;
     fake_time += timeout_ms < 100 ? timeout_ms : 100;
     if (hardware_load_success || hardware_load_race) hardware_module_present = true;
+    if (hardware_unload_calls && hardware_load_success) hardware_interface_at = hardware_recovered_interface_at;
     return hardware_load_success;
+}
+static bool fake_hardware_recovery_safe(void)
+{
+    ++hardware_recovery_checks;
+    return hardware_recovery_allowed;
+}
+static bool fake_hardware_unload(int timeout_ms)
+{
+    assert(timeout_ms > 0 && timeout_ms <= 1000 && hardware_recovery_allowed);
+    ++hardware_unload_calls;
+    fake_time += timeout_ms < 100 ? timeout_ms : 100;
+    if (hardware_unload_success) hardware_module_present = false;
+    return hardware_unload_success;
 }
 static bool fake_hardware_unblock(void)
 {
@@ -287,6 +316,7 @@ static bool fake_radio_clear(int descriptor)
 
 static void reset(void)
 {
+    (void)unlink(C1_WIFI_DISABLED_MARKER);
     fake_time = 1000;
     command_count = 0U;
     selected_id = 7;
@@ -298,6 +328,9 @@ static void reset(void)
     fail_save = fail_restore = fail_select_reply = fail_setup = foreign_dhcp = slow_commands = false;
     scan_complete = true;
     empty_scan = repeat_bss_id = false;
+    scan_busy_attempts = scan_start_attempts = 0;
+    scan_start_failure = false;
+    interface_disabled_until = 0;
     scan_rows = 1;
     saved_target = saved_security_mismatch = saved_key_missing = saved_lookup_failure = false;
     saved_open = saved_wep = false;
@@ -351,6 +384,12 @@ static void reset(void)
     hardware_io.enable = fake_hardware_enable;
     hardware_io.now = fake_now;
     hardware_io.sleep = fake_sleep;
+    hardware_io.recovery_safe = fake_hardware_recovery_safe;
+    hardware_io.unload_failed_module = fake_hardware_unload;
+    hardware_recovery_allowed = false;
+    hardware_unload_success = true;
+    hardware_recovered_interface_at = INT64_MAX;
+    hardware_unload_calls = hardware_recovery_checks = 0;
     radio_io.read = fake_radio_read;
     radio_io.clear_soft = fake_radio_clear;
     wifi_io.events_close = fake_events_close;
@@ -398,6 +437,42 @@ static void test_codecs_status(void)
     assert(reply_is("OK\n", "OK"));
     assert(argument_is("udhcpc\0-i\0wlan0\0-p\0/run/c1/udhcpc.pid\0", 41U, "-i", "wlan0"));
     assert(!argument_is("udhcpc\0-i\0wlan1\0", 17U, "-i", "wlan0"));
+}
+
+/* WPA's mandated KDF: public known vectors and control-command shape.
+ * A real host supplicant + hashlib oracle additionally verify special bytes
+ * and config reload in test_wifi_wpa_protocol.py. */
+static void test_literal_passphrases(void)
+{
+    static const char *values[] = {"plain123", "quote\"pass", "slash\\pass", " both \" \\ ", "tail123\\", "quote\"#pass"};
+    char encoded[65];
+    char longest[64];
+    c1_wifi_snapshot snapshot;
+    reset();
+    assert(derive_wpa_psk("IEEE", "password", encoded));
+    assert(strcmp(encoded, "f42c6fc52df0ebef9ebb4b90b38a5f902e83fe1b135a70e23aed762e9710a12e") == 0);
+    assert(derive_wpa_psk("ThisIsASSID", "ThisIsAPassword", encoded));
+    assert(strcmp(encoded, "0dc0d6eb90555ed6419756b9a15ec3e3209b63df707dd508d14581f8982721af") == 0);
+    for (size_t i = 0U; i < sizeof(values) / sizeof(values[0]); ++i) {
+        reset();
+        assert(derive_wpa_psk("target", values[i], encoded) && strlen(encoded) == 64U);
+        assert(c1_wifi_connect_ex("target", values[i], C1_WIFI_SECURITY_WPA_PSK, NULL, &snapshot)
+               == C1_STATUS_OK);
+        char expected[256];
+        snprintf(expected, sizeof(expected), "SET_NETWORK 42 psk %s", encoded);
+        assert(issued(expected) && save_calls == 1);
+    }
+    memset(longest, '\\', sizeof(longest) - 1U);
+    longest[sizeof(longest) - 1U] = '\0';
+    assert(derive_wpa_psk("target", longest, encoded) && strlen(encoded) == 64U);
+    assert(!valid_wpa_passphrase("invalid\npass"));
+    assert(!valid_wpa_passphrase("invalid\rpass"));
+    assert(!valid_wpa_passphrase("short"));
+    reset();
+    c1_wifi_operation_options options = {fake_progress, &progress_calls};
+    begin_operation(&options, 45000);
+    cancel_phase = C1_WIFI_PHASE_PREPARING;
+    assert(!derive_wpa_psk("target", "testpass", encoded) && operation_cancelled && encoded[0] == '\0');
 }
 
 static void test_scan_parser(void)
@@ -712,6 +787,59 @@ static void test_scan_flow(void)
     assert(!events_attached && !issued("BSS FIRST"));
 }
 
+static void test_scan_startup_and_ownership(void)
+{
+    c1_wifi_snapshot snapshot;
+    c1_wifi_operation_options options = {fake_progress, &progress_calls};
+    reset();
+    /* A real supplicant scans saved profiles automatically on startup. Its
+     * documented FAIL-BUSY response must not make every UI scan fail. */
+    scan_busy_attempts = 2;
+    assert(c1_wifi_scan(&snapshot) == C1_STATUS_OK);
+    assert(scan_start_attempts == 3 && events_closed && snapshot.network_count == 1U);
+
+    reset();
+    /* IFF_UP returning does not synchronously process the supplicant's
+     * netlink event. This also occurs when re-enabling after our own Off. */
+    interface_disabled_until = fake_time + 500;
+    assert(c1_wifi_scan(&snapshot) == C1_STATUS_OK);
+    assert(fake_time >= interface_disabled_until && scan_start_attempts == 1);
+
+    reset();
+    scan_busy_attempts = INT_MAX;
+    assert(c1_wifi_scan(&snapshot) != C1_STATUS_OK);
+    assert(scan_start_attempts > 1 && fake_time <= 1000 + C1_WIFI_SCAN_MS + 100);
+    assert(snapshot.network_count == 0U && events_closed);
+
+    reset();
+    scan_busy_attempts = INT_MAX;
+    cancel_at_time = fake_time + 400;
+    assert(c1_wifi_scan_ex(&options, &snapshot) == C1_STATUS_INTERRUPTED);
+    assert(events_closed && fake_time < 2000);
+
+    reset();
+    scan_start_failure = true;
+    assert(c1_wifi_scan(&snapshot) != C1_STATUS_OK);
+    assert(scan_start_attempts == 1 && events_closed); /* Do not retry real failures. */
+
+    reset();
+    interface_disabled_until = INT64_MAX;
+    assert(c1_wifi_scan(&snapshot) != C1_STATUS_OK);
+    assert(!issued("SCAN") && !issued("BSS_FLUSH 0"));
+    assert(fake_time <= 1000 + C1_WIFI_SCAN_MS + 100);
+
+    reset();
+    foreign_dhcp = true;
+    assert(c1_wifi_disable(&snapshot) == C1_STATUS_UNAVAILABLE);
+    assert(!issued("DISCONNECT") && stop_calls == 0 && clear_calls == 0 && hardware_enable_calls == 0);
+
+    reset();
+    current_state = C1_WIFI_DISABLED; /* Fresh UI process, existing daemon remains down. */
+    interface_disabled_until = INT64_MAX;
+    assert(c1_wifi_read_snapshot(&snapshot) && snapshot.state == C1_WIFI_DISABLED);
+    assert(hardware_enable_calls == 0 && dhcp_calls == 0);
+}
+
 static unsigned int resume_progress_calls;
 static bool resume_progress(c1_wifi_phase phase, void *context)
 {
@@ -825,6 +953,157 @@ static void test_cold_start_hardware(void)
     assert(!prepare_wifi_hardware());
     assert(operation_cancelled && hardware_load_calls == 1 && hardware_unblock_calls == 0);
     assert(fake_time == 1400);
+}
+
+static void failed_module_fixture(void)
+{
+    reset();
+    hardware_module_present = true;
+    hardware_interface_at = INT64_MAX;
+    hardware_recovery_allowed = true;
+    hardware_recovered_interface_at = 8100;
+}
+
+static void test_failed_module_recovery(void)
+{
+    c1_wifi_operation_options options = {fake_progress, &progress_calls};
+    failed_module_fixture();
+    begin_operation(NULL, 20000);
+    assert(prepare_wifi_hardware());
+    assert(hardware_unload_calls == 1 && hardware_load_calls == 1);
+    assert(hardware_unblock_calls == 1 && hardware_enable_calls == 1 && fake_time == 8100);
+    assert(save_calls == 0 && restore_calls == 0 && stop_calls == 0 && command_count == 0);
+
+    /* A new module may also report success despite failing to create wlan0. */
+    failed_module_fixture();
+    hardware_module_present = false;
+    begin_operation(NULL, 20000);
+    assert(prepare_wifi_hardware() && hardware_load_calls == 2 && hardware_unload_calls == 1);
+
+    /* Healthy/slow or unsafe/unknown modules are never unloaded. */
+    failed_module_fixture();
+    hardware_interface_at = 6500;
+    begin_operation(NULL, 20000);
+    assert(prepare_wifi_hardware() && hardware_recovery_checks == 0 && hardware_unload_calls == 0);
+    failed_module_fixture();
+    hardware_recovery_allowed = false;
+    begin_operation(NULL, 20000);
+    assert(!prepare_wifi_hardware() && fake_time == 7000);
+    assert(hardware_recovery_checks == 1 && hardware_unload_calls == 0 && hardware_load_calls == 0);
+
+    failed_module_fixture();
+    hardware_unload_success = false;
+    begin_operation(NULL, 20000);
+    assert(!prepare_wifi_hardware() && hardware_unload_calls == 1 && hardware_load_calls == 0);
+    assert(strcmp(last_error, "WI-FI FAILED DRIVER RECOVERY REFUSED") == 0);
+    failed_module_fixture();
+    hardware_load_success = false;
+    begin_operation(NULL, 20000);
+    assert(!prepare_wifi_hardware() && hardware_unload_calls == 1 && hardware_load_calls == 1);
+    assert(strcmp(last_error, "WI-FI MODULE LOAD FAILED") == 0);
+
+    /* No loop of unload/reload if the retry also fails. */
+    failed_module_fixture();
+    hardware_recovered_interface_at = INT64_MAX;
+    begin_operation(NULL, 20000);
+    assert(!prepare_wifi_hardware() && hardware_unload_calls == 1 && hardware_load_calls == 1);
+    assert(fake_time == 1000 + C1_WIFI_HARDWARE_MS + C1_WIFI_RECOVERY_MS);
+    assert(strcmp(last_error, "WLAN0 INITIALIZATION TIMED OUT") == 0);
+
+    failed_module_fixture();
+    begin_operation(NULL, 6000);
+    assert(!prepare_wifi_hardware() && fake_time == 7000 && hardware_unload_calls == 0);
+    failed_module_fixture();
+    hardware_recovered_interface_at = INT64_MAX;
+    begin_operation(NULL, 6250);
+    assert(!prepare_wifi_hardware() && fake_time == 7250 && hardware_unload_calls == 1);
+    assert(hardware_load_calls == 1 && hardware_enable_calls == 0);
+
+    failed_module_fixture();
+    cancel_at_time = 7000;
+    begin_operation(&options, 20000);
+    assert(!prepare_wifi_hardware() && operation_cancelled && hardware_unload_calls == 0);
+    failed_module_fixture();
+    cancel_at_time = 7100;
+    begin_operation(&options, 20000);
+    assert(!prepare_wifi_hardware() && operation_cancelled && hardware_unload_calls == 1);
+    assert(hardware_load_calls == 0 && hardware_enable_calls == 0);
+    failed_module_fixture();
+    hardware_recovered_interface_at = INT64_MAX;
+    cancel_at_time = 7400;
+    begin_operation(&options, 20000);
+    assert(!prepare_wifi_hardware() && operation_cancelled && fake_time == 7400);
+    assert(hardware_unload_calls == 1 && hardware_load_calls == 1 && hardware_enable_calls == 0);
+}
+
+static void fixture_value(const char *directory, const char *relative, const char *value)
+{
+    char path[PATH_MAX];
+    assert(snprintf(path, sizeof(path), "%s/%s", directory, relative) < (int)sizeof(path));
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    assert(fd >= 0 && write(fd, value, strlen(value)) == (ssize_t)strlen(value));
+    assert(close(fd) == 0);
+}
+
+static void test_failed_module_sysfs_guard(void)
+{
+    char root[] = "/tmp/c1-wifi-recovery-XXXXXX";
+    char module[PATH_MAX], driver[PATH_MAX], holders[PATH_MAX], parameters[PATH_MAX], path[PATH_MAX];
+    assert(mkdtemp(root));
+    snprintf(module, sizeof(module), "%s/module", root);
+    snprintf(driver, sizeof(driver), "%s/driver", root);
+    snprintf(holders, sizeof(holders), "%s/module/holders", root);
+    snprintf(parameters, sizeof(parameters), "%s/module/parameters", root);
+    assert(mkdir(module, 0700) == 0 && mkdir(driver, 0700) == 0);
+    assert(mkdir(holders, 0700) == 0 && mkdir(parameters, 0700) == 0);
+    fixture_value(module, "initstate", "live\n");
+    fixture_value(module, "refcnt", "0\n");
+    fixture_value(module, "parameters/insmod_stat", "0\n");
+    fixture_value(driver, "bind", "");
+    fixture_value(driver, "unbind", "");
+    fixture_value(driver, "uevent", "");
+    assert(module_probe_failed_at(module, driver));
+    fixture_value(module, "initstate", "coming\n");
+    assert(!module_probe_failed_at(module, driver));
+    fixture_value(module, "initstate", "live\n");
+    fixture_value(module, "refcnt", "1\n");
+    assert(!module_probe_failed_at(module, driver));
+    fixture_value(module, "refcnt", "0\n");
+    fixture_value(module, "parameters/insmod_stat", "1\n");
+    assert(!module_probe_failed_at(module, driver));
+    fixture_value(module, "parameters/insmod_stat", "unknown\n");
+    assert(!module_probe_failed_at(module, driver));
+    fixture_value(module, "parameters/insmod_stat", "0\n");
+    fixture_value(holders, "other_module", "");
+    assert(!module_probe_failed_at(module, driver));
+    snprintf(path, sizeof(path), "%s/module/holders/other_module", root);
+    assert(unlink(path) == 0);
+    snprintf(path, sizeof(path), "%s/driver/mmc1:0001:1", root);
+    assert(symlink(module, path) == 0);
+    assert(!module_probe_failed_at(module, driver));
+    assert(unlink(path) == 0);
+    assert(module_probe_failed_at(module, driver));
+    assert(rmdir(holders) == 0);
+    assert(!module_probe_failed_at(module, driver));
+    assert(mkdir(holders, 0700) == 0);
+    snprintf(path, sizeof(path), "%s/module/parameters/insmod_stat", root);
+    assert(unlink(path) == 0);
+    assert(!module_probe_failed_at(module, driver));
+    assert(symlink("../refcnt", path) == 0);
+    assert(!module_probe_failed_at(module, driver));
+    assert(unlink(path) == 0);
+    assert(mkfifo(path, 0600) == 0);
+    assert(!module_probe_failed_at(module, driver));
+    assert(unlink(path) == 0);
+    assert(rmdir(parameters) == 0 && rmdir(holders) == 0);
+    snprintf(path, sizeof(path), "%s/module/initstate", root); assert(unlink(path) == 0);
+    snprintf(path, sizeof(path), "%s/module/refcnt", root); assert(unlink(path) == 0);
+    assert(rmdir(module) == 0);
+    snprintf(path, sizeof(path), "%s/driver/bind", root); assert(unlink(path) == 0);
+    snprintf(path, sizeof(path), "%s/driver/unbind", root); assert(unlink(path) == 0);
+    snprintf(path, sizeof(path), "%s/driver/uevent", root); assert(unlink(path) == 0);
+    assert(rmdir(driver) == 0 && rmdir(root) == 0);
+    assert(!module_probe_failed_at(module, driver));
 }
 
 static void test_radio_scope(void)
@@ -967,8 +1246,90 @@ static void test_saved_connections(void)
     assert(issued("SELECT_NETWORK 7") && !issued("REMOVE_NETWORK 42") && save_calls == 0);
 }
 
+static void test_disconnected_rollback_order(void)
+{
+    connection_backup backup;
+    reset();
+    memset(&backup, 0, sizeof(backup));
+    backup.previous_id = -1;
+    backup.previous_disconnected = true;
+    backup.count = 2U;
+    backup.networks[0].id = 7;
+    backup.networks[0].disabled = false;
+    backup.networks[1].id = 8;
+    backup.networks[1].disabled = true;
+    assert(rollback_connection(&backup, 42, true, false));
+    assert(issued("REMOVE_NETWORK 42") && issued("ENABLE_NETWORK 7") && issued("DISABLE_NETWORK 8"));
+    /* Enabling a profile can restart association, so DISCONNECT must follow. */
+    assert(strcmp(commands[command_count - 1U], "DISCONNECT") == 0);
+    reset();
+    backup.previous_disconnected = false; /* SCANNING must remain eligible to reconnect. */
+    assert(rollback_connection(&backup, 42, true, false));
+    assert(strcmp(commands[command_count - 1U], "DISABLE_NETWORK 8") == 0);
+    reset();
+    previous_network = false;
+    assert(capture_networks(&backup) && backup.previous_disconnected);
+    reset();
+    assert(capture_networks(&backup) && !backup.previous_disconnected);
+}
+
+static volatile sig_atomic_t transport_signals;
+static void transport_signal(int signal_number)
+{
+    (void)signal_number;
+    ++transport_signals;
+}
+
+static void test_control_transport_and_process_deadlines(void)
+{
+    int sockets[2], status;
+    char output[32];
+    struct sigaction action = {0}, previous;
+    reset();
+    assert(socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, sockets) == 0);
+    assert(send(sockets[1], "OK\n", 3U, 0) == 3);
+    assert(receive_control(sockets[0], output, sizeof(output), 100) && reply_is(output, "OK"));
+    assert(send(sockets[1], "truncated", 9U, 0) == 9);
+    assert(!receive_control(sockets[0], output, 4U, 100));
+    action.sa_handler = transport_signal;
+    sigemptyset(&action.sa_mask);
+    assert(sigaction(SIGUSR1, &action, &previous) == 0);
+    transport_signals = 0;
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) {
+        close(sockets[0]);
+        sleep_milliseconds(30);
+        (void)kill(getppid(), SIGUSR1);
+        sleep_milliseconds(30);
+        _exit(send(sockets[1], "OK\n", 3U, 0) == 3 ? 0 : 1);
+    }
+    bool received = receive_control(sockets[0], output, sizeof(output), 1000);
+    while (waitpid(child, &status, 0) < 0) assert(errno == EINTR);
+    assert(sigaction(SIGUSR1, &previous, NULL) == 0);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0 && transport_signals == 1);
+    assert(received && reply_is(output, "OK"));
+    int64_t started = monotonic_ms();
+    assert(!receive_control(sockets[0], output, sizeof(output), 30));
+    assert(monotonic_ms() - started < 1000);
+    close(sockets[0]); close(sockets[1]);
+
+    char *const ok[] = {"true", NULL};
+    char *const failed[] = {"false", NULL};
+    char *const slow[] = {"sleep", "5", NULL};
+    assert(run_program("/bin/true", ok, 1000));
+    assert(!run_program("/bin/false", failed, 1000));
+    started = monotonic_ms();
+    assert(!run_program("/bin/sleep", slow, 100));
+    assert(monotonic_ms() - started < 2000);
+    /* Timeout must reap its own process, without leaking a live child. */
+    assert(waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD);
+}
+
 int main(void)
 {
+    test_scan_startup_and_ownership();
+    test_literal_passphrases();
     test_saved_connections();
     test_codecs_status();
     test_scan_parser();
@@ -979,8 +1340,12 @@ int main(void)
     test_scan_flow();
     test_resume();
     test_cold_start_hardware();
+    test_failed_module_recovery();
+    test_failed_module_sysfs_guard();
     test_radio_scope();
     test_legacy_network_list();
-    puts("Wi-Fi host tests passed (startup discovery, snapshot budgets, connection, scan, rollback, cancellation, hardware, legacy daemon)");
+    test_disconnected_rollback_order();
+    test_control_transport_and_process_deadlines();
+    puts("Wi-Fi host tests passed (startup, KDF, connection, scan, rollback, cancellation, hardware, legacy daemon, transport)");
     return 0;
 }

@@ -17,6 +17,11 @@ c1_launcher_decide(const struct c1_launcher_observation *observation)
         decision.short_crashes = crashes;
         return decision;
     }
+    if (observation->exited && observation->exit_code == C1_LAUNCHER_SHUTDOWN_EXIT) {
+        decision.action = C1_LAUNCHER_STOP;
+        decision.short_crashes = crashes;
+        return decision;
+    }
     if (observation->exited && observation->exit_code == C1_LAUNCHER_UPDATE_EXIT) {
         decision.action = C1_LAUNCHER_UPDATE;
         decision.short_crashes = crashes;

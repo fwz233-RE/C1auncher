@@ -4,6 +4,7 @@
 #include "update/slot.h"
 #include "update/supervise.h"
 #include "update/repository.h"
+#include "update/check.h"
 #include "update/transaction.h"
 #include "security/secure_file.h"
 #include "security/trusted_ed25519.h"
@@ -26,6 +27,7 @@ static void usage(FILE *stream)
           "  c1updater verify-signature PAYLOAD SIGNATURE KEY\n"
           "  c1updater verify-manifest MANIFEST SIGNATURE KEY\n"
           "  c1updater state ROOT\n"
+          "  c1updater check-configured (signed metadata only; never prepares/downloads components)\n"
           "  c1updater prepare-local RELEASE_DIR STAGING_ROOT CORE_ROOT STATE_ROOT KEY\n"
           "  c1updater prepare URL STAGING_ROOT CORE_ROOT STATE_ROOT KEY\n"
           "  c1updater prepare-configured STAGING_ROOT CORE_ROOT STATE_ROOT KEY\n"
@@ -101,6 +103,27 @@ static int show_state(const char *root)
                 (unsigned long long)state.generation, c1_update_phase_name(state.phase),
                 (unsigned long long)state.sequence, (unsigned long long)state.security_epoch,
                 state.release);
+    return EXIT_SUCCESS;
+}
+
+static int check_configured(void)
+{
+    struct c1_update_check_result result;
+    char repository[C1_UPDATE_URL_MAX + 1U];
+    char error[C1_UPDATE_ERROR_MAX] = "";
+    if (c1_update_repository_read_url(C1_UPDATE_REPOSITORY_CONFIG, repository,
+                                      sizeof(repository), error, sizeof(error)) != 0 ||
+        c1_update_check(repository, C1_UPDATE_DEFAULT_STAGING_ROOT,
+                         C1_UPDATE_DEFAULT_STATE_ROOT, C1_UPDATE_DEFAULT_KEY,
+                         &result, error, sizeof(error)) != 0) {
+        fprintf(stderr, "check failed: %s\n", error[0] != '\0' ? error : "rejected");
+        return EXIT_FAILURE;
+    }
+    /* Emit only a complete successful, verified result after staging cleanup.
+     * Consumers must require exit status 0 and exactly this versioned protocol. */
+    if (printf("C1UPDATE-CHECK 1\nS\t%llu\nV\t%s\nA\t%d\n",
+               (unsigned long long)result.sequence, result.version, result.available) < 0 ||
+        fflush(stdout) != 0) return EXIT_FAILURE;
     return EXIT_SUCCESS;
 }
 
@@ -246,6 +269,7 @@ int main(int argc, char **argv)
         if (result != 0) fprintf(stderr, "current release verification failed: %s\n", error);
         return result == 0 ? 0 : 1;
     }
+    if (argc == 2 && strcmp(argv[1], "check-configured") == 0) return check_configured();
     if (argc == 3 && strcmp(argv[1], "state") == 0) return show_state(argv[2]);
     if (argc == 7 && strcmp(argv[1], "prepare-local") == 0)
         return prepare_release(argv[2], 1, argv[3], argv[4], argv[5], argv[6]);

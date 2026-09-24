@@ -103,6 +103,12 @@ credentials, modules, or sysfs.
 
 ## Hardware acceptance still required
 
+The extracted target root filesystem exposes an important ownership boundary: `/etc/init.d/S40network` starts `ifup -a`, and `bin/wifi_up.sh` starts `wpa_supplicant` with `ctrl_interface=/var/run/wpa_supplicant` from `/usr/resource/wpa_supplicant.conf`, then starts a background `udhcpc`. `bin/wifi_down.sh` later uses broad `killall` and terminates the factory daemon. The service therefore adopts a live factory `wlan0` control socket and its configuration instead of starting a second daemon; it never invokes the broad vendor stop script. DHCP ownership remains restricted to the exact `wlan0` plus `/run/c1/udhcpc.pid` process.
+
+A scan can receive `FAIL-BUSY` while the factory daemon is completing its startup scan. The service now waits for `STATUS` to leave `INTERFACE_DISABLED` after re-enabling the interface, retries only `FAIL-BUSY` within the operation deadline, and never treats a stale event as the new scan result. A small `/run/c1/wifi.disabled` marker preserves an intentional Off state across a launcher restart; a reachable control socket alone no longer means Wi-Fi is enabled.
+
+These lifecycle paths have host regressions and a private Unix-datagram control-daemon test (`make wifi-control-lifecycle-test`). They still do not prove the atbm603x driver, RF kill state, DHCP hook, route, DNS, or an actual access point on hardware. The USB target was offline during this review, so no device state was changed.
+
 - Validate cold start, the firmware's actual supplicant control capabilities,
   rfkill layout, BusyBox DHCP hooks, and existing factory-owned services.
 - Exercise open and WPA/WPA2-PSK networks, wrong passwords, DHCP failure, repeated

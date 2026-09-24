@@ -1,7 +1,12 @@
 #include "pkg.h"
+#include "local.h"
 #include "text.h"
 #include "storage_layout.h"
 #include "ed25519.h"
+#include "sha512.h"
+
+#include <sys/file.h>
+#include <stddef.h>
 #include "platform/repository_endpoint.h"
 
 #include <time.h>
@@ -71,25 +76,376 @@ int c1pkg_repo_read_url(const char *path, char *url, size_t url_size,
     return 0;
 }
 
-/* The package manager serializes transport calls. Keep a process-wide cooldown
- * across metadata, packages, subsequent user actions, and the fixed IP alias.
- * This is deliberately conservative for custom repositories too. No RPM quota
- * is inferred: the server limits concurrent downloads and shared bandwidth. */
+/* Each transport holds a per-repository cross-process lock through request and
+ * response persistence. Memory below is only the active operation's view. */
 #define C1PKG_AUTO_WAIT_MAX 3600U
+#define COOLDOWN_SLOTS 32U
+#define COOLDOWN_URL_MAX 1400U
+#define COOLDOWN_RECOVERY_MS 60000U
+#define COOLDOWN_READY "C1PKG-COOL-1"
+#define COOLDOWN_PENDING "C1PKG-REQ-2"
+struct cooldown_record {
+    char magic[16];
+    char scope[COOLDOWN_URL_MAX];
+    char boot[37];
+    uint64_t written_ms;
+    uint64_t duration_ms;
+    uint64_t until_ms;
+    unsigned char checksum[64];
+};
+static struct {
+    int root;
+    int guard;
+    unsigned int slot;
+    struct cooldown_record record;
+} cooldown_active = {.root = -1, .guard = -1};
+static char transport_repo_scope[COOLDOWN_URL_MAX];
 static uint64_t transport_not_before;
 
 static uint64_t monotonic_milliseconds(void)
 {
     struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0U;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 ||
+        now.tv_nsec < 0 || now.tv_nsec >= 1000000000L ||
+        (uint64_t)now.tv_sec > (UINT64_MAX - 999U) / 1000U) return UINT64_MAX;
     return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
 }
 
-static void remember_cooldown(uint64_t seconds)
+/* Canonicalize only equivalences we can prove locally. Preserve path case and
+ * isolate different repository paths, but join the official HTTP alias pair.
+ * Ambiguous credentials, query/fragment, encoded or dot-segment paths fail
+ * closed rather than acquiring a different cooldown key for the same resource. */
+static int cooldown_url(const char *input, char output[COOLDOWN_URL_MAX])
+{
+    size_t prefix, length, authority, host_end, i, used;
+    const char *path;
+    char host[512];
+    if (input == NULL) return -1;
+    prefix = strncasecmp(input, "http://", 7U) == 0 ? 7U :
+             strncasecmp(input, "https://", 8U) == 0 ? 8U : 0U;
+    length = strnlen(input, COOLDOWN_URL_MAX);
+    if (prefix == 0U || length <= prefix || length >= COOLDOWN_URL_MAX) return -1;
+    path = strchr(input + prefix, '/');
+    authority = path != NULL ? (size_t)(path - input) : length;
+    host_end = authority;
+    if (prefix == 7U && host_end >= prefix + 3U && memcmp(input + host_end - 3U, ":80", 3U) == 0)
+        host_end -= 3U;
+    else if (prefix == 8U && host_end >= prefix + 4U && memcmp(input + host_end - 4U, ":443", 4U) == 0)
+        host_end -= 4U;
+    if (host_end <= prefix || host_end - prefix >= sizeof(host)) return -1;
+    for (i = prefix; i < host_end; ++i) {
+        unsigned char c = (unsigned char)input[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '-' || c == '.' || c == ':' || c == '[' || c == ']')) return -1;
+        host[i - prefix] = (char)(c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c);
+    }
+    host[host_end - prefix] = '\0';
+    if (host[0] == ':' || host[strlen(host) - 1U] == '.') return -1;
+    if (prefix == 7U && strcmp(host, "www.fwz233.com") == 0) strcpy(host, "123.56.214.77");
+    used = (size_t)snprintf(output, COOLDOWN_URL_MAX, "%s%s", prefix == 7U ? "http://" : "https://", host);
+    if (used >= COOLDOWN_URL_MAX) return -1;
+    if (path != NULL) {
+        if (strstr(path, "//") != NULL || strstr(path, "/./") != NULL || strstr(path, "/../") != NULL)
+            return -1;
+        for (i = authority; i < length; ++i) {
+            unsigned char c = (unsigned char)input[i];
+            if (c <= 0x20U || c >= 0x7fU || strchr("\\%?#{}[]", c) != NULL || used + 1U >= COOLDOWN_URL_MAX)
+                return -1;
+            output[used++] = (char)c;
+        }
+    }
+    while (used > prefix && output[used - 1U] == '/') --used;
+    output[used] = '\0';
+    if ((used >= 2U && strcmp(output + used - 2U, "/.") == 0) ||
+        (used >= 3U && strcmp(output + used - 3U, "/..") == 0)) return -1;
+    return 0;
+}
+
+int c1pkg_repo_bind_transport(const struct c1pkg_config *config)
+{
+    transport_repo_scope[0] = '\0';
+    if (config == NULL || cooldown_url(config->repo_base, transport_repo_scope) != 0) {
+        transport_repo_scope[0] = '\0';
+        return -1;
+    }
+    return 0;
+}
+
+static int cooldown_contains(const char *scope, const char *url)
+{
+    size_t n = strlen(scope);
+    return strncmp(scope, url, n) == 0 && (url[n] == '\0' || url[n] == '/');
+}
+
+static int cooldown_boot(char boot[37])
+{
+    char data[38];
+    ssize_t n;
+    size_t i;
+    int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    do { n = read(fd, data, sizeof(data)); } while (n < 0 && errno == EINTR);
+    (void)close(fd);
+    if (n != 37 || data[36] != '\n') return -1;
+    for (i = 0U; i < 36U; ++i) {
+        if (i == 8U || i == 13U || i == 18U || i == 23U) { if (data[i] != '-') return -1; }
+        else if (!((data[i] >= '0' && data[i] <= '9') || (data[i] >= 'a' && data[i] <= 'f'))) return -1;
+    }
+    memcpy(boot, data, 36U); boot[36] = '\0';
+    return 0;
+}
+
+static int cooldown_private(int fd, int directory)
+{
+    struct stat st;
+    return fstat(fd, &st) == 0 && st.st_uid == geteuid() &&
+           (st.st_mode & 0777) == (directory ? 0700 : 0600) &&
+           (directory ? S_ISDIR(st.st_mode) : S_ISREG(st.st_mode) && st.st_nlink == 1);
+}
+
+static int cooldown_open_lock(int root, const char *name)
+{
+    int fd = openat(root, name, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+    if (fd >= 0 && !cooldown_private(fd, 0)) { (void)close(fd); fd = -1; errno = EACCES; }
+    return fd;
+}
+
+static int cooldown_pause(char *error, size_t error_size)
+{
+    if (c1pkg_progress("正在等待同一仓库的下载操作") != 0) {
+        errno = ECANCELED; c1pkg_set_error(error, error_size, "操作已取消"); return -1;
+    }
+    if (poll(NULL, 0U, 100) < 0 && errno != EINTR) return -1;
+    return 0;
+}
+
+static int cooldown_read(int root, unsigned int slot, struct cooldown_record *record)
+{
+    char name[32];
+    struct stat st;
+    unsigned char digest[64], extra;
+    char normalized[COOLDOWN_URL_MAX];
+    size_t used = 0U;
+    int fd;
+    ssize_t n;
+    (void)snprintf(name, sizeof(name), "%02u.state", slot);
+    fd = openat(root, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        if (errno != ENOENT) return -1;
+        /* An assigned slot's lock outlives every request. A missing state with
+         * a surviving lock is lost state, not a fresh zero-cooldown repository. */
+        (void)snprintf(name, sizeof(name), "%02u.lock", slot);
+        return fstatat(root, name, &st, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT ? 1 : -1;
+    }
+    (void)snprintf(name, sizeof(name), "%02u.lock", slot);
+    if (fstatat(root, name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_nlink != 1 || st.st_uid != geteuid() || (st.st_mode & 0777) != 0600) goto failed;
+    if (!cooldown_private(fd, 0) || fstat(fd, &st) != 0 || st.st_size != (off_t)sizeof(*record)) goto failed;
+    while (used < sizeof(*record)) {
+        n = read(fd, (unsigned char *)record + used, sizeof(*record) - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) goto failed;
+        used += (size_t)n;
+    }
+    do { n = read(fd, &extra, 1U); } while (n < 0 && errno == EINTR);
+    (void)close(fd);
+    if (n != 0 || sha512((const unsigned char *)record, offsetof(struct cooldown_record, checksum), digest) != 0 ||
+        memcmp(digest, record->checksum, sizeof(digest)) != 0 ||
+        (memcmp(record->magic, COOLDOWN_READY, sizeof(COOLDOWN_READY)) != 0 &&
+         memcmp(record->magic, COOLDOWN_PENDING, sizeof(COOLDOWN_PENDING)) != 0) ||
+        memchr(record->scope, 0, sizeof(record->scope)) == NULL ||
+        cooldown_url(record->scope, normalized) != 0 || strcmp(normalized, record->scope) != 0 ||
+        record->boot[36] != '\0' || strlen(record->boot) != 36U ||
+        record->written_ms == UINT64_MAX || record->until_ms < record->written_ms ||
+        record->until_ms != (record->duration_ms > UINT64_MAX - record->written_ms ?
+                            UINT64_MAX : record->written_ms + record->duration_ms)) return -1;
+    return 0;
+failed:
+    (void)close(fd);
+    return -1;
+}
+
+static int cooldown_store(void)
+{
+    struct cooldown_record *record = &cooldown_active.record;
+    char name[32], temp[32];
+    int fd, result = -1;
+    size_t used = 0U;
+    (void)snprintf(name, sizeof(name), "%02u.state", cooldown_active.slot);
+    (void)snprintf(temp, sizeof(temp), "%02u.tmp", cooldown_active.slot);
+    if (sha512((const unsigned char *)record, offsetof(struct cooldown_record, checksum), record->checksum) != 0)
+        return -1;
+    (void)unlinkat(cooldown_active.root, temp, 0);
+    fd = openat(cooldown_active.root, temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    while (used < sizeof(*record)) {
+        ssize_t n = write(fd, (const unsigned char *)record + used, sizeof(*record) - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) goto done;
+        used += (size_t)n;
+    }
+    if (fsync(fd) == 0) result = 0;
+done:
+    if (close(fd) != 0) result = -1;
+    if (result == 0 && renameat(cooldown_active.root, temp, cooldown_active.root, name) == 0 &&
+        fsync(cooldown_active.root) == 0) return 0;
+    (void)unlinkat(cooldown_active.root, temp, 0);
+    return -1;
+}
+
+static void cooldown_close(void)
+{
+    if (cooldown_active.guard >= 0) (void)close(cooldown_active.guard);
+    if (cooldown_active.root >= 0) (void)close(cooldown_active.root);
+    cooldown_active.guard = -1; cooldown_active.root = -1;
+}
+
+/* At most 32 immutable repository assignments, 32 state files and 32 locks.
+ * The tiny registry lock protects assignment only; unrelated repositories can
+ * transfer concurrently. Never evict a pending deadline to admit another URL. */
+static int cooldown_open(const char *url, char *error, size_t error_size)
+{
+    char normalized[COOLDOWN_URL_MAX], scope[COOLDOWN_URL_MAX], boot[37], name[32];
+    struct cooldown_record candidate, selected;
+    struct stat st;
+    uint64_t now;
+    int parent = -1, registry = -1, guard = -1, choice, vacant, found, i, status;
+    if (cooldown_active.root >= 0 || cooldown_url(url, normalized) != 0 || cooldown_boot(boot) != 0 ||
+        (now = monotonic_milliseconds()) == UINT64_MAX) goto failed;
+    if (lstat(C1PKG_STATE_ROOT, &st) == 0) {
+        if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0777) != 0700) goto failed;
+    } else if (errno != ENOENT || c1pkg_storage_state_init(error, error_size) != 0) goto failed;
+    parent = open(C1PKG_STATE_ROOT, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (parent < 0 || !cooldown_private(parent, 1)) goto failed;
+    if (mkdirat(parent, "cooldown", 0700) == 0) {
+        if (fsync(parent) != 0) goto failed;
+    } else if (errno != EEXIST) goto failed;
+    cooldown_active.root = openat(parent, "cooldown", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    (void)close(parent); parent = -1;
+    if (cooldown_active.root < 0 || !cooldown_private(cooldown_active.root, 1) ||
+        (registry = cooldown_open_lock(cooldown_active.root, "registry.lock")) < 0) goto failed;
+    for (;;) {
+        if (flock(registry, LOCK_EX | LOCK_NB) != 0) {
+            if (errno != EWOULDBLOCK && errno != EAGAIN) goto failed;
+            if (cooldown_pause(error, error_size) != 0) goto cancelled;
+            continue;
+        }
+        choice = -1; vacant = -1; found = 0; scope[0] = '\0';
+        if (transport_repo_scope[0] != '\0' && cooldown_contains(transport_repo_scope, normalized)) {
+            strcpy(scope, transport_repo_scope); found = 1;
+        }
+        for (i = 0; i < (int)COOLDOWN_SLOTS; ++i) {
+            status = cooldown_read(cooldown_active.root, (unsigned int)i, &candidate);
+            if (status < 0) goto failed;
+            if (status == 1) { if (vacant < 0) vacant = i; continue; }
+            if ((found && strcmp(scope, candidate.scope) == 0) ||
+                (!found && cooldown_contains(candidate.scope, normalized) && strlen(candidate.scope) > strlen(scope))) {
+                choice = i; selected = candidate;
+                if (!found) strcpy(scope, candidate.scope);
+            }
+        }
+        if (choice < 0) {
+            if (vacant < 0) { errno = ENOSPC; goto failed; }
+            if (!found) {
+                char *slash;
+                strcpy(scope, normalized);
+                slash = strrchr(scope + (strncmp(scope, "https://", 8U) == 0 ? 8U : 7U), '/');
+                if (slash != NULL) *slash = '\0';
+            }
+            choice = vacant;
+            memset(&selected, 0, sizeof(selected));
+            strcpy(selected.magic, COOLDOWN_READY); strcpy(selected.scope, scope); strcpy(selected.boot, boot);
+            selected.written_ms = now; selected.until_ms = now;
+        }
+        (void)snprintf(name, sizeof(name), "%02u.lock", (unsigned int)choice);
+        guard = cooldown_open_lock(cooldown_active.root, name);
+        if (guard < 0) goto failed;
+        if (flock(guard, LOCK_EX | LOCK_NB) == 0) break;
+        status = errno;
+        (void)close(guard); guard = -1;
+        (void)flock(registry, LOCK_UN);
+        if ((status != EWOULDBLOCK && status != EAGAIN) || cooldown_pause(error, error_size) != 0) goto cancelled;
+    }
+    /* Another transfer may have atomically updated this slot between our scan
+     * and successful guard acquisition. Never overwrite its fresh deadline with
+     * the scanned copy. Assignments themselves are immutable under registry. */
+    if (choice != vacant) {
+        status = cooldown_read(cooldown_active.root, (unsigned int)choice, &candidate);
+        if (status != 0) goto failed;
+        selected = candidate;
+    }
+    cooldown_active.guard = guard; guard = -1;
+    cooldown_active.slot = (unsigned int)choice;
+    cooldown_active.record = selected;
+    /* A new boot has no trustworthy elapsed RTC time. Restart the accepted
+     * remaining interval on its monotonic clock and persist conversion once.
+     * A same-boot clock rollback remains an independent error. */
+    now = monotonic_milliseconds();
+    if (now == UINT64_MAX) goto failed;
+    if (strcmp(selected.boot, boot) != 0) {
+        strcpy(cooldown_active.record.boot, boot);
+        cooldown_active.record.written_ms = now;
+        cooldown_active.record.until_ms = selected.duration_ms > UINT64_MAX - now ? UINT64_MAX : now + selected.duration_ms;
+    } else if (now < selected.written_ms) goto failed;
+    if (strcmp(selected.magic, COOLDOWN_PENDING) == 0) {
+        uint64_t recovery = now > UINT64_MAX - COOLDOWN_RECOVERY_MS ? UINT64_MAX : now + COOLDOWN_RECOVERY_MS;
+        /* Guard ownership proves the previous request no longer owns the slot.
+         * Consume this marker once; reopening/cancelling the GUI cannot restart
+         * the recovery window. Known server deadlines are never replaced by a
+         * shorter recovery delay. Unknown/lost responses use a bounded policy,
+         * not a claim that their unseen server Retry-After is known. */
+        if (recovery > cooldown_active.record.until_ms) cooldown_active.record.until_ms = recovery;
+        cooldown_active.record.written_ms = now;
+        cooldown_active.record.duration_ms = cooldown_active.record.until_ms == UINT64_MAX ? UINT64_MAX :
+                                             cooldown_active.record.until_ms - now;
+        strcpy(cooldown_active.record.magic, COOLDOWN_READY);
+    }
+    transport_not_before = cooldown_active.record.until_ms;
+    if (cooldown_store() != 0) goto failed;
+    (void)close(registry);
+    return 0;
+failed:
+    c1pkg_set_error(error, error_size, "仓库冷却记录不可用或已损坏；为避免提前请求已停止联网");
+    errno = EAGAIN;
+cancelled:
+    status = errno;
+    if (parent >= 0) (void)close(parent);
+    if (registry >= 0) (void)close(registry);
+    if (guard >= 0) (void)close(guard);
+    cooldown_close();
+    errno = status;
+    return -1;
+}
+
+static int cooldown_commit_state(uint64_t until, const char *magic)
+{
+    uint64_t now = monotonic_milliseconds();
+    if (cooldown_active.root < 0) return 0; /* Pure clock helper tests / local publication delay. */
+    if (now == UINT64_MAX || now < cooldown_active.record.written_ms) return -1;
+    if (until < cooldown_active.record.until_ms) until = cooldown_active.record.until_ms;
+    strcpy(cooldown_active.record.magic, magic);
+    cooldown_active.record.written_ms = now;
+    cooldown_active.record.duration_ms = until == UINT64_MAX ? UINT64_MAX : until > now ? until - now : 0U;
+    cooldown_active.record.until_ms = until == UINT64_MAX ? UINT64_MAX : until > now ? until : now;
+    return cooldown_store();
+}
+
+static int cooldown_commit(uint64_t until)
+{
+    return cooldown_commit_state(until, COOLDOWN_READY);
+}
+
+static int cooldown_begin_request(void)
+{
+    return cooldown_commit_state(transport_not_before, COOLDOWN_PENDING);
+}
+
+static int remember_cooldown(uint64_t seconds)
 {
     uint64_t now = monotonic_milliseconds();
     uint64_t until = seconds > (UINT64_MAX - now) / 1000U ? UINT64_MAX : now + seconds * 1000U;
     if (until > transport_not_before) transport_not_before = until;
+    return now == UINT64_MAX ? -1 : cooldown_commit(transport_not_before);
 }
 
 static int wait_for_cooldown(char *error, size_t error_size)
@@ -98,6 +454,16 @@ static int wait_for_cooldown(char *error, size_t error_size)
     for (;;) {
         uint64_t now = monotonic_milliseconds(), remaining, seconds;
         char message[160];
+        if (now == UINT64_MAX || (cooldown_active.root >= 0 && now < cooldown_active.record.written_ms)) {
+            c1pkg_set_error(error, error_size, "单调时钟异常；已停止仓库请求");
+            errno = EAGAIN;
+            return -1;
+        }
+        if (transport_not_before == UINT64_MAX) {
+            c1pkg_set_error(error, error_size, "仓库冷却期限超出范围；已停止联网");
+            errno = EAGAIN;
+            return -1;
+        }
         if (now >= transport_not_before) return 0;
         remaining = transport_not_before - now;
         seconds = remaining / 1000U + (remaining % 1000U != 0U);
@@ -126,7 +492,11 @@ static int wait_for_cooldown(char *error, size_t error_size)
 
 static int retry_wait(uint64_t seconds, char *error, size_t error_size)
 {
-    remember_cooldown(seconds);
+    if (remember_cooldown(seconds) != 0) {
+        c1pkg_set_error(error, error_size, "无法保存仓库冷却时间");
+        errno = EAGAIN;
+        return -1;
+    }
     return wait_for_cooldown(error, error_size);
 }
 
@@ -340,6 +710,7 @@ static int fetch_endpoint(const char *url, const char *output, uint64_t limit,
         errno = ENAMETOOLONG;
         return -2;
     }
+    if (cooldown_open(url, error, error_size) != 0) return errno == ECANCELED ? -2 : -3;
     /* The caller supplies an installation temporary path, never a live package. */
     descriptor = open(output, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
     if (descriptor < 0) goto io_failed;
@@ -377,6 +748,14 @@ static int fetch_endpoint(const char *url, const char *output, uint64_t limit,
         header_fd = open(headers, O_WRONLY | O_TRUNC | O_CLOEXEC | O_NOFOLLOW);
         if (header_fd < 0) goto io_failed;
         (void)close(header_fd);
+        /* Preserve the known deadline and mark the request before sending.
+         * If interrupted, the next guard owner consumes the marker once into
+         * a bounded recovery wait, never shortening a saved server deadline. */
+        if (cooldown_begin_request() != 0) {
+            saved_errno = EAGAIN; result = -3;
+            c1pkg_set_error(error, error_size, "无法持久保存仓库请求状态；已停止联网");
+            break;
+        }
         transfer = c1pkg_run_bounded(arguments, descriptor, limit - offset, &received,
                                      &exit_code, error, error_size);
         transfer_errno = errno;
@@ -390,7 +769,11 @@ static int fetch_endpoint(const char *url, const char *output, uint64_t limit,
                       (attempt < 3U ? 5U << attempt : 30U) : 1U;
         }
         if (seconds == 0U) seconds = 1U; /* Avoid tight loops for Retry-After: 0. */
-        remember_cooldown(seconds);
+        if (remember_cooldown(seconds) != 0) {
+            saved_errno = EAGAIN; result = -3;
+            c1pkg_set_error(error, error_size, "无法保存服务器冷却时间；已停止后续请求");
+            break;
+        }
         if (transfer == -2 && transfer_errno != EFBIG) {
             saved_errno = transfer_errno; result = -2; break;
         }
@@ -446,6 +829,7 @@ done:
     }
     if (headers_created) (void)unlink(headers);
     if (result != 0 && descriptor >= 0) (void)unlink(output);
+    cooldown_close();
     errno = saved_errno;
     return result;
 }
@@ -472,28 +856,72 @@ int c1pkg_fetch(const char *url, const char *output, uint64_t limit,
     return result == 0 ? 0 : -1;
 }
 
+/* Read one opened regular inode with a hard ceiling, including an EOF probe.
+ * The source can be read-only and untrusted; verify and parse these same bytes,
+ * never reopen an index after signature verification. */
+static int read_local_file(int fd, unsigned char **data, size_t *size, size_t limit,
+                           char *error, size_t error_size)
+{
+    struct stat info;
+    unsigned char *buffer = NULL, extra;
+    size_t used = 0U, length;
+    ssize_t amount;
+    if (fstat(fd, &info) != 0) goto failed;
+    if (!S_ISREG(info.st_mode) || info.st_nlink != 1 || info.st_size < 0 ||
+        (uint64_t)info.st_size > limit) {
+        errno = EINVAL;
+        c1pkg_set_error(error, error_size, "local file is linked, special, or exceeds size limit");
+        return -1;
+    }
+    length = (size_t)info.st_size;
+    buffer = malloc(length + 1U);
+    if (buffer == NULL) goto failed;
+    while (used < length) {
+        size_t chunk = length - used > 16384U ? 16384U : length - used;
+        if (c1pkg_progress(NULL) != 0) { errno = ECANCELED; goto failed; }
+        amount = read(fd, buffer + used, chunk);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) { if (amount == 0) errno = EIO; goto failed; }
+        used += (size_t)amount;
+    }
+    do { amount = read(fd, &extra, 1U); } while (amount < 0 && errno == EINTR);
+    if (amount != 0) { if (amount > 0) errno = EFBIG; goto failed; }
+    buffer[used] = 0U;
+    *data = buffer;
+    *size = used;
+    return 0;
+failed:
+    free(buffer);
+    c1pkg_set_error(error, error_size, "read local file: %s", strerror(errno));
+    return -1;
+}
+
 static int verify_key(const char *key, unsigned char public_key[32],
                       char *error, size_t error_size)
 {
     struct stat information;
     unsigned char *data = NULL;
     size_t size = 0U;
+    int fd = -1, result = -1;
 
-    if (key == NULL || key[0] != '/' || lstat(key, &information) != 0 ||
-        !S_ISREG(information.st_mode) || information.st_nlink != 1 ||
-        information.st_size != 32 || (information.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    /* Inspect and read the same inode, including all parent components. */
+    if (key == NULL || key[0] != '/' ||
+        (fd = c1pkg_local_openat(AT_FDCWD, key, 0, error, error_size)) < 0 ||
+        fstat(fd, &information) != 0 || !S_ISREG(information.st_mode) ||
+        information.st_nlink != 1 || information.st_size != 32 ||
+        (information.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
         c1pkg_set_error(error, error_size,
                         "trusted Ed25519 key missing, unsafe, or not 32 bytes: %s",
                         key != NULL ? key : "(null)");
-        return -1;
+        goto done;
     }
-    if (c1pkg_read_file(key, &data, &size, 32U, error, error_size) != 0 || size != 32U) {
-        free(data);
-        return -1;
-    }
+    if (read_local_file(fd, &data, &size, 32U, error, error_size) != 0 || size != 32U) goto done;
     memcpy(public_key, data, 32U);
+    result = 0;
+done:
     free(data);
-    return 0;
+    if (fd >= 0) (void)close(fd);
+    return result;
 }
 
 static int verify_signature(const char *key, const char *signature, const char *index_path,
@@ -709,6 +1137,45 @@ int c1pkg_repo_parse(const unsigned char *data, size_t size, struct c1pkg_index 
     return result;
 }
 
+int c1pkg_repo_open_local(const struct c1pkg_config *config, const char *directory,
+                          struct c1pkg_index *index, char *error, size_t error_size)
+{
+    unsigned char key[32], *signature = NULL, *data = NULL;
+    size_t signature_size = 0U, size = 0U;
+    int root = -1, signature_fd = -1, index_fd = -1, result = -1;
+    if (config == NULL || index == NULL) {
+        c1pkg_set_error(error, error_size, "missing local repository configuration or index");
+        return -1;
+    }
+    if (verify_key(config->public_key, key, error, error_size) != 0 ||
+        (root = c1pkg_local_openat(AT_FDCWD, directory, 1, error, error_size)) < 0 ||
+        (signature_fd = c1pkg_local_openat(root, "index.v1.sig", 0, error, error_size)) < 0 ||
+        read_local_file(signature_fd, &signature, &signature_size, 64U, error, error_size) != 0)
+        goto done;
+    if (signature_size != 64U) {
+        c1pkg_set_error(error, error_size, "repository signature must be 64 bytes");
+        goto done;
+    }
+    if ((index_fd = c1pkg_local_openat(root, "index.v1", 0, error, error_size)) < 0 ||
+        read_local_file(index_fd, &data, &size, C1PKG_INDEX_MAX, error, error_size) != 0) goto done;
+    if (ed25519_verify(signature, data, size, key) != 1) {
+        c1pkg_set_error(error, error_size, "repository Ed25519 signature rejected");
+        goto done;
+    }
+    if (c1pkg_repo_parse(data, size, index, error, error_size) != 0) goto done;
+    /* Offline bundles have independent sequences. Do not touch the online
+     * cache or rollback floor; the store still enforces per-package versions. */
+    result = root;
+    root = -1;
+done:
+    if (signature_fd >= 0) (void)close(signature_fd);
+    if (index_fd >= 0) (void)close(index_fd);
+    if (root >= 0) (void)close(root);
+    free(signature);
+    free(data);
+    return result;
+}
+
 static int parse_index_file(const char *path, struct c1pkg_index *index,
                             char *error, size_t error_size)
 {
@@ -799,6 +1266,10 @@ int c1pkg_repo_load_cached(const struct c1pkg_config *config, struct c1pkg_index
     struct c1pkg_index *candidate = calloc(1U, sizeof(*candidate));
     int result = -1;
     if (candidate == NULL || config == NULL || index == NULL) goto done;
+    /* This in-memory hint only identifies package URLs. The deadline itself is
+     * always loaded under the persistent guard; a refresh child's hint need not
+     * propagate to its parent, since the parent also matches registered scopes. */
+    (void)c1pkg_repo_bind_transport(config);
     if (access(C1PKG_STATE_ROOT "/cache/verified.v1", F_OK) != 0 && errno == ENOENT) {
         /* Migrate legacy caches only after re-verification and rollback checking. */
         if (verify_signature(config->public_key, C1PKG_STATE_ROOT "/cache/index.v1.sig",
@@ -853,6 +1324,11 @@ int c1pkg_repo_refresh(const struct c1pkg_config *config, struct c1pkg_index *in
 
     if (config == NULL || !valid_url_base(config->repo_base)) {
         c1pkg_set_error(error, error_size, "Configure repository.url or --repo URL");
+        return -1;
+    }
+    if (c1pkg_repo_bind_transport(config) != 0) {
+        transport_repo_scope[0] = '\0';
+        c1pkg_set_error(error, error_size, "仓库地址不能安全确定冷却作用域");
         return -1;
     }
     if (index == NULL || c1pkg_storage_state_init(error, error_size) != 0 ||

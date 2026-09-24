@@ -28,6 +28,8 @@
 #define C1_WIFI_FACTORY_CTRL_DIR "/var/run/wpa_supplicant"
 #define C1_WIFI_DATA_DIR "/usr/data/c1/wifi"
 #define C1_WIFI_CONFIG C1_WIFI_DATA_DIR "/wpa_supplicant.conf"
+#define C1_WIFI_FACTORY_CONFIG "/usr/resource/wpa_supplicant.conf"
+#define C1_WIFI_DISABLED_MARKER C1_WIFI_RUN_DIR "/wifi.disabled"
 #define C1_WIFI_PID C1_WIFI_RUN_DIR "/wpa_supplicant.pid"
 #define C1_WIFI_DHCP_PID C1_WIFI_RUN_DIR "/udhcpc.pid"
 #define C1_WIFI_OUTPUT_CAPACITY 4096U
@@ -41,6 +43,8 @@
 #define C1_WIFI_INTERFACE_SYSFS "/sys/class/net/wlan0"
 #define C1_WIFI_PHY_SYSFS C1_WIFI_INTERFACE_SYSFS "/phy80211"
 #define C1_WIFI_HARDWARE_MS 6000
+#define C1_WIFI_RECOVERY_MS 6000
+#define C1_WIFI_SDIO_DRIVER "/sys/bus/sdio/drivers/atbm_wlan"
 #define C1_WIFI_OBSERVE_MS 40
 #define C1_WIFI_OBSERVE_CACHE_MS 1000
 /* Standard wpa_supplicant control replies have a 4096-byte buffer. Reserve
@@ -67,11 +71,40 @@ static bool restoring;
 /* Initial DISABLED means unobserved, not an explicit request to disconnect. */
 static bool explicitly_disabled;
 static bool scan_profiles_valid;
+static bool using_factory_control;
+static const char *control_directory(void)
+{
+    return using_factory_control ? C1_WIFI_FACTORY_CTRL_DIR : C1_WIFI_CTRL_DIR;
+}
+static bool ensure_directory(const char *path);
+static const char *config_path(void)
+{
+    return using_factory_control ? C1_WIFI_FACTORY_CONFIG : C1_WIFI_CONFIG;
+}
+static const char *config_directory(void)
+{
+    return using_factory_control ? "/usr/resource" : C1_WIFI_DATA_DIR;
+}
+static bool disabled_marker_present(void)
+{
+    struct stat info;
+    return stat(C1_WIFI_DISABLED_MARKER, &info) == 0 && S_ISREG(info.st_mode);
+}
+static bool set_disabled_marker(bool disabled)
+{
+    int descriptor;
+    if (!ensure_directory(C1_WIFI_RUN_DIR)) return false;
+    if (!disabled) return unlink(C1_WIFI_DISABLED_MARKER) == 0 || errno == ENOENT;
+    descriptor = open(C1_WIFI_DISABLED_MARKER, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor < 0) return false;
+    return close(descriptor) == 0;
+}
 static int scan_profile_saved(const char *ssid, c1_wifi_security security);
 static struct {
     bool valid;
     bool connected;
     bool control_available;
+    bool interface_disabled;
     c1_wifi_state context_state;
     char target[C1_WIFI_SSID_CAPACITY];
     char ssid[C1_WIFI_SSID_CAPACITY];
@@ -215,17 +248,23 @@ static void close_control(int descriptor)
 static bool receive_control(int descriptor, char *output, size_t capacity, int timeout_ms)
 {
     struct pollfd readable = {descriptor, POLLIN, 0};
+    int64_t deadline = monotonic_ms() + timeout_ms;
     ssize_t count;
-    if (capacity < 2U || timeout_ms <= 0 ||
-        poll(&readable, 1U, timeout_ms) <= 0 || !(readable.revents & POLLIN)) {
-        return false;
+    if (capacity < 2U || timeout_ms <= 0) return false;
+    for (;;) {
+        int64_t left = deadline - monotonic_ms();
+        int result;
+        if (left <= 0) return false;
+        readable.revents = 0;
+        result = poll(&readable, 1U, (int)left);
+        if (result < 0 && errno == EINTR) continue;
+        if (result <= 0 || !(readable.revents & POLLIN)) return false;
+        count = recv(descriptor, output, capacity - 1U, MSG_TRUNC);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        if (count < 0 || (size_t)count >= capacity) return false;
+        output[count] = '\0';
+        return true;
     }
-    count = recv(descriptor, output, capacity - 1U, MSG_TRUNC);
-    if (count < 0 || (size_t)count >= capacity) {
-        return false;
-    }
-    output[count] = '\0';
-    return true;
 }
 
 static bool command_at(const char *directory, const char *command,
@@ -256,7 +295,7 @@ static bool reply_is(const char *output, const char *expected)
 
 static bool real_command(const char *command, char *output, size_t capacity, int timeout_ms)
 {
-    return command_at(C1_WIFI_CTRL_DIR, command, output, capacity, timeout_ms);
+    return command_at(control_directory(), command, output, capacity, timeout_ms);
 }
 
 static bool query_observed_status(const char *directory, char *output, size_t capacity, int timeout_ms)
@@ -344,7 +383,7 @@ static bool ensure_directory(const char *path)
 static bool secure_config(void)
 {
     struct stat info;
-    int descriptor = open(C1_WIFI_CONFIG, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    int descriptor = open(config_path(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     bool success;
     if (descriptor < 0) {
         return false;
@@ -361,7 +400,7 @@ static bool read_config_backup(config_backup *backup)
     struct stat info;
     size_t offset = 0U;
     if (!secure_config()) return false;
-    descriptor = open(C1_WIFI_CONFIG, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    descriptor = open(config_path(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (descriptor < 0) return false;
     if (fstat(descriptor, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0 ||
         info.st_size > (off_t)C1_WIFI_SCAN_CAPACITY) {
@@ -390,7 +429,7 @@ static bool restore_config_backup(const config_backup *backup)
     int directory;
     size_t offset = 0U;
     bool success;
-    snprintf(temporary, sizeof(temporary), C1_WIFI_CONFIG ".restore-%ld", (long)getpid());
+    snprintf(temporary, sizeof(temporary), "%s.restore-%ld", config_path(), (long)getpid());
     descriptor = open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (descriptor < 0) return false;
     while (offset < backup->size) {
@@ -400,12 +439,12 @@ static bool restore_config_backup(const config_backup *backup)
     }
     success = offset == backup->size && fsync(descriptor) == 0;
     if (close(descriptor) != 0) success = false;
-    if (success) success = rename(temporary, C1_WIFI_CONFIG) == 0;
+    if (success) success = rename(temporary, config_path()) == 0;
     if (!success) {
         unlink(temporary);
         return false;
     }
-    directory = open(C1_WIFI_DATA_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    directory = open(config_directory(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (directory < 0) return false;
     success = fsync(directory) == 0;
     close(directory);
@@ -421,7 +460,7 @@ static bool write_runtime_config(void)
         !ensure_directory(C1_WIFI_DATA_DIR)) {
         return false;
     }
-    descriptor = open(C1_WIFI_CONFIG, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    descriptor = open(config_path(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (descriptor < 0) {
         return errno == EEXIST && secure_config();
     }
@@ -431,7 +470,7 @@ static bool write_runtime_config(void)
         success = false;
     }
     if (!success) {
-        unlink(C1_WIFI_CONFIG);
+        unlink(config_path());
     }
     return success;
 }
@@ -588,6 +627,74 @@ static bool read_sysfs_at(int directory, const char *name, char *value, size_t c
     return true;
 }
 
+/* A failed SDIO probe can leave a live module with no wlan0. The vendor
+ * driver's insmod_stat is 0 in that state and 1 once the netdev exists. Only
+ * that positively identified failed, unused module may be retried. Unknown
+ * sysfs state, module dependants and bound SDIO devices all refuse recovery. */
+static bool module_probe_failed_at(const char *module_path, const char *driver_path)
+{
+    char value[32];
+    int module = open(module_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    bool safe = module >= 0;
+    if (module < 0) return false;
+    safe = read_sysfs_at(module, "initstate", value, sizeof(value)) && strcmp(value, "live") == 0 &&
+           read_sysfs_at(module, "refcnt", value, sizeof(value)) && strcmp(value, "0") == 0 &&
+           read_sysfs_at(module, "parameters/insmod_stat", value, sizeof(value)) && strcmp(value, "0") == 0;
+    if (safe) {
+        int holders = openat(module, "holders", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        DIR *directory = holders >= 0 ? fdopendir(holders) : NULL;
+        struct dirent *entry;
+        safe = directory != NULL;
+        if (directory != NULL) {
+            errno = 0;
+            while ((entry = readdir(directory)) != NULL) {
+                if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..")) safe = false;
+            }
+            if (errno != 0) safe = false;
+            closedir(directory);
+        } else if (holders >= 0) close(holders);
+    }
+    close(module);
+    if (safe) {
+        int driver = open(driver_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        DIR *directory = driver >= 0 ? fdopendir(driver) : NULL;
+        struct dirent *entry;
+        safe = directory != NULL;
+        if (directory != NULL) {
+            errno = 0;
+            while ((entry = readdir(directory)) != NULL) {
+                if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..") &&
+                    strcmp(entry->d_name, "bind") && strcmp(entry->d_name, "unbind") &&
+                    strcmp(entry->d_name, "uevent")) safe = false;
+            }
+            if (errno != 0) safe = false;
+            closedir(directory);
+        } else if (driver >= 0) close(driver);
+    }
+    return safe;
+}
+
+static bool wifi_module_recovery_safe(void)
+{
+    struct stat info;
+    bool any;
+    /* lstat also refuses a dangling wlan0 symlink. Never equate access errors
+     * with an absent interface or stop somebody else's networking process. */
+    if (lstat(C1_WIFI_INTERFACE_SYSFS, &info) == 0 || errno != ENOENT) return false;
+    if (!module_probe_failed_at(C1_WIFI_MODULE_SYSFS, C1_WIFI_SDIO_DRIVER)) return false;
+    if (!inspect_processes("wpa_supplicant", false, &any) || any) return false;
+    return inspect_processes("udhcpc", false, &any) && !any;
+}
+
+static bool unload_failed_wifi_module(int timeout_ms)
+{
+    char *const argv[] = {"rmmod", "atbm603x_wifi_sdio", NULL};
+    const char *binary = access("/sbin/rmmod", X_OK) == 0 ? "/sbin/rmmod" : "/bin/rmmod";
+    /* Recheck immediately before normal (never forced) removal. */
+    return timeout_ms > 0 && continue_operation() && wifi_module_recovery_safe() &&
+           run_program(binary, argv, timeout_ms);
+}
+
 static bool clear_radio_soft_block(int radio)
 {
     int descriptor = openat(radio, "soft", O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
@@ -654,8 +761,21 @@ static struct {
     bool (*enable)(bool);
     int64_t (*now)(void);
     void (*sleep)(long);
+    bool (*recovery_safe)(void);
+    bool (*unload_failed_module)(int);
 } hardware_io = {hardware_exists, load_wifi_module, unblock_wifi_radio,
-                 set_interface_enabled, monotonic_ms, sleep_milliseconds};
+                 set_interface_enabled, monotonic_ms, sleep_milliseconds,
+                 wifi_module_recovery_safe, unload_failed_wifi_module};
+
+static void wait_for_wifi_interface(int64_t deadline)
+{
+    while (!hardware_io.exists(C1_WIFI_INTERFACE_SYSFS) &&
+           hardware_io.now() < deadline && continue_operation()) {
+        int64_t left = deadline - hardware_io.now();
+        if (left <= 0) break;
+        hardware_io.sleep(left < 100 ? (long)left : 100L);
+    }
+}
 
 static bool prepare_wifi_hardware(void)
 {
@@ -673,11 +793,29 @@ static bool prepare_wifi_hardware(void)
                 return false;
             }
         }
-        while (!hardware_io.exists(C1_WIFI_INTERFACE_SYSFS) &&
-               hardware_io.now() < deadline && continue_operation()) {
+        wait_for_wifi_interface(deadline);
+        if (!hardware_io.exists(C1_WIFI_INTERFACE_SYSFS) && continue_operation() &&
+            remaining_ms(C1_WIFI_RECOVERY_MS) > 0 && hardware_io.recovery_safe()) {
+            /* One recovery attempt inside the scan/connect total deadline.
+             * Keep normal cold start's 6 s grace: a slow probe is not failure.
+             * Do not clear credentials, use vendor scripts or force removal. */
+            budget = remaining_ms(C1_WIFI_RECOVERY_MS);
+            deadline = hardware_io.now() + budget;
+            if (!hardware_io.unload_failed_module(budget < 1000 ? budget : 1000)) {
+                set_error("WI-FI FAILED DRIVER RECOVERY REFUSED");
+                return false;
+            }
             int64_t left = deadline - hardware_io.now();
-            if (left <= 0) break;
-            hardware_io.sleep(left < 100 ? (long)left : 100L);
+            if (left <= 0 || !continue_operation()) return false;
+            int load_budget = remaining_ms(left < 4000 ? (int)left : 4000);
+            if (load_budget <= 0 || !continue_operation()) return false;
+            bool loaded = hardware_io.load_module(load_budget);
+            if (!loaded && !hardware_io.exists(C1_WIFI_MODULE_SYSFS) &&
+                !hardware_io.exists(C1_WIFI_INTERFACE_SYSFS)) {
+                set_error("WI-FI MODULE LOAD FAILED");
+                return false;
+            }
+            wait_for_wifi_interface(deadline);
         }
         if (!hardware_io.exists(C1_WIFI_INTERFACE_SYSFS)) {
             set_error("WLAN0 INITIALIZATION TIMED OUT");
@@ -705,12 +843,19 @@ static bool ensure_wifi_ready(void)
         return false;
     }
     if (control_ready_at(C1_WIFI_CTRL_DIR)) {
+        using_factory_control = false;
+        return prepare_wifi_hardware();
+    }
+    if (control_ready_at(C1_WIFI_FACTORY_CTRL_DIR)) {
+        /* The firmware's S40network/wifi_up.sh already owns wlan0. Adopt its
+         * control socket instead of creating a second supplicant that can race
+         * it; all commands remain scoped to this interface. */
+        using_factory_control = true;
         return prepare_wifi_hardware();
     }
     /* Never take over a factory supplicant or invoke vendor scripts which may
      * use global killall. Existing foreign wlan0 ownership is explicit. */
-    if (control_ready_at(C1_WIFI_FACTORY_CTRL_DIR) ||
-        !inspect_processes("wpa_supplicant", false, &any) || any) {
+    if (!inspect_processes("wpa_supplicant", false, &any) || any) {
         set_error("WLAN0 OWNED BY ANOTHER SERVICE");
         return false;
     }
@@ -719,9 +864,12 @@ static bool ensure_wifi_ready(void)
         set_error("RUNTIME CONFIG FAILED");
         return false;
     }
+    using_factory_control = false;
     {
+        char config_file[PATH_MAX];
         char *const argv[] = {"wpa_supplicant", "-B", "-D", "nl80211", "-i", "wlan0",
-                              "-c", C1_WIFI_CONFIG, "-P", C1_WIFI_PID, NULL};
+                              "-c", config_file, "-P", C1_WIFI_PID, NULL};
+        snprintf(config_file, sizeof(config_file), "%s", config_path());
         const char *binary = access("/usr/sbin/wpa_supplicant", X_OK) == 0
                                  ? "/usr/sbin/wpa_supplicant" : "/sbin/wpa_supplicant";
         if (!run_program(binary, argv, remaining_ms(4000))) {
@@ -743,7 +891,7 @@ static bool ensure_wifi_ready(void)
 static int scan_events_open(void)
 {
     char output[256];
-    int descriptor = open_control(C1_WIFI_CTRL_DIR);
+    int descriptor = open_control(control_directory());
     if (descriptor >= 0 && send(descriptor, "ATTACH", 6U, 0) == 6 &&
         receive_control(descriptor, output, sizeof(output), remaining_ms(750)) && reply_is(output, "OK")) {
         return descriptor;
@@ -831,7 +979,7 @@ static void begin_operation(const c1_wifi_operation_options *options, int timeou
     active_options = options;
     scan_profiles_valid = false;
     observation.valid = false;
-    explicitly_disabled = false;
+    explicitly_disabled = disabled_marker_present();
     operation_cancelled = false;
     restoring = false;
     operation_deadline = wifi_io.now() + timeout_ms;
@@ -1121,7 +1269,7 @@ bool c1_wifi_read_snapshot(c1_wifi_snapshot *snapshot)
     snprintf(snapshot->error, sizeof(snapshot->error), "%s", last_error);
     /* Busy/error/explicit-off state has precedence over cached observation.
      * Only initial unobserved DISABLED is eligible for passive discovery. */
-    if (explicitly_disabled || current_state == C1_WIFI_ERROR || current_state == C1_WIFI_CONNECTING ||
+    if (explicitly_disabled || disabled_marker_present() || current_state == C1_WIFI_ERROR || current_state == C1_WIFI_CONNECTING ||
         current_state == C1_WIFI_SCANNING) {
         observation.valid = false;
         return true;
@@ -1145,9 +1293,15 @@ bool c1_wifi_read_snapshot(c1_wifi_snapshot *snapshot)
             if (!received && wifi_io.now() < deadline) {
                 received = wifi_io.observe_status(C1_WIFI_FACTORY_CTRL_DIR, output, sizeof(output),
                                                    (int)(deadline - wifi_io.now()));
+                if (received) using_factory_control = true;
             }
         }
         observation.control_available = received;
+        if (received) {
+            char state[32];
+            observation.interface_disabled = status_value(output, "wpa_state", state, sizeof(state)) &&
+                                             strcmp(state, "INTERFACE_DISABLED") == 0;
+        }
         observation.connected = received &&
             completed_status(output, target[0] != '\0' ? target : NULL, -1,
                              observation.ssid, sizeof(observation.ssid)) &&
@@ -1163,6 +1317,10 @@ bool c1_wifi_read_snapshot(c1_wifi_snapshot *snapshot)
         snapshot->state = C1_WIFI_CONNECTED;
         snprintf(snapshot->connected_ssid, sizeof(snapshot->connected_ssid), "%s", observation.ssid);
         snprintf(snapshot->ipv4, sizeof(snapshot->ipv4), "%s", observation.ipv4);
+    } else if (observation.interface_disabled) {
+        /* Off keeps the daemon/socket alive. After a UI restart, a reachable
+         * control socket alone must not turn the switch back into READY. */
+        snapshot->state = C1_WIFI_DISABLED;
     } else if (current_state != C1_WIFI_DISABLED || observation.control_available) {
         snapshot->state = C1_WIFI_READY;
     }
@@ -1211,27 +1369,64 @@ static c1_status end_operation(c1_status result, c1_wifi_snapshot *snapshot)
 
 static bool prepare_scan_profiles(void);
 
+/* Bringing IFF_UP back up is asynchronous to the supplicant's netlink event
+ * loop. A PONG only proves the control socket is alive, including while the
+ * interface is still INTERFACE_DISABLED after our own disable/pause. */
+static bool wait_interface_enabled(void)
+{
+    char output[C1_WIFI_OUTPUT_CAPACITY], state[32];
+    int64_t deadline = wifi_io.now() + remaining_ms(C1_WIFI_HARDWARE_MS);
+    while (continue_operation() && wifi_io.now() < deadline) {
+        if (command("STATUS", output, sizeof(output)) &&
+            status_value(output, "wpa_state", state, sizeof(state)) &&
+            strcmp(state, "INTERFACE_DISABLED") != 0) return true;
+        int delay = remaining_ms(100);
+        if (delay > 0) wifi_io.sleep(delay);
+    }
+    set_error("WLAN0 ENABLE FAILED");
+    return false;
+}
+
 c1_status c1_wifi_scan_ex(const c1_wifi_operation_options *options, c1_wifi_snapshot *snapshot)
 {
     int events = -1;
     c1_status result = C1_STATUS_IO_ERROR;
     begin_operation(options, C1_WIFI_SCAN_MS);
     current_state = C1_WIFI_SCANNING;
-    if (!continue_operation() || !wifi_io.ready()) return end_operation(C1_STATUS_UNAVAILABLE, snapshot);
+    if (!continue_operation() || !wifi_io.ready() || !wait_interface_enabled())
+        return end_operation(C1_STATUS_UNAVAILABLE, snapshot);
+    (void)set_disabled_marker(false);
+    explicitly_disabled = false;
     current_phase = C1_WIFI_PHASE_SCANNING;
-    /* Discard prior BSS cache entries before starting. Associated entries may
-     * be retained by wpa_supplicant; all other rows come from this scan. */
-    if (!command_ok("BSS_FLUSH 0")) {
-        set_error("FRESH SCAN UNSUPPORTED");
-        return end_operation(C1_STATUS_UNSUPPORTED, snapshot);
-    }
-    /* Attach BEFORE SCAN; do not accept old SCAN_RESULTS while a scan runs. */
-    events = wifi_io.events_open();
-    if (events < 0 || !command_ok("SCAN")) {
-        set_error("SCAN START FAILED");
-        goto finished;
-    }
     while (continue_operation()) {
+        char output[128];
+        /* A saved profile can already be doing its automatic startup scan.
+         * FAIL-BUSY is retryable, not a permanent SCAN START FAILED. Each retry
+         * discards that scan's event subscription and BSS cache, so its results
+         * cannot be mistaken for completion of our newly accepted request. */
+        if (!command_ok("BSS_FLUSH 0")) {
+            set_error("FRESH SCAN UNSUPPORTED");
+            result = C1_STATUS_UNSUPPORTED;
+            goto finished;
+        }
+        events = wifi_io.events_open();
+        if (events < 0 || !command("SCAN", output, sizeof(output))) {
+            set_error("SCAN START FAILED");
+            goto finished;
+        }
+        if (reply_is(output, "OK")) break;
+        if (!reply_is(output, "FAIL-BUSY")) {
+            set_error("SCAN START FAILED");
+            goto finished;
+        }
+        int wait = remaining_ms(250);
+        if (wait > 0) (void)wifi_io.events_wait(events, wait);
+        wifi_io.events_close(events);
+        events = -1;
+        int delay = remaining_ms(100);
+        if (delay > 0) wifi_io.sleep(delay);
+    }
+    while (events >= 0 && continue_operation()) {
         int event = wifi_io.events_wait(events, remaining_ms(250));
         if (event < 0) {
             set_error("SCAN FAILED");
@@ -1266,22 +1461,156 @@ c1_status c1_wifi_scan(c1_wifi_snapshot *snapshot)
     return c1_wifi_scan_ex(NULL, snapshot);
 }
 
-static bool quote_wpa_value(const char *value, char *quoted, size_t capacity)
+/* WPA/WPA2 specifies PBKDF2-HMAC-SHA1, 4096 rounds, a 256-bit result.
+ * Derive locally and send the 64 hex digits: wpa_config_parse_psk does NOT
+ * unescape quoted strings, while its config-file comment parser can truncate
+ * a literal quote followed by '#'. Hex PSKs survive both control and file
+ * parsing unchanged. SHA-1 is used only for this mandated legacy KDF, never
+ * as a signature or collision-resistant digest. No new runtime dependency. */
+typedef struct {
+    uint32_t state[5];
+    uint64_t bytes;
+    unsigned char block[64];
+    size_t used;
+} wifi_sha1;
+
+static uint32_t rotate_left(uint32_t value, unsigned int bits)
 {
-    size_t input;
-    size_t output = 0U;
-    if (strlen(value) > 63U || capacity < 3U) return false;
-    quoted[output++] = '"';
-    for (input = 0U; value[input] != '\0'; ++input) {
-        unsigned char character = (unsigned char)value[input];
-        if (character < 32U || character > 126U) return false;
-        if (output + 3U >= capacity) return false;
-        if (character == '"' || character == '\\') quoted[output++] = '\\';
-        quoted[output++] = (char)character;
+    return (value << bits) | (value >> (32U - bits));
+}
+
+static void wifi_sha1_transform(wifi_sha1 *context)
+{
+    uint32_t words[80];
+    uint32_t a = context->state[0], b = context->state[1], c = context->state[2];
+    uint32_t d = context->state[3], e = context->state[4];
+    for (size_t i = 0U; i < 16U; ++i) {
+        const unsigned char *p = context->block + i * 4U;
+        words[i] = (uint32_t)p[0] << 24U | (uint32_t)p[1] << 16U |
+                   (uint32_t)p[2] << 8U | (uint32_t)p[3];
     }
-    quoted[output++] = '"';
-    quoted[output] = '\0';
+    for (size_t i = 16U; i < 80U; ++i)
+        words[i] = rotate_left(words[i - 3U] ^ words[i - 8U] ^ words[i - 14U] ^ words[i - 16U], 1U);
+    for (size_t i = 0U; i < 80U; ++i) {
+        uint32_t f, k;
+        if (i < 20U) { f = (b & c) | (~b & d); k = UINT32_C(0x5a827999); }
+        else if (i < 40U) { f = b ^ c ^ d; k = UINT32_C(0x6ed9eba1); }
+        else if (i < 60U) { f = (b & c) | (b & d) | (c & d); k = UINT32_C(0x8f1bbcdc); }
+        else { f = b ^ c ^ d; k = UINT32_C(0xca62c1d6); }
+        uint32_t next = rotate_left(a, 5U) + f + e + k + words[i];
+        e = d; d = c; c = rotate_left(b, 30U); b = a; a = next;
+    }
+    context->state[0] += a; context->state[1] += b; context->state[2] += c;
+    context->state[3] += d; context->state[4] += e;
+    secure_clear(words, sizeof(words));
+}
+
+static void wifi_sha1_init(wifi_sha1 *context)
+{
+    memset(context, 0, sizeof(*context));
+    context->state[0] = UINT32_C(0x67452301);
+    context->state[1] = UINT32_C(0xefcdab89);
+    context->state[2] = UINT32_C(0x98badcfe);
+    context->state[3] = UINT32_C(0x10325476);
+    context->state[4] = UINT32_C(0xc3d2e1f0);
+}
+
+static void wifi_sha1_update(wifi_sha1 *context, const unsigned char *bytes, size_t size)
+{
+    context->bytes += size;
+    while (size > 0U) {
+        size_t take = sizeof(context->block) - context->used;
+        if (take > size) take = size;
+        memcpy(context->block + context->used, bytes, take);
+        context->used += take;
+        bytes += take;
+        size -= take;
+        if (context->used == sizeof(context->block)) {
+            wifi_sha1_transform(context);
+            context->used = 0U;
+        }
+    }
+}
+
+static void wifi_sha1_finish(wifi_sha1 *context, unsigned char digest[20])
+{
+    unsigned char padding[64] = {0x80U};
+    unsigned char length[8];
+    uint64_t bits = context->bytes * 8U;
+    size_t count = context->used < 56U ? 56U - context->used : 120U - context->used;
+    for (size_t i = 0U; i < 8U; ++i) length[7U - i] = (unsigned char)(bits >> (i * 8U));
+    wifi_sha1_update(context, padding, count);
+    wifi_sha1_update(context, length, sizeof(length));
+    for (size_t i = 0U; i < 20U; ++i)
+        digest[i] = (unsigned char)(context->state[i / 4U] >> ((3U - i % 4U) * 8U));
+    secure_clear(context, sizeof(*context));
+}
+
+static void wifi_hmac_sha1(const wifi_sha1 *inner, const wifi_sha1 *outer,
+                           const unsigned char *bytes, size_t size, unsigned char digest[20])
+{
+    wifi_sha1 context = *inner;
+    unsigned char temporary[20];
+    wifi_sha1_update(&context, bytes, size);
+    wifi_sha1_finish(&context, temporary);
+    context = *outer;
+    wifi_sha1_update(&context, temporary, sizeof(temporary));
+    wifi_sha1_finish(&context, digest);
+    secure_clear(temporary, sizeof(temporary));
+}
+
+static bool valid_wpa_passphrase(const char *password)
+{
+    size_t length = strlen(password);
+    if (length < 8U || length > 63U) return false;
+    for (size_t i = 0U; i < length; ++i) {
+        if ((unsigned char)password[i] < 32U || (unsigned char)password[i] > 126U) return false;
+    }
     return true;
+}
+
+static bool derive_wpa_psk(const char *ssid, const char *password, char output[65])
+{
+    static const char hex[] = "0123456789abcdef";
+    unsigned char pad[64] = {0}, salt[36] = {0}, u[20] = {0}, block[20] = {0}, key[32] = {0};
+    wifi_sha1 inner, outer;
+    size_t ssid_size = strlen(ssid), password_size = strlen(password);
+    bool success = false;
+    output[0] = '\0';
+    if (ssid_size == 0U || ssid_size > 32U || !valid_wpa_passphrase(password)) return false;
+    for (size_t i = 0U; i < sizeof(pad); ++i)
+        pad[i] = (unsigned char)((i < password_size ? (unsigned char)password[i] : 0U) ^ 0x36U);
+    wifi_sha1_init(&inner);
+    wifi_sha1_update(&inner, pad, sizeof(pad));
+    for (size_t i = 0U; i < sizeof(pad); ++i) pad[i] ^= 0x36U ^ 0x5cU;
+    wifi_sha1_init(&outer);
+    wifi_sha1_update(&outer, pad, sizeof(pad));
+    memcpy(salt, ssid, ssid_size);
+    for (unsigned int index = 1U; index <= 2U; ++index) {
+        salt[ssid_size + 3U] = (unsigned char)index;
+        wifi_hmac_sha1(&inner, &outer, salt, ssid_size + 4U, u);
+        memcpy(block, u, sizeof(block));
+        for (unsigned int round = 1U; round < 4096U; ++round) {
+            /* Keep cancellation/heartbeat and the enclosing deadline live
+             * even on the low-power target; no subprocess sees the secret. */
+            if (round % 64U == 1U && !continue_operation()) goto finished;
+            wifi_hmac_sha1(&inner, &outer, u, sizeof(u), u);
+            for (size_t i = 0U; i < sizeof(block); ++i) block[i] ^= u[i];
+        }
+        memcpy(key + (index - 1U) * 20U, block, index == 1U ? 20U : 12U);
+    }
+    if (!continue_operation()) goto finished;
+    for (size_t i = 0U; i < sizeof(key); ++i) {
+        output[i * 2U] = hex[key[i] >> 4U];
+        output[i * 2U + 1U] = hex[key[i] & 15U];
+    }
+    output[64] = '\0';
+    success = true;
+finished:
+    secure_clear(&inner, sizeof(inner)); secure_clear(&outer, sizeof(outer));
+    secure_clear(pad, sizeof(pad)); secure_clear(salt, sizeof(salt));
+    secure_clear(u, sizeof(u)); secure_clear(block, sizeof(block)); secure_clear(key, sizeof(key));
+    return success;
 }
 
 typedef struct {
@@ -1296,6 +1625,7 @@ typedef struct {
     int previous_id;
     char previous_ssid[C1_WIFI_SSID_CAPACITY];
     bool previous_completed;
+    bool previous_disconnected;
 } connection_backup;
 
 static bool capture_networks(connection_backup *backup)
@@ -1304,13 +1634,15 @@ static bool capture_networks(connection_backup *backup)
     char request[64] = "LIST_NETWORKS";
     char *line;
     char *save;
-    char id[16];
+    char id[16], state[32];
     int last_id = -1;
     memset(backup, 0, sizeof(*backup));
     backup->previous_id = -1;
     if (!command("STATUS", output, sizeof(output))) return false;
     backup->previous_completed = completed_status(output, NULL, -1,
                                                   backup->previous_ssid, sizeof(backup->previous_ssid));
+    backup->previous_disconnected = status_value(output, "wpa_state", state, sizeof(state)) &&
+                                    strcmp(state, "DISCONNECTED") == 0;
     if (status_value(output, "id", id, sizeof(id)) &&
         !parse_integer(id, 0, INT_MAX, &backup->previous_id)) return false;
     /* A short, newline-terminated reply has room for the maximum next row,
@@ -1480,6 +1812,10 @@ static bool rollback_connection(const connection_backup *backup, int new_id, boo
         success = false;
     }
     if (!restore_enabled(backup, -1)) success = false;
+    /* ENABLE_NETWORK can itself start association. Restore explicit
+     * disconnected state AFTER enabled bits, otherwise that state is undone
+     * by the last enabled profile (including a failed saved reconnect). */
+    if (backup->previous_disconnected && !command_ok("DISCONNECT")) success = false;
     if (selected && backup->previous_completed) {
         if (!wait_authenticated(backup->previous_ssid, backup->previous_id, 4000)) {
             success = false;
@@ -1498,7 +1834,7 @@ static c1_status connect_profile(const char *ssid, const char *password, c1_wifi
 {
     char output[C1_WIFI_OUTPUT_CAPACITY];
     char encoded_ssid[C1_WIFI_SSID_CAPACITY * 2U];
-    char quoted_password[132] = {0};
+    char encoded_psk[65] = {0};
     char text[256] = {0};
     char actual[C1_WIFI_SSID_CAPACITY];
     char ip[C1_WIFI_IP_CAPACITY];
@@ -1526,11 +1862,13 @@ static c1_status connect_profile(const char *ssid, const char *password, c1_wifi
     }
     password_length = password != NULL ? strlen(password) : 0U;
     if (!use_saved && ((security == C1_WIFI_SECURITY_OPEN && password_length != 0U) ||
-        (security == C1_WIFI_SECURITY_WPA_PSK &&
-         (password_length < 8U || password_length > 63U ||
-          !quote_wpa_value(password, quoted_password, sizeof(quoted_password)))))) {
+        (security == C1_WIFI_SECURITY_WPA_PSK && !valid_wpa_passphrase(password)))) {
         set_error("INVALID PASSWORD (PSK: 8-63 ASCII)");
         result = C1_STATUS_INVALID_ARGUMENT;
+        goto finished;
+    }
+    if (!use_saved && security == C1_WIFI_SECURITY_WPA_PSK && !derive_wpa_psk(ssid, password, encoded_psk)) {
+        set_error("CREDENTIAL PREPARATION FAILED");
         goto finished;
     }
     if (!continue_operation() || !wifi_io.ready()) {
@@ -1542,6 +1880,12 @@ static c1_status connect_profile(const char *ssid, const char *password, c1_wifi
         result = C1_STATUS_UNAVAILABLE;
         goto finished;
     }
+    if (!wait_interface_enabled()) {
+        result = C1_STATUS_UNAVAILABLE;
+        goto finished;
+    }
+    (void)set_disabled_marker(false);
+    explicitly_disabled = false;
     if ((!use_saved && !wifi_io.backup_config(&config)) || !capture_networks(&backup)) {
         set_error("CANNOT PRESERVE NETWORK CONFIG");
         goto finished;
@@ -1576,7 +1920,7 @@ static c1_status connect_profile(const char *ssid, const char *password, c1_wifi
         goto finished;
     }
     if (security == C1_WIFI_SECURITY_WPA_PSK) {
-        snprintf(text, sizeof(text), "SET_NETWORK %d psk %s", new_id, quoted_password);
+        snprintf(text, sizeof(text), "SET_NETWORK %d psk %s", new_id, encoded_psk);
         if (!command_ok(text)) {
             set_error("CREDENTIAL REJECTED");
             goto finished;
@@ -1646,7 +1990,7 @@ finished:
         secure_clear(config.bytes, config.size);
         free(config.bytes);
     }
-    secure_clear(quoted_password, sizeof(quoted_password));
+    secure_clear(encoded_psk, sizeof(encoded_psk));
     secure_clear(text, sizeof(text));
     secure_clear(output, sizeof(output));
     return end_operation(result, snapshot);
@@ -1689,8 +2033,21 @@ c1_status c1_wifi_disable(c1_wifi_snapshot *snapshot)
     char output[64];
     c1_status result = C1_STATUS_OK;
     begin_operation(NULL, 5000);
+    /* Worker snapshots do not carry process-local control ownership. Re-select
+     * the live interface before issuing DISCONNECT, so a fresh UI can stop the
+     * firmware's /var/run/wpa_supplicant instance instead of probing only its
+     * private socket directory. */
+    if (!control_ready_at(C1_WIFI_CTRL_DIR)) {
+        using_factory_control = control_ready_at(C1_WIFI_FACTORY_CTRL_DIR);
+    } else {
+        using_factory_control = false;
+    }
     /* Keep the managed supplicant/config alive for pause/resume. No vendor
      * down script and no name-based kill of unrelated interfaces. */
+    if (!wifi_io.dhcp_available()) {
+        set_error("WLAN0 DHCP OWNED BY ANOTHER SERVICE");
+        return end_operation(C1_STATUS_UNAVAILABLE, snapshot);
+    }
     if (!command("PING", output, sizeof(output)) || !reply_is(output, "PONG") || !command_ok("DISCONNECT") ||
         !wifi_io.stop_dhcp() || !wifi_io.clear_address() || !hardware_io.enable(false)) {
         set_error("WI-FI DISCONNECT FAILED OR UNMANAGED");
@@ -1698,6 +2055,7 @@ c1_status c1_wifi_disable(c1_wifi_snapshot *snapshot)
     } else {
         current_state = C1_WIFI_DISABLED;
         explicitly_disabled = true;
+        (void)set_disabled_marker(true);
         cached_network_count = 0U;
         memset(cached_networks, 0, sizeof(cached_networks));
         cached_connected_ssid[0] = '\0';
@@ -1712,6 +2070,12 @@ c1_status c1_wifi_pause(bool *was_enabled, bool *was_connected, bool *was_manage
     c1_status result;
     if (was_enabled == NULL || was_connected == NULL || was_managed == NULL) return C1_STATUS_INVALID_ARGUMENT;
     *was_managed = control_ready_at(C1_WIFI_CTRL_DIR);
+    using_factory_control = false;
+    if (!*was_managed && control_ready_at(C1_WIFI_FACTORY_CTRL_DIR)) {
+        using_factory_control = true;
+        *was_managed = true;
+    }
+    if (disabled_marker_present()) explicitly_disabled = true;
     *was_enabled = !explicitly_disabled && (current_state != C1_WIFI_DISABLED || *was_managed ||
                                            control_ready_at(C1_WIFI_FACTORY_CTRL_DIR));
     *was_connected = false;
@@ -1740,10 +2104,13 @@ c1_status c1_wifi_resume_ex(bool was_enabled, bool was_connected, bool was_manag
     if (!was_enabled) return C1_STATUS_OK;
     begin_operation(options, 30000);
     current_state = C1_WIFI_CONNECTING;
-    if (!was_managed || !wifi_io.ready()) {
+    if (!was_managed) {
         set_error("UNMANAGED WI-FI RESUME UNSUPPORTED");
         goto finished;
     }
+    if (!wifi_io.ready() || !wait_interface_enabled()) goto finished;
+    (void)set_disabled_marker(false);
+    explicitly_disabled = false;
     if (!was_connected) {
         current_state = C1_WIFI_READY;
         result = C1_STATUS_OK;
