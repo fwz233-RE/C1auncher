@@ -15,6 +15,14 @@ APPS = ["C1Slim-App-hello-1.5.1.zip", "C1Slim-App-book-reader-0.1.20.zip",
         "C1Slim-App-music-player-0.3.4.zip", "C1Slim-App-pinao-0.1.4.zip"]
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def download(name):
     CACHE.mkdir(parents=True, exist_ok=True)
     path = CACHE / name
@@ -37,8 +45,7 @@ def main():
     manifest = []
     for name in [INSTALLER] + APPS:
         path = download(name)
-        with path.open("rb") as file:
-            digest = hashlib.file_digest(file, "sha256").hexdigest()
+        digest = sha256_file(path)
         if checksums.get(name) != digest:
             raise SystemExit("发行包 SHA-256 校验失败：" + name)
         with zipfile.ZipFile(path) as archive:

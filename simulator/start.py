@@ -221,6 +221,10 @@ def handler(simulator, port, repository):
 
 
 def audio_arguments(qemu, backend, recording):
+    if backend == "none":
+        if recording:
+            raise ValueError("--audio-record 不能与静音后端同时使用")
+        return [], backend
     result = subprocess.run([qemu, "-audiodev", "help"], capture_output=True, text=True, check=True)
     available = set(line.strip() for line in (result.stdout + result.stderr).splitlines())
     if recording:

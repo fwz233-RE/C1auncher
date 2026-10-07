@@ -14,6 +14,14 @@ FFMPEG = "6.1.5"
 FFMPEG_SHA256 = "05fbe9db1f5452a3605bb1d9bf91da9d4bb08162891692e4f172b58c49109412"
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def download(url):
     CACHE.mkdir(parents=True, exist_ok=True)
     path = CACHE / url.rsplit("/", 1)[-1]
@@ -29,8 +37,7 @@ def download(url):
 def check(path, hashes):
     expected = next((line.split()[0] for line in hashes.read_text().splitlines()
                      if line.endswith(" " + path.name) or line.endswith("*" + path.name)), None)
-    with path.open("rb") as file:
-        actual = hashlib.file_digest(file, "sha256").hexdigest()
+    actual = sha256_file(path)
     if expected != actual:
         raise SystemExit("源码 SHA-256 校验失败：" + path.name)
     print("已校验 " + path.name, flush=True)
@@ -42,12 +49,10 @@ if __name__ == "__main__":
     base = "https://busybox.net/downloads/"
     check(download(base + "busybox-" + BUSYBOX + ".tar.bz2"), download(base + "busybox-" + BUSYBOX + ".tar.bz2.sha256"))
     path = download("https://curl.se/download/curl-" + CURL + ".tar.xz")
-    with path.open("rb") as file:
-        if hashlib.file_digest(file, "sha256").hexdigest() != CURL_SHA256:
-            raise SystemExit("curl 源码 SHA-256 校验失败")
+    if sha256_file(path) != CURL_SHA256:
+        raise SystemExit("curl 源码 SHA-256 校验失败")
     print("已校验 " + path.name, flush=True)
     path = download("https://ffmpeg.org/releases/ffmpeg-" + FFMPEG + ".tar.xz")
-    with path.open("rb") as file:
-        if hashlib.file_digest(file, "sha256").hexdigest() != FFMPEG_SHA256:
-            raise SystemExit("FFmpeg 源码 SHA-256 校验失败")
+    if sha256_file(path) != FFMPEG_SHA256:
+        raise SystemExit("FFmpeg 源码 SHA-256 校验失败")
     print("已校验 " + path.name, flush=True)
