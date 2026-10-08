@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && mipsle
 
 package c1device
 
