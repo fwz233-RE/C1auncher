@@ -4,9 +4,9 @@
 
 ## 下载与安装
 
-**当前设备核心版本为 2.9.9（更新序列 27）**，已发布到设备正式更新通道。功能与更新后的数据清理范围见 [2.9.9 版本说明](C1ancher/docs/release-2.9.9.md)，发布核验与限制见 [发布记录](C1ancher/docs/release-2.9.9-published.md)。
+**当前设备核心版本为 2.9.12（更新序列 30）**，已发布到设备正式更新通道。功能与更新后的自动关机策略见 [2.9.12 版本说明](C1ancher/docs/release-2.9.12.md)，发布核验记录见 [2.9.12 发布材料](C1ancher/docs/release-2.9.12.md)。
 
-GitHub 当前已有的 [2.0.0 Release](https://github.com/fwz233-RE/C1auncher/releases/tag/v2.0.0) 提供 **2.0.0 Windows 安装包**及普通应用发行包；它不是 2.9.9 安装包。各应用保留自己的版本号，旧包下载说明见 [2.0.0 发行说明](docs/release-v2.0.0.md)。本轮同步源码，不创建新的 GitHub Release，也不重新发布设备核心。
+GitHub 的 [2.9.12 Release](https://github.com/fwz233-RE/C1auncher/releases/tag/v2.9.12) 提供核心二进制、对应源码、最新普通应用发行包和可直接运行的 QEMU MIPS 模拟器离线包。模拟器在 Windows + WSL 环境中运行 C1-Slim 的 MIPS Linux 程序；真实设备更新仍使用正式更新通道。旧版 [2.0.0 Release](https://github.com/fwz233-RE/C1auncher/releases/tag/v2.0.0) 仍保留，用于获取旧版 Windows 安装包和旧版普通应用发行包。
 
 安装器应整包解压，保留 EXE 和配套 `payload/`；安装会修改设备启动配置，并在确认新核心正常运行后删除原厂学习软件，操作前请阅读随包用户指南并自行备份。已有 C1ancher 的设备可通过应用管理器下载安装普通应用。
 
@@ -35,7 +35,7 @@ GitHub 当前已有的 [2.0.0 Release](https://github.com/fwz233-RE/C1auncher/re
 
 公开源码统一在本仓库维护。服务器、发布器、InkWars 和 Windows 安装器源码仅在本地保留，不随本轮源码提交上传；发布器的使用方法见 [打包与发布说明](docs/publishing.md)。旧版本提交和标签保留；核心源码位于 `C1ancher/`，旧文档中的仓库根构建命令需先进入该目录。
 
-维护者的唯一主项目目录为 `D:\c1slim`，发布材料统一归档到项目内的 `build/release-2.9.9/`，不再维护盘符根目录下的平行发布源码目录。`build/`、凭据、个人数据和本地运行记录不提交到 GitHub。
+维护者的唯一主项目目录为 `D:\c1slim`，发布材料统一归档到项目内的 `build/release-2.9.12/`，不再维护盘符根目录下的平行发布源码目录。`build/`、凭据、个人数据和本地运行记录不提交到 GitHub。
 
 ## 目标设备与构建
 
