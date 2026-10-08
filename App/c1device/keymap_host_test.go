@@ -1,4 +1,4 @@
-//go:build !linux || !mipsle
+//go:build (!linux || !mipsle) && !headless
 
 package c1device
 
